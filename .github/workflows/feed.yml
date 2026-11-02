@@ -44,7 +44,7 @@ jobs:
           echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
           chmod +x apk.static
 
-      - name: Guard: release tag must match the pinned upstream engine version
+      - name: Guard - release tag must match the pinned upstream engine version
         if: github.ref_type == 'tag'
         run: |
           set -eu
