@@ -32,3 +32,21 @@ config engine 'engine'
 	#	list nfqws2_opt '--new'
 	#	list nfqws2_opt '--filter-udp=443'
 	#	list nfqws2_opt '--filter-l7=quic'
+
+config mihomo 'mihomo'
+
+	# mihomo routing-mark integration (issue #60): the CLI injects one
+	# root-level line 'routing-mark: 268435456' with a backup, validates with
+	# `mihomo -t` and reloads mihomo via its REST API. Paths follow the stock
+	# layout; change only if the mihomo setup is non-standard.
+
+	# mihomo config the mark is injected into
+	# (backup taken at install: <this>.bak-wanguard-antidpi)
+	option conffile '/etc/mihomo/config.yaml'
+
+	# mihomo workdir: the reload recipe (PUT /configs?force=true) accepts only
+	# paths under the workdir, so the edited config is copied here before the
+	# REST call. external-controller and secret are parsed from the config
+	# itself; the secret never leaves the router (passed to curl via a
+	# temporary header file, not through argv).
+	option workdir '/usr/share/mihomo'

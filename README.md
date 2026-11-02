@@ -6,16 +6,24 @@ engine applied only to mihomo DIRECT egress, as a companion to
 the encrypted proxy tunnel is out of scope (excluded by destination address);
 the engine sees the packets a DPI middlebox can still inspect.
 
-Status: **phase 1** - signed apk feed pipeline plus the real engine payload:
-static nfqws2 (pinned upstream zapret2 release) + lua strategies + own procd
-init + config. Scope integration (mihomo `routing-mark` install, the final
-nft rule set, tunnel exclusion) lands in phase 2.
+Status: **phase 2** - ucode-first base, the engine payload, and the mihomo
+scope integration: static nfqws2 (pinned upstream zapret2 release) + lua
+strategies + own procd init + UCI config + idempotent mihomo `routing-mark`
+install with live REST reload. Still ahead in phase 2: the final nft rule
+set and tunnel exclusion (#61/#62).
 
 **Language policy: ucode-first** (issue #67) - all router-side logic lives in
 a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
 remains only for the thin init shim (rc.common contract) and host/CI
-tooling. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the migration
-lands with the next package revision.
+tooling. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+**mihomo routing-mark integration** (issue #60) - on service start the CLI
+idempotently injects one root-level line `routing-mark: 268435456` into the
+mihomo config (with a backup, `mihomo -t` validation and a live REST reload
+when mihomo is running; a foreign `routing-mark` value is never touched).
+The mark makes ALL mihomo egress visible to the add-on's nft table - this is
+the scope primitive the whole add-on is built around. Removal is explicit
+and sticky (see Rollback).
 
 ## Design constants
 
@@ -92,6 +100,32 @@ Engine lifecycle notes:
   actions without touching live state - this is what the container test
   matrix exercises
 
+## Rollback
+
+- stop the add-on only (engine killed, nft table flushed; the mihomo
+  routing-mark stays in its config BY DESIGN - it is harmless without the
+  queue rules):
+
+  ```sh
+  /etc/init.d/wanguard-antidpi stop && /etc/init.d/wanguard-antidpi disable
+  ```
+
+- remove the mark and restore the mihomo config (backup taken at install
+  time, or the injected line dropped surgically when no backup exists);
+  also disarms the init hook so a later service start does not re-inject:
+
+  ```sh
+  wanguard-antidpi mark-remove
+  ```
+
+  NB: backup-restore reverts any mihomo config edits made between
+  `mark-install` and `mark-remove` - re-apply those edits afterwards if any.
+  Re-enable the integration later with `wanguard-antidpi mark-install`;
+  current state: `wanguard-antidpi mark-status`.
+
+- remove the package (`apk del wanguard-antidpi`); run `mark-remove` first
+  if the mihomo config should be restored - apk has no uninstall hooks.
+
 Note on licensing: this repository's own code is MIT. The upstream engine
 zapret2 does not declare a license; its binary and lua strategies are
 redistributed here unmodified, pinned by sha256.
@@ -133,9 +167,14 @@ What runs where:
   construction.
 - `scripts/dev-test.sh` - probe, build, fresh-container install + smoke in one
   command; exits non-zero on failure.
+- `scripts/test-mark.sh` - mihomo routing-mark integration test with a REAL
+  pinned mihomo binary inside the container (needs `--cap-add NET_ADMIN`):
+  `mihomo -t` after the inject, start with the mark, live REST reload in both
+  directions, idempotency, conflict, DRYRUN, graceful no-config. Runs in CI
+  (job `mark-test`) with the same container.
 
-The smoke set grows into the full container test matrix (mihomo integration,
-nft idempotency, resolver updater) in later phases.
+The smoke set grows into the full container test matrix (nft idempotency,
+resolver updater) in later phases.
 
 ## Requirements
 

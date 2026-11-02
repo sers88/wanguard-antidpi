@@ -69,8 +69,9 @@ printf '%s\n' "$VER" > "$W/usr/share/wanguard-antidpi/version"
 # kmods from the upstream OpenWrt feed, unpinned (apk resolves the kernel
 # version); nftables = the userspace nft binary (present via fw4, declared
 # as the contract); ucode interpreter + fs/uci modules for the CLI - declared
-# explicitly like the wanguard core does (preinstalled on stock 25.x)
-DEPS="kmod-nft-queue kmod-nfnetlink-queue nftables ucode ucode-mod-fs ucode-mod-uci"
+# explicitly like the wanguard core does (preinstalled on stock 25.x);
+# curl = the REST reload client for the mihomo routing-mark integration (#60)
+DEPS="kmod-nft-queue kmod-nfnetlink-queue nftables ucode ucode-mod-fs ucode-mod-uci curl"
 
 "$APK" mkpkg -F "$W" \
 	-I "name:wanguard-antidpi" \

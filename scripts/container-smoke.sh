@@ -150,6 +150,82 @@ esac
 # init DRYRUN paths are exercised on hosts with rc.common; here only the CLI
 # surface they call is proven (rc.common does not exist in the container)
 
+# ---- mihomo routing-mark integration (issue #60; no mihomo binary/process
+# ---- in this container - the graceful paths plus the file mechanics) ----
+out=$("$CLI" mark-status)
+case "$out" in
+	*"install-on-start: enabled"*) ;;
+	*) fail "mark-status: install-on-start not enabled on a fresh host" ;;
+esac
+case "$out" in
+	*"mark: no-config"*) ;;
+	*) fail "mark-status: expected no-config on a fresh host" ;;
+esac
+mkdir -p /etc/mihomo
+printf 'mixed-port: 17890\nmode: rule\nlog-level: warning\nexternal-controller: 127.0.0.1:19090\nsecret: marktest\n' > /etc/mihomo/config.yaml
+cp /etc/mihomo/config.yaml /tmp/smoke-mihomo-orig.yaml
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" mark-install)
+case "$out" in
+	*DRYRUN*) ;;
+	*) fail "mark-install DRYRUN: no DRYRUN marker" ;;
+esac
+cmp -s /etc/mihomo/config.yaml /tmp/smoke-mihomo-orig.yaml || fail "mark-install DRYRUN touched the config"
+[ ! -f /etc/mihomo/config.yaml.bak-wanguard-antidpi ] || fail "mark-install DRYRUN created a backup"
+"$CLI" mark-install >/dev/null || fail "mark-install failed"
+[ "$(head -n 1 /etc/mihomo/config.yaml)" = "routing-mark: 268435456" ] \
+	|| fail "mark-install: routing-mark line not prepended"
+l1=$(wc -l < /tmp/smoke-mihomo-orig.yaml)
+l2=$(wc -l < /etc/mihomo/config.yaml)
+[ "$((l1 + 1))" = "$l2" ] || fail "mark-install: diff is not exactly one line ($l1 -> $l2)"
+[ -f /etc/mihomo/config.yaml.bak-wanguard-antidpi ] || fail "mark-install: backup missing"
+out=$("$CLI" mark-install)
+case "$out" in
+	*"already installed"*) ;;
+	*) fail "mark-install is not idempotent" ;;
+esac
+out=$("$CLI" mark-status)
+case "$out" in
+	*"mark: installed"*) ;;
+	*) fail "mark-status: not installed after install" ;;
+esac
+case "$out" in
+	*"api: 127.0.0.1:19090"*) ;;
+	*) fail "mark-status: api endpoint not parsed from the config" ;;
+esac
+"$CLI" mark-remove >/dev/null || fail "mark-remove failed"
+cmp -s /etc/mihomo/config.yaml /tmp/smoke-mihomo-orig.yaml \
+	|| fail "mark-remove did not restore the original bytes"
+out=$("$CLI" mark-status)
+case "$out" in
+	*"install-on-start: disabled"*) ;;
+	*) fail "mark-remove: install-on-start not disarmed" ;;
+esac
+out=$("$CLI" mark-ensure)
+case "$out" in
+	*"disabled"*) ;;
+	*) fail "mark-ensure did not honor the disarm stamp" ;;
+esac
+cmp -s /etc/mihomo/config.yaml /tmp/smoke-mihomo-orig.yaml \
+	|| fail "mark-ensure injected despite the disarm stamp"
+# surgical fallback (no backup): byte-faithful single-line removal
+"$CLI" mark-install >/dev/null || fail "mark-install (for surgical) failed"
+rm -f /etc/mihomo/config.yaml.bak-wanguard-antidpi
+"$CLI" mark-remove >/dev/null || fail "surgical mark-remove failed"
+cmp -s /etc/mihomo/config.yaml /tmp/smoke-mihomo-orig.yaml \
+	|| fail "surgical removal did not reproduce the original bytes"
+# conflict: a foreign routing-mark value is never touched
+printf 'routing-mark: 12345\nmode: rule\n' > /etc/mihomo/config.yaml
+cp /etc/mihomo/config.yaml /tmp/smoke-mihomo-conflict.yaml
+"$CLI" mark-install >/dev/null 2>&1 && fail "mark-install did not fail on a foreign routing-mark"
+cmp -s /etc/mihomo/config.yaml /tmp/smoke-mihomo-conflict.yaml \
+	|| fail "conflict: config was modified"
+out=$("$CLI" mark-status)
+case "$out" in
+	*"mark: conflict (12345)"*) ;;
+	*) fail "mark-status: conflict not reported" ;;
+esac
+rm -rf /etc/mihomo /tmp/smoke-mihomo-orig.yaml /tmp/smoke-mihomo-conflict.yaml
+
 # ---- smoke set: CLI determinism (bootstrap contract, kept from #56) ----
 out1=$("$CLI")
 out2=$("$CLI")

@@ -1,10 +1,16 @@
 #!/bin/sh /etc/rc.common
-# wanguard-antidpi init (issue #57): nfqws2 engine scoped to mihomo DIRECT
-# egress. Own lifecycle (ad-on pattern) - upstream zapret2's installer and
-# its init.d/openwrt are NOT used.
+# wanguard-antidpi init (issues #57/#60): nfqws2 engine scoped to mihomo
+# DIRECT egress. Own lifecycle (ad-on pattern) - upstream zapret2's installer
+# and its init.d/openwrt are NOT used.
 #
-# start: apply the own nft table -> procd instance (respawn on crash)
+# start: ensure the mihomo routing-mark (idempotent inject + live REST reload,
+#        non-fatal) -> apply the own nft table -> procd instance (respawn)
 # stop : procd kills the instance -> flush the nft table
+#
+# The routing-mark persists in the mihomo config across stop/restart BY
+# DESIGN (it is harmless without the queue rules): explicit removal is
+# `wanguard-antidpi mark-remove` (restores the config and disarms the init
+# hook via the no-mark stamp). Docs: README + docs/ARCHITECTURE.md.
 #
 # DRYRUN contract (container matrix, issues #57/#63):
 #   WANGUARD_ANTIDPI_DRYRUN=1 start   -> print actions, touch nothing
@@ -23,19 +29,20 @@ CLI=/usr/bin/wanguard-antidpi
 start_service() {
 	if [ "${WANGUARD_ANTIDPI_DRYRUN:-0}" = "1" ]; then
 		"$CLI" nft-apply
+		echo "DRYRUN: would ensure the mihomo routing-mark (mark-ensure)"
 		echo "DRYRUN: would start procd instance:"
 		"$CLI" engine-cmdline
 		return 0
 	fi
 
-	"$CLI" nft-apply || return 1
+	# scope mark integration (#60): idempotent, self-healing - injects the
+	# mark when missing (boot: mihomo not up yet, S99 picks the config up;
+	# running system: inject + live REST reload). Non-fatal by contract:
+	# a failure must not keep the engine/queue down, the mark lands on the
+	# next mihomo restart either way.
+	"$CLI" mark-ensure || logger -t wanguard-antidpi "mark-ensure failed (non-fatal; see logread)"
 
-	# graceful no-op hint (issue #57): without mihomo no packet carries the
-	# 0x10000000 scope mark, the queue stays empty (bypass) and the engine
-	# idles. This is normal - logread carries the explanation.
-	if ! pidof mihomo >/dev/null 2>&1; then
-		logger -t wanguard-antidpi "mihomo not found - processing not active (no traffic matches the scope mark; engine idles)"
-	fi
+	"$CLI" nft-apply || return 1
 
 	# word-split the one-arg-per-line output into argv (IFS includes \n)
 	set -- $("$CLI" engine-cmdline)

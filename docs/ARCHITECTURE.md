@@ -37,11 +37,11 @@ UCI layout (`/etc/config/wanguard-antidpi`, section `engine`):
 
 | Component | Role |
 |---|---|
-| mihomo | proxy core; with `routing-mark 0x10000000` its own DIRECT egress is the add-on's scope (phase 2, issue #60) |
+| mihomo | proxy core; with `routing-mark 0x10000000` its own DIRECT egress is the add-on's scope (the CLI installs the mark idempotently, #60) |
 | nftables (`table inet wanguard_antidpi`) | own table: postrouting @ mangle+10, `meta mark 0x10000000 queue flags bypass to <qnum>`; never touches wanguard / fw4 tables (final rule set: #61) |
 | nfqws2 (zapret2) | desync engine, single instance, `--qnum=<qnum>`, gzipped lua strategies loaded via `--lua-init=@`; graceful no-op when the strategy is empty |
-| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush; DRYRUN-aware |
-| procd init | apply table -> engine instance (respawn 3600 5 0, stdout/stderr to syslog); stop = kill -> flush table |
+| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status; DRYRUN-aware |
+| procd init | ensure the mihomo mark (non-fatal) -> apply table -> engine instance (respawn 3600 5 0, stdout/stderr to syslog); stop = kill -> flush table |
 | apk feed | signed index on the `feed` branch; package built by CI from the sha256-pinned upstream artifact |
 
 ## 3. Frozen contracts
@@ -54,6 +54,49 @@ UCI layout (`/etc/config/wanguard-antidpi`, section `engine`):
 - marks: `0x10000000` (mihomo scope) and `0x40000000` (nfqws desync)
 - versioning: package major = pinned upstream version (`vX.Y.Z` -> `X.Y.Z-r1`);
   package-only fixes ship as explicit revision tags (`vX.Y.Z-rN` -> `X.Y.Z-rN`)
+
+## 3.1 mihomo routing-mark integration (#60)
+
+The scope mark `0x10000000` is the add-on's property: nothing else on the
+system may claim it (wanguard policy marks live in `0x64..0x258` and match by
+exact value, so a new mark cannot disturb policy routing).
+
+Install (`mark-install`, also run by the init shim as the non-fatal
+`mark-ensure` on every service start):
+
+1. `/etc/mihomo/config.yaml` missing -> graceful no-op (the whole add-on
+   stays inert without mihomo)
+2. `routing-mark` root-level line present -> idempotent skip when it equals
+   `268435456`; a FOREIGN value is never touched (strict `mark-install`
+   exits 1, the init hook only warns)
+3. backup -> `config.yaml.bak-wanguard-antidpi` (taken once, never
+   overwritten), inject ONE root-level line `routing-mark: 268435456`
+   (prepended - root-level key order is free in YAML; the config is never
+   rewritten as a whole)
+4. validate with the real binary (`mihomo -t`); on failure the inject is
+   rolled back from the in-memory pre-inject content
+5. mihomo running -> live reload via its REST API: `PUT
+   /configs?force=true` with the config path under the mihomo workdir
+   (SAFE_PATHS convention - the edited config is copied to
+   `<workdir>/config.yaml` first and the copy is kept in sync);
+   `external-controller` and `secret` are parsed from the mihomo config
+   itself, the secret travels to curl via a temporary header FILE, never
+   through argv. mihomo not running -> nothing to reload, it starts with
+   the mark when it comes up
+
+Removal (`mark-remove`): restore the backup (spec default - reverts any
+edits made between install and remove; documented) or, without a backup,
+surgically drop the injected line; validate + live reload; then arm the
+disarm stamp (`/usr/share/wanguard-antidpi/no-mark`) so the init hook stops
+re-injecting. apk has no uninstall scripts (verified: apk3 mkpkg rejects
+pre/post-uninstall), so `mark-remove` is the documented rollback step.
+`mark-status` prints one `key: value` line per fact (mark / install-on-start
+/ backup / mihomo / config / api) for tests and future LuCI.
+
+Contract checks live in `scripts/container-smoke.sh` (file mechanics,
+idempotency, conflict, DRYRUN, stamp) and `scripts/test-mark.sh` (real
+pinned mihomo: `mihomo -t`, start with the mark, live REST reload both
+directions).
 
 Contract changes are frozen with golden fixtures byte-for-byte (the wanguard
 core pattern); the container smoke and the CI gate assert the CLI stays ucode.
