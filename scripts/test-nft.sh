@@ -59,12 +59,27 @@ udp_packets() {
 
 proxied_code() {
 	# `|| true` on purpose: curl rc must not trip set -e (AGENTS gotcha) -
-	# failures surface as http_code 000 and fail the assert with a message
-	curl -s -m 20 -x "http://127.0.0.1:$MPORT" -o /dev/null -w '%{http_code}' "$PROBE" || true
+	# failures surface as http_code 000 and fail the assert with a message.
+	# Network intermittents are a fact of life on this stand: retry, first
+	# 200 wins (a partial attempt still ticks the counters, so the counter
+	# asserts stay strict)
+	local c=""
+	for r in 1 2 3; do
+		c=$(curl -s -m 20 -x "http://127.0.0.1:$MPORT" -o /dev/null -w '%{http_code}' "$PROBE" || true)
+		[ "$c" = "200" ] && { printf '%s' "$c"; return 0; }
+		sleep 2
+	done
+	printf '%s' "$c"
 }
 
 direct_code() {
-	curl -s -m 20 -o /dev/null -w '%{http_code}' "$PROBE" || true
+	local c=""
+	for r in 1 2 3; do
+		c=$(curl -s -m 20 -o /dev/null -w '%{http_code}' "$PROBE" || true)
+		[ "$c" = "200" ] && { printf '%s' "$c"; return 0; }
+		sleep 2
+	done
+	printf '%s' "$c"
 }
 
 # ---- setup: package ----
@@ -178,13 +193,9 @@ ENG_PID=
 echo "ENGINE-BIND-OK (fetch 200 through the bound queue, counter $e1 -> $e2)"
 
 # ---- [5] scope negative: unmarked traffic never ticks ----
+# (the MARKED mihomo is killed FIRST: its background retries would otherwise
+# race the counters - seen once on CI)
 echo "== [5] scope negatives (unmarked)"
-n1=$(tcp_packets)
-code=$(direct_code)
-[ "$code" = "200" ] || fail "direct fetch failed (container egress): code=$code"
-sleep 1
-[ "$(tcp_packets)" = "$n1" ] || fail "direct (unmarked) fetch ticked the tcp rule counter"
-grep -q '^routing-mark' "$CONF" && sed -i '/^routing-mark/d' "$CONF"
 kill "$M_PID" 2>/dev/null
 M_PID=
 i=0
@@ -193,6 +204,12 @@ while [ $i -lt 15 ]; do
 	i=$((i + 1))
 	sleep 1
 done
+n1=$(tcp_packets)
+code=$(direct_code)
+[ "$code" = "200" ] || fail "direct fetch failed (container egress): code=$code"
+sleep 1
+[ "$(tcp_packets)" = "$n1" ] || fail "direct (unmarked) fetch ticked the tcp rule counter"
+grep -q '^routing-mark' "$CONF" && sed -i '/^routing-mark/d' "$CONF"
 mihomo -f "$CONF" -d /usr/share/mihomo >/tmp/mihomo2.log 2>&1 &
 M_PID=$!
 i=0
