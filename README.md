@@ -46,6 +46,45 @@ apk update
 apk add wanguard-antidpi
 ```
 
+## Development
+
+All development and testing runs in Docker containers - the same
+`openwrt/rootfs:x86_64-25.12.6` image CI uses; the router is only touched at
+final acceptance. One command from zero to smoke:
+
+```sh
+sh scripts/dev-test.sh            # kernel probe -> local build -> install + smoke
+sh scripts/dev-build.sh 0.1.2-r1  # build only -> out/*.apk
+sh scripts/kernel-probe.sh        # NFQUEUE capability probe only
+```
+
+On Windows run these from the **Git Bash** shell (the scripts are POSIX sh;
+outside Git Bash, `bash` may resolve to WSL and `sh` may not be on PATH - the
+scripts handle Git Bash path-mangling quirks themselves).
+
+What runs where:
+
+- `scripts/dev-build.sh` - downloads the pinned `apk.static` (same pin as CI)
+  and builds `out/*.apk` inside the container. Packages are intentionally
+  unsigned; the feed index signature is what routers verify.
+- `scripts/kernel-probe.sh` - tries an `nft ... queue num 300 bypass` rule in
+  a container. Containers use the **host kernel** (on Windows: the Docker
+  Desktop / WSL2 VM kernel), so the verdict describes the machine, not the
+  image: `NFQUEUE-OK` means live packet scenarios are testable in containers
+  here; `NFQUEUE-UNAVAILABLE` (never fatal) means container tests stay
+  structural/dry-run and live desync scenarios are validated only at router
+  acceptance.
+- `scripts/container-smoke.sh` - install + smoke assertions inside the
+  container, two modes: `local` (untrusted install of `out/*.apk`, used by
+  `dev-test.sh`) and `feed` (signed feed install, used by CI `feed-test`).
+  One script for both modes, so local and CI results are comparable by
+  construction.
+- `scripts/dev-test.sh` - probe, build, fresh-container install + smoke in one
+  command; exits non-zero on failure.
+
+The smoke set grows into the full container test matrix (mihomo integration,
+nft idempotency, resolver updater) in later phases.
+
 ## Requirements
 
 - OpenWrt with apk (24.10+/25.x) and mihomo as the proxy core (the add-on

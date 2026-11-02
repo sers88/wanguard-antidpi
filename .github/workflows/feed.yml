@@ -113,24 +113,18 @@ jobs:
           git push -qf "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" feed:feed
 
   feed-test:
-    name: Install test (OpenWrt 25.12.6 container)
+    name: Install + smoke test (OpenWrt 25.12.6 container)
     needs: [build, feed]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install from feed in OpenWrt container
+      - name: Install + smoke test in OpenWrt container (same script as the dev stand)
         env:
           VER: ${{ needs.build.outputs.ver }}
         run: |
-          docker run --rm -v "$PWD/keys:/hostkeys:ro" openwrt/rootfs:x86_64-25.12.6 sh -exc '
-            cp /hostkeys/wanguard-antidpi.pem /etc/apk/keys/
-            echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x86_64/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
-            apk update
-            apk add wanguard-antidpi
-            test -x /usr/bin/wanguard-antidpi
-            test -f /usr/share/wanguard-antidpi/version
-            test "$(cat /usr/share/wanguard-antidpi/version)" = "'"$VER"'"
-            /usr/bin/wanguard-antidpi | grep -q "'"$VER"'" # placeholder CLI reports the stamp
-            echo FEED-TEST-OK
-          '
+          docker run --rm \
+            -v "$PWD/keys:/hostkeys:ro" \
+            -v "$PWD/scripts:/scripts:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /scripts/container-smoke.sh feed "$VER"
