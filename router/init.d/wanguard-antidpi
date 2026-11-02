@@ -4,8 +4,11 @@
 # and its init.d/openwrt are NOT used.
 #
 # start: ensure the mihomo routing-mark (idempotent inject + live REST reload,
-#        non-fatal) -> apply the own nft table -> procd instance (respawn)
-# stop : procd kills the instance -> flush the nft table
+#        non-fatal) -> refresh the tunnel exclusion set (resolver updater,
+#        non-fatal; the persisted list covers boot-time DNS outages) -> apply
+#        the own nft table -> ensure the periodic update cron line -> procd
+#        instance (respawn)
+# stop : procd kills the instance -> drop the cron line -> flush the nft table
 #
 # The routing-mark persists in the mihomo config across stop/restart BY
 # DESIGN (it is harmless without the queue rules): explicit removal is
@@ -30,6 +33,10 @@ start_service() {
 	if [ "${WANGUARD_ANTIDPI_DRYRUN:-0}" = "1" ]; then
 		"$CLI" nft-apply
 		echo "DRYRUN: would ensure the mihomo routing-mark (mark-ensure)"
+		echo "DRYRUN: would refresh the tunnel exclusion set (tunnel-update)"
+		"$CLI" tunnel-update
+		echo "DRYRUN: would ensure the periodic update cron line (cron-install)"
+		"$CLI" cron-install
 		echo "DRYRUN: would start procd instance:"
 		"$CLI" engine-cmdline
 		return 0
@@ -42,7 +49,18 @@ start_service() {
 	# next mihomo restart either way.
 	"$CLI" mark-ensure || logger -t wanguard-antidpi "mark-ensure failed (non-fatal; see logread)"
 
+	# tunnel exclusion (#62): refresh the resolver-managed set BEFORE the
+	# table apply so the first apply already carries the fresh answers.
+	# Non-fatal: boot-time DNS outages keep the last known UCI list (it
+	# persists across reboots); the periodic cron run heals it later.
+	"$CLI" tunnel-update || logger -t wanguard-antidpi "tunnel-update failed (non-fatal; keeping the last known set)"
+
 	"$CLI" nft-apply || return 1
+
+	# periodic updater trigger (#62): one tagged line in /etc/crontabs/root
+	# (busybox crond reloads changed crontab files itself); no hosts
+	# configured or update_interval=0 -> the CLI keeps it absent
+	"$CLI" cron-install || logger -t wanguard-antidpi "cron-install failed (non-fatal; manual tunnel-update still works)"
 
 	# word-split the one-arg-per-line output into argv (IFS includes \n)
 	set -- $("$CLI" engine-cmdline)
@@ -59,9 +77,13 @@ start_service() {
 
 stop_service() {
 	if [ "${WANGUARD_ANTIDPI_DRYRUN:-0}" = "1" ]; then
+		echo "DRYRUN: would drop the periodic update cron line (cron-remove)"
+		"$CLI" cron-remove
 		echo "DRYRUN: would flush the nft table (procd already stopped the engine)"
 		return 0
 	fi
-	# called by stop() after procd killed the instances
+	# called by stop() after procd killed the instances; a disabled service
+	# must not keep a periodic updater behind
+	"$CLI" cron-remove
 	"$CLI" nft-flush
 }

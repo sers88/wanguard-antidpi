@@ -28,6 +28,14 @@
 //                   the next start does not re-inject; DRYRUN-aware
 //   mark-status     machine-readable state: mark / install-on-start / backup /
 //                   mihomo / config / api (one `key: value` per line)
+//   tunnel-update   resolve tunnel.hosts (nslookup), refresh the resolver-
+//                   managed proxy_resolved UCI list with per-IP expiry
+//                   (state file), re-apply the table only when the set really
+//                   changed and the table lives (issue #62); DRYRUN-aware
+//   tunnel-status   machine-readable tunnel state (hosts/resolved/cron/table)
+//   cron-install    ensure the periodic tunnel-update line in /etc/crontabs/
+//                   root (busybox crond reloads changed files itself)
+//   cron-remove     drop the cron line (service stop)
 //
 // DRYRUN contract: WANGUARD_ANTIDPI_DRYRUN=1 makes every state-changing
 // command print what it would do, touch nothing, exit 0. This is how the
@@ -61,6 +69,14 @@ const BACKUP_SUFFIX = '.bak-wanguard-antidpi';
 const NOSTAMP = BASE + '/no-mark';
 const AUTH_TMP = '/tmp/wanguard-antidpi.auth';
 
+// tunnel resolver updater (issue #62): the state file keeps a per-IP
+// last-seen timestamp so entries that stop appearing in DNS answers age
+// out (the tunnel daddr ROTATES - issue #61 finding), while the UCI list
+// stays the single render source
+const STATE = BASE + '/tunnel-resolved.state';
+const CRONTAB = '/etc/crontabs/root';
+const CRON_TAG = 'wanguard-antidpi-tunnel-update';
+
 function die(msg) {
 	warn('wanguard-antidpi: ' + msg + '\n');
 	exit(1);
@@ -92,12 +108,36 @@ function load_config() {
 }
 
 function load_tunnel() {
-	// soft section (issue #61/#62 contract): missing section/options render an
-	// empty proxy_servers set; entries are validated at render time
+	// soft section (issues #61/#62 contract): missing section/options render an
+	// empty proxy set; entries are validated at render/update time
 	let s = uci.cursor().get_all(CONF, 'tunnel');
-	return {
-		proxy_servers: (s == null || type(s.proxy_servers) != 'array') ? [] : s.proxy_servers
+	// numeric option with a published default; garbage falls back loudly
+	let num = function(orig, def, name) {
+		if (orig == null)
+			return def;
+		if (type(orig) != 'string' || match(orig, /^[0-9]+$/) == null) {
+			warn('wanguard-antidpi: tunnel.' + name + ' is not numeric ("' +
+				orig + '") - using the default ' + def + '\n');
+			return def;
+		}
+		return orig;
 	};
+	return {
+		proxy_servers: (s == null || type(s.proxy_servers) != 'array') ? [] : s.proxy_servers,
+		proxy_resolved: (s == null || type(s.proxy_resolved) != 'array') ? [] : s.proxy_resolved,
+		tunnel_hosts: (s == null || type(s.tunnel_hosts) != 'array') ? [] : s.tunnel_hosts,
+		update_interval: num((s == null) ? null : s.update_interval, '6', 'update_interval'),
+		expire_hours: num((s == null) ? null : s.expire_hours, '24', 'expire_hours')
+	};
+}
+
+function valid_hostname(h) {
+	// strict DNS hostname for shell exec via nslookup: letters/digits/hyphen
+	// labels, at least two labels (single labels cannot resolve via DNS
+	// anyway), 253-octet presentation limit
+	if (h == null || length(h) == 0 || length(h) > 253)
+		return false;
+	return match(h, /^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/) != null;
 }
 
 function valid_addr_entry(e) {
@@ -124,6 +164,28 @@ function valid_addr_entry(e) {
 			return false; // no leading zeros: keeps the render canonical
 	}
 	return true;
+}
+
+function merge_proxy_entries(t) {
+	// the rendered set = manual pins (tunnel.proxy_servers) UNION resolver-
+	// managed answers (tunnel.proxy_resolved, issue #62); strict validation
+	// on every entry (render-injection safety), dedupe, canonical order
+	let seen = {};
+	let els = [];
+	let lists = [t.proxy_servers, t.proxy_resolved];
+	for (let li = 0; li < length(lists); li++) {
+		for (let i = 0; i < length(lists[li]); i++) {
+			let e = lists[li][i];
+			if (!valid_addr_entry(e))
+				die('tunnel proxy entry is not a canonical IPv4/CIDR: "' + e + '"');
+			if (seen[e] == null) {
+				seen[e] = true;
+				push(els, e);
+			}
+		}
+	}
+	sort(els);
+	return els;
 }
 
 function cmd_version() {
@@ -165,19 +227,13 @@ function cmd_engine_cmdline() {
 function render_nft() {
 	// substitutions (issue #61): @QNUM@ queue number, @FWMARK@ the desync
 	// anti-loop mark (must equal the engine's --fwmark), @PROXY_ELEMENTS@
-	// the rendered set elements for tunnel.proxy_servers (#62 fills the UCI)
+	// the rendered set elements for the tunnel exclusion (#62 fills them)
 	let c = load_config();
 	let t = load_tunnel();
 	let tpl = readfile(NFT_TEMPLATE);
 	if (tpl == null)
 		die('nft template missing: ' + NFT_TEMPLATE);
-	let els = [];
-	for (let i = 0; i < length(t.proxy_servers); i++) {
-		let e = t.proxy_servers[i];
-		if (!valid_addr_entry(e))
-			die('tunnel.proxy_servers entry is not a canonical IPv4/CIDR: "' + e + '"');
-		push(els, e);
-	}
+	let els = merge_proxy_entries(t);
 	// manual join: ucode join() returns null (2026.01.16)
 	let elsline = '';
 	for (let i = 0; i < length(els); i++)
@@ -192,6 +248,17 @@ function cmd_nft_render() {
 	print(render_nft());
 }
 
+function apply_table() {
+	// render + apply; returns the nft exit code (0 = applied). Fixed tmp
+	// name: the engine lifecycle is single-instance (procd) and the file is
+	// unlinked right after nft -f consumed it. Callers decide logging/exit.
+	let tmp = '/tmp/wanguard-antidpi.nft';
+	writefile(tmp, render_nft());
+	let rc = system('nft -f ' + tmp);
+	unlink(tmp);
+	return rc;
+}
+
 function cmd_nft_apply() {
 	let c = load_config();
 	if (dryrun()) {
@@ -199,12 +266,7 @@ function cmd_nft_apply() {
 		print(render_nft());
 		return;
 	}
-	// fixed tmp name: the engine lifecycle is single-instance (procd) and the
-	// file is unlinked right after nft -f consumed it
-	let tmp = '/tmp/wanguard-antidpi.nft';
-	writefile(tmp, render_nft());
-	let rc = system('nft -f ' + tmp);
-	unlink(tmp);
+	let rc = apply_table();
 	if (rc == 0)
 		system('logger -t wanguard-antidpi "nft table inet ' + TABLE + ' applied (queue ' + c.qnum + ')"');
 	else
@@ -584,6 +646,353 @@ function cmd_mark_status() {
 }
 
 
+// ---------------------------------------------------------------------------
+// tunnel exclusion resolver updater (issue #62)
+//
+// The nft set proxy_servers is rendered from UCI on every apply (#61
+// contract) - the updater therefore maintains the UCI list, never the live
+// set. The tunnel daddr ROTATES (issue #61 router finding: one hostname,
+// different answers over time), so fresh answers REFRESH a per-IP timestamp
+// in a state file and entries that stop appearing in DNS answers age out
+// after tunnel.expire_hours. Resilience: when no host resolves, the last
+// known set is kept untouched (exit 1, cron/init treat it as non-fatal).
+// Triggers: every service start (init shim, best-effort) and periodically
+// via cron (cron-install/cron-remove manage one tagged line in
+// /etc/crontabs/root; busybox crond reloads changed crontab files itself).
+// ---------------------------------------------------------------------------
+
+function resolve_host(host) {
+	// busybox nslookup output -> array of IPv4 answers; null on failure or
+	// when the answer carries no IPv4 (NXDOMAIN goes to stderr, hence 2>&1;
+	// the server header line 'Address:\t<ip>:53' is rejected by the strict
+	// IPv4 check, CNAME tails are split off)
+	let fp = popen('nslookup ' + sh_quote(host) + ' 2>&1', 'r');
+	let out = (fp != null) ? fp.read('all') : '';
+	let rc = (fp != null) ? fp.close() : -1;
+	if (rc != 0)
+		return null;
+	let ips = [];
+	let lines = split(out, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		let ln = lines[i];
+		if (substr(ln, 0, 7) != 'Address')
+			continue;
+		let c = index(ln, ':');
+		if (c == null || c < 0)
+			continue;
+		let rest = trim(substr(ln, c + 1));
+		// first whitespace token only ('Address 1: ip cname'); busybox 1.30+
+		// numbers the answers, older builds do not - both shapes parse
+		let sp = index(rest, ' ');
+		if (sp != null && sp > 0)
+			rest = substr(rest, 0, sp);
+		// plain A answers only - no CIDR can come out of DNS
+		if (valid_addr_entry(rest) && index(rest, '/') < 0)
+			push(ips, rest);
+	}
+	return (length(ips) > 0) ? ips : null;
+}
+
+function load_state() {
+	// '<ip> <epoch>' lines -> { ip: epoch }; garbage lines ignored
+	let m = {};
+	let txt = readfile(STATE);
+	if (txt == null)
+		return m;
+	let lines = split(txt, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		let ln = trim(lines[i]);
+		if (length(ln) == 0 || substr(ln, 0, 1) == '#')
+			continue;
+		let sp = index(ln, ' ');
+		if (sp == null || sp < 1)
+			continue;
+		let ip = substr(ln, 0, sp);
+		let ts = trim(substr(ln, sp + 1));
+		if (valid_addr_entry(ip) && index(ip, '/') < 0 && match(ts, /^[0-9]+$/) != null)
+			m[ip] = int(ts);
+	}
+	return m;
+}
+
+function save_state(m) {
+	// sorted '<ip> <epoch>' lines (deterministic; small file, single writer)
+	let ips = [];
+	for (let k in m)
+		push(ips, k);
+	sort(ips);
+	let txt = '';
+	for (let i = 0; i < length(ips); i++)
+		txt += ips[i] + ' ' + m[ips[i]] + '\n';
+	check_write(STATE, writefile(STATE, txt));
+}
+
+function index_of(arr, v) {
+	for (let i = 0; i < length(arr); i++)
+		if (arr[i] == v)
+			return i;
+	return -1;
+}
+
+function write_resolved_list(ips) {
+	// persist the resolver-managed UCI list. The ucode cursor.add() of this
+	// build cannot create NAMED sections (verified 2026-11-02: it returns
+	// null and creates nothing) - when the user deleted the tunnel section,
+	// the uci CLI binary recreates it first. Empty list -> delete the option.
+	if (uci.cursor().get_all(CONF, 'tunnel') == null) {
+		system('uci set ' + sh_quote(CONF) + '.tunnel=tunnel');
+		system('uci commit ' + sh_quote(CONF));
+	}
+	let ctx = uci.cursor();
+	if (length(ips) > 0)
+		ctx.set(CONF, 'tunnel', 'proxy_resolved', ips);
+	else
+		ctx.delete(CONF, 'tunnel', 'proxy_resolved');
+	ctx.save(CONF);
+	ctx.commit(CONF);
+	// verify-after-write: ucode uci failures are silent (null returns)
+	let chk = uci.cursor().get_all(CONF, 'tunnel');
+	let got = (chk == null || type(chk.proxy_resolved) != 'array') ? [] : chk.proxy_resolved;
+	if (length(got) != length(ips))
+		die('tunnel.proxy_resolved write verification failed');
+	for (let i = 0; i < length(ips); i++)
+		if (got[i] != ips[i])
+			die('tunnel.proxy_resolved write verification failed');
+}
+
+function cmd_tunnel_update() {
+	let t = load_tunnel();
+	if (length(t.tunnel_hosts) == 0) {
+		print('wanguard-antidpi: no tunnel hosts configured - nothing to resolve\n');
+		exit(0);
+	}
+	for (let i = 0; i < length(t.tunnel_hosts); i++)
+		if (!valid_hostname(t.tunnel_hosts[i]))
+			die('tunnel.tunnel_hosts entry is not a valid DNS hostname: "' + t.tunnel_hosts[i] + '"');
+	let now = time();
+	let expire = int(t.expire_hours) * 3600;
+
+	// resolve every host; a fresh answer refreshes that IP's timestamp
+	let fresh = {};
+	let failed = 0;
+	for (let i = 0; i < length(t.tunnel_hosts); i++) {
+		let h = t.tunnel_hosts[i];
+		let ips = resolve_host(h);
+		if (ips == null) {
+			warn('wanguard-antidpi: tunnel host did not resolve: ' + h + '\n');
+			failed++;
+			continue;
+		}
+		for (let j = 0; j < length(ips); j++)
+			fresh[ips[j]] = true;
+	}
+	if (failed == length(t.tunnel_hosts)) {
+		if (dryrun()) {
+			print('DRYRUN: no tunnel host resolved - would keep the last known set (exit 1)\n');
+			exit(0);
+		}
+		warn('wanguard-antidpi: no tunnel host resolved - keeping the last known set\n');
+		system('logger -t wanguard-antidpi "tunnel-update: no host resolved - keeping the last known set"');
+		exit(1);
+	}
+
+	let st = load_state();
+	// adopt entries already in UCI but missing from the state (first run,
+	// state file removed): they expire one window after adoption
+	for (let i = 0; i < length(t.proxy_resolved); i++)
+		if (valid_addr_entry(t.proxy_resolved[i]) && st[t.proxy_resolved[i]] == null)
+			st[t.proxy_resolved[i]] = now;
+	for (let k in fresh)
+		st[k] = now;
+	// expiry: entries not re-observed within the window drop out
+	let surv = [];
+	for (let k in st)
+		if (expire == 0 || now - st[k] < expire)
+			push(surv, k);
+	sort(surv);
+
+	// compare against the current UCI list (garbage entries cannot come back:
+	// the render would die on them, so they are treated as absent here)
+	let cur = [];
+	for (let i = 0; i < length(t.proxy_resolved); i++)
+		if (valid_addr_entry(t.proxy_resolved[i]))
+			push(cur, t.proxy_resolved[i]);
+	sort(cur);
+	let changed = length(surv) != length(cur);
+	if (!changed)
+		for (let i = 0; i < length(surv); i++)
+			if (surv[i] != cur[i]) {
+				changed = true;
+				break;
+			}
+
+	if (dryrun()) {
+		print('DRYRUN: hosts=' + length(t.tunnel_hosts) + ' failed=' + failed +
+			' fresh=' + length(fresh) + ' survivors=' + length(surv) +
+			' current=' + length(cur) + '\n');
+		if (changed)
+			print('DRYRUN: would write tunnel.proxy_resolved (' + length(surv) + ' entries) and re-apply the table when it lives\n');
+		else
+			print('DRYRUN: set unchanged - nothing to write\n');
+		exit(0);
+	}
+
+	// the state file is refreshed on every run (timestamps), set or not
+	save_state(st);
+	if (!changed) {
+		print('wanguard-antidpi: tunnel set unchanged (' + length(cur) + ' entries) - nothing to do\n');
+		exit(0);
+	}
+
+	let added = 0;
+	let dropped = 0;
+	for (let i = 0; i < length(surv); i++)
+		if (index_of(cur, surv[i]) < 0)
+			added++;
+	for (let i = 0; i < length(cur); i++)
+		if (index_of(surv, cur[i]) < 0)
+			dropped++;
+	write_resolved_list(surv);
+	let msg = 'tunnel set updated (+' + added + '/-' + dropped + ' -> ' + length(surv) + ' entries)';
+	if (system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') == 0) {
+		let rc = apply_table();
+		msg += (rc == 0) ? ' - table re-applied' : ' - TABLE APPLY FAILED (rc ' + rc + ')';
+		system('logger -t wanguard-antidpi ' + sh_quote(msg));
+		print('wanguard-antidpi: ' + msg + '\n');
+		if (rc != 0)
+			exit(1);
+	} else {
+		msg += ' - table absent, applies on next start';
+		system('logger -t wanguard-antidpi ' + sh_quote(msg));
+		print('wanguard-antidpi: ' + msg + '\n');
+	}
+	exit(0);
+}
+
+// ---- cron trigger ----
+
+function cron_line(interval) {
+	// busybox crond rereads changed /etc/crontabs/* files itself; stdout is
+	// discarded - the updater reports via syslog (logger) on its own
+	return '0 */' + interval + ' * * * /usr/bin/wanguard-antidpi tunnel-update >/dev/null 2>&1 # ' + CRON_TAG;
+}
+
+function read_crontab_lines() {
+	let txt = readfile(CRONTAB);
+	return (txt == null) ? [] : split(txt, '\n');
+}
+
+function split_cron_lines(lines) {
+	// ours (tagged) vs everything else - foreign lines are never touched
+	let ours = [];
+	let kept = [];
+	for (let i = 0; i < length(lines); i++) {
+		if (index(lines[i], CRON_TAG) >= 0)
+			push(ours, lines[i]);
+		else
+			push(kept, lines[i]);
+	}
+	return { kept: kept, ours: ours };
+}
+
+function write_crontab_lines(lines) {
+	// drop trailing empty lines, single trailing newline
+	let n = length(lines);
+	while (n > 0 && length(trim(lines[n - 1])) == 0)
+		n--;
+	let txt = '';
+	for (let i = 0; i < n; i++)
+		txt += lines[i] + '\n';
+	check_write(CRONTAB, writefile(CRONTAB, txt));
+}
+
+function cmd_cron_install() {
+	let t = load_tunnel();
+	let want = cron_line(t.update_interval);
+	let parts = split_cron_lines(read_crontab_lines());
+	if (dryrun()) {
+		if (length(t.tunnel_hosts) == 0 || t.update_interval == '0')
+			print('DRYRUN: would remove the ' + CRON_TAG + ' cron line if present (' + length(parts.ours) + ' found)\n');
+		else
+			print('DRYRUN: would ensure the cron line: ' + want + '\n');
+		exit(0);
+	}
+	// nothing to schedule (no hosts, or periodic updates disabled by config):
+	// make sure no stale line survives
+	if (length(t.tunnel_hosts) == 0) {
+		if (length(parts.ours) == 0) {
+			print('wanguard-antidpi: no tunnel hosts - no cron entry\n');
+			exit(0);
+		}
+		write_crontab_lines(parts.kept);
+		log('no tunnel hosts configured - removed the stale cron entry');
+		exit(0);
+	}
+	if (t.update_interval == '0') {
+		if (length(parts.ours) == 0) {
+			print('wanguard-antidpi: periodic updates disabled (update_interval=0) - no cron entry\n');
+			exit(0);
+		}
+		write_crontab_lines(parts.kept);
+		log('periodic updates disabled (update_interval=0) - removed the cron entry');
+		exit(0);
+	}
+	if (length(parts.ours) == 1 && parts.ours[0] == want) {
+		print('wanguard-antidpi: cron entry already up to date\n');
+		exit(0);
+	}
+	push(parts.kept, want);
+	write_crontab_lines(parts.kept);
+	log('cron schedule ensured: tunnel-update every ' + t.update_interval + 'h');
+	exit(0);
+}
+
+function cmd_cron_remove() {
+	if (dryrun()) {
+		print('DRYRUN: would remove ' + CRON_TAG + ' cron lines from ' + CRONTAB + '\n');
+		exit(0);
+	}
+	let parts = split_cron_lines(read_crontab_lines());
+	if (length(parts.ours) == 0) {
+		print('wanguard-antidpi: no cron entry - nothing to remove\n');
+		exit(0);
+	}
+	write_crontab_lines(parts.kept);
+	system('logger -t wanguard-antidpi "cron entry removed"');
+	print('wanguard-antidpi: cron entry removed\n');
+	exit(0);
+}
+
+function cmd_tunnel_status() {
+	let t = load_tunnel();
+	let j = function(list) {
+		let out = '';
+		for (let i = 0; i < length(list); i++)
+			out += ((i > 0) ? ', ' : '') + list[i];
+		return (length(list) > 0) ? out : 'none';
+	};
+	let parts = split_cron_lines(read_crontab_lines());
+	print('hosts: ' + j(t.tunnel_hosts) + '\n');
+	print('static pins: ' + j(t.proxy_servers) + '\n');
+	print('resolved: ' + j(t.proxy_resolved) + '\n');
+	print('update interval: ' + t.update_interval + 'h\n');
+	print('expire: ' + t.expire_hours + 'h\n');
+	let crondesc = 'absent';
+	if (length(parts.ours) > 0) {
+		let h = index(parts.ours[0], '#');
+		crondesc = (h != null && h > 0) ? trim(substr(parts.ours[0], 0, h)) : parts.ours[0];
+	}
+	print('cron: ' + crondesc + '\n');
+	print('table: ' + ((system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') == 0) ? 'present' : 'absent') + '\n');
+	let st = load_state();
+	let n = 0;
+	for (let k in st)
+		n++;
+	print('state entries: ' + n + '\n');
+	print('state file: ' + STATE + '\n');
+}
+
+
 let cmd = (length(ARGV) > 0) ? ARGV[0] : 'version';
 switch (cmd) {
 case 'version':
@@ -626,7 +1035,23 @@ case 'mark-status':
 	cmd_mark_status();
 	break;
 
+case 'tunnel-update':
+	cmd_tunnel_update();
+	break;
+
+case 'tunnel-status':
+	cmd_tunnel_status();
+	break;
+
+case 'cron-install':
+	cmd_cron_install();
+	break;
+
+case 'cron-remove':
+	cmd_cron_remove();
+	break;
+
 default:
-	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status]\n');
+	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove]\n');
 	exit(2);
 }

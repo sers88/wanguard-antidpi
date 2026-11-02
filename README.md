@@ -7,12 +7,14 @@ the encrypted proxy tunnel is out of scope (excluded by destination address);
 the engine sees the packets a DPI middlebox can still inspect.
 
 Status: **phase 2** - ucode-first base, the engine payload, the mihomo scope
-integration and the final nft rule set: static nfqws2 (pinned upstream
-zapret2 release) + lua strategies + own procd init + UCI config + idempotent
-mihomo `routing-mark` install with live REST reload + the scope table
-(priority 101, connbytes windows, tunnel/local exclusions, queue bypass).
-Still ahead in phase 2: the tunnel exclusion set updater (#62) and the test
-matrix (#63).
+integration, the final nft rule set and the tunnel exclusion updater:
+static nfqws2 (pinned upstream zapret2 release) + lua strategies + own procd
+init + UCI config + idempotent mihomo `routing-mark` install with live REST
+reload + the scope table (priority 101, connbytes windows, tunnel/local
+exclusions, queue bypass) + the tunnel resolver updater that keeps the
+exclusion set current (multi-A answers, rotating daddrs, per-IP expiry,
+cron-refreshed). Still ahead in phase 2: the test matrix consolidation
+(#63).
 
 **Language policy: ucode-first** (issue #67) - all router-side logic lives in
 a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
@@ -26,6 +28,35 @@ when mihomo is running; a foreign `routing-mark` value is never touched).
 The mark makes ALL mihomo egress visible to the add-on's nft table - this is
 the scope primitive the whole add-on is built around. Removal is explicit
 and sticky (see Rollback).
+
+**Tunnel exclusion** (issue #62) - the proxy tunnel itself is never
+desynchronized: destinations rendered into the nft set `proxy_servers` bypass
+the queue. The set is maintained in UCI (never edited live in nft - an apply
+rebuilds the table): static pins in `tunnel.proxy_servers` plus the
+resolver-managed `tunnel.proxy_resolved`, refreshed by
+`wanguard-antidpi tunnel-update` on every service start and periodically via
+cron. Configure your tunnel hostname(s) in `tunnel.tunnel_hosts` and the
+updater does the rest:
+
+```
+config tunnel 'tunnel'
+	list tunnel_hosts 'cdn.tunnel-provider.example'   # your tunnel host(s)
+	option update_interval '6'                        # cron hours (0 = manual)
+	option expire_hours '24'                          # drop stale IPs after
+```
+
+The updater resolves every host with `nslookup`, keeps ALL observed A
+records (round-robin/rotating answers are the norm - one query rarely
+returns every address), and ages entries out after `expire_hours` without a
+fresh answer. If no host resolves (DNS outage), the last known set is kept
+untouched. Manual controls: `tunnel-update` (one refresh now),
+`tunnel-status` (current state), `cron-install` / `cron-remove` (periodic
+trigger). The rendered set = static pins UNION resolver answers, deduped and
+sorted; entries are validated as canonical IPv4/CIDR at render time.
+Defense in depth for a later phase (#64): desync strategy filters in
+`nfqws2_opt` must be written so they only ever match non-tunnel traffic -
+the nft-level destination exclusion is the primary control and must not be
+the only one.
 
 ## Design constants
 
@@ -69,13 +100,13 @@ apk add wanguard-antidpi
 | Path | What |
 |---|---|
 | `/usr/bin/nfqws2` | static desync engine from the pinned upstream zapret2 release (shipped unmodified) |
-| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush (all state-changing commands are DRYRUN-aware) |
+| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`); all state-changing commands are DRYRUN-aware |
 | `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
 | `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
 | `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@` rendered from the config by `nft-render`) |
 | `/usr/share/wanguard-antidpi/version` | package version stamp |
 | `/etc/config/wanguard-antidpi` | UCI config template (source of truth; apk-protected: user edits survive upgrades) |
-| `/etc/init.d/wanguard-antidpi` | procd init (thin sh shim - the rc.common contract): apply own nft table -> engine instance (respawn on crash); stop = kill -> flush table |
+| `/etc/init.d/wanguard-antidpi` | procd init (thin sh shim - the rc.common contract): ensure mihomo mark -> refresh tunnel exclusion set (non-fatal) -> apply own nft table -> ensure the periodic-update cron line -> engine instance (respawn on crash); stop = kill -> drop cron line -> flush table |
 
 Upstream pinning (issue #57): the engine payload comes from the
 `bol-van/zapret2` `openwrt-embedded` release artifact, downloaded at build
@@ -97,11 +128,12 @@ Engine lifecycle notes:
   blockcheck tuning) the engine starts, binds the queue and passes packets
   unmodified; without mihomo running, no packet carries the scope mark, the
   queue stays empty (`bypass`), and the init logs a hint to logread
-- tunnel exclusion: the `proxy_servers` set ships EMPTY (issue #62 maintains
-  the `tunnel.proxy_servers` UCI list and the table renders it on every
-  apply). Until it is populated the tunnel itself matches the queue - keep
-  the strategy list empty, or desynchronizing the tunnel's own TLS would
-  break it
+- tunnel exclusion: the `proxy_servers` set is rendered from the UCI lists
+  (`tunnel.proxy_servers` static pins + `tunnel.proxy_resolved` maintained
+  by the resolver updater, issue #62) on every apply. With tunnel hosts
+  configured the updater fills the set automatically; until then the tunnel
+  itself matches the queue - keep the strategy list empty, or
+  desynchronizing the tunnel's own TLS would break it
 - `bypass` queue semantics: if the engine dies, marked packets leave
   unprocessed instead of dropping (procd respawns it meanwhile)
 - DRYRUN contract: `WANGUARD_ANTIDPI_DRYRUN=1` makes the init/CLI print
@@ -133,6 +165,10 @@ Engine lifecycle notes:
 
 - remove the package (`apk del wanguard-antidpi`); run `mark-remove` first
   if the mihomo config should be restored - apk has no uninstall hooks.
+  A stopped service leaves no periodic updater behind (stop drops the cron
+  line); `/usr/share/wanguard-antidpi/tunnel-resolved.state` (per-IP
+  timestamps of the resolver answers) is an unowned leftover file and can be
+  removed together with the package.
 
 Note on licensing: this repository's own code is MIT. The upstream engine
 zapret2 does not declare a license; its binary and lua strategies are
@@ -186,6 +222,14 @@ What runs where:
   (unmarked traffic never ticks the counters), flush. Uses the same pinned
   mihomo as the marked traffic source; runs in CI (job `nft-test`); on a
   kernel without NFQUEUE it stays structural (`NFT-LIVE-SKIP`).
+- `scripts/test-tunnel.sh` - the tunnel exclusion resolver updater, live
+  (needs `--cap-add NET_ADMIN`, no network: DNS answers come from a stub
+  `nslookup` on PATH): multi-A resolution into the sorted UCI list,
+  idempotency (config bytes untouched), cross-host dedupe, partial and total
+  resolution failures, per-IP expiry, live apply with a populated set,
+  update-while-live, no-table guard, render-injection guard. Runs in CI
+  (job `tunnel-test`); without NFQUEUE in the host kernel the live apply
+  part stays structural (`TUNNEL-LIVE-SKIP`).
 
 The smoke set grows into the full container test matrix (#63).
 

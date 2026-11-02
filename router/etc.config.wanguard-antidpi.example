@@ -53,12 +53,35 @@ config mihomo 'mihomo'
 
 config tunnel 'tunnel'
 
+	# ---- manual static pins ----
 	# upstream proxy/tunnel endpoints excluded from the add-on's queue scope
-	# (issues #61/#62): rendered into the nft set `proxy_servers` on every
-	# apply. Maintained by the resolver updater (issue #62) - until it is
-	# populated the tunnel is NOT excluded from the queue, so keep the engine
-	# strategy empty (graceful no-op): desynchronizing the tunnel's own TLS
-	# would break the tunnel. Canonical IPv4 or CIDR entries.
+	# (issues #61/#62), rendered into the nft set `proxy_servers` on every
+	# apply together with the resolver-managed list below. Never touched by
+	# the updater - use for a fixed server address or an escape hatch.
+	# Canonical IPv4 or CIDR entries.
 	#
 	#	list proxy_servers '203.0.113.7'
 	#	list proxy_servers '203.0.113.0/24'
+
+	# ---- resolver updater (issue #62) ----
+	# Hostnames of the upstream proxy/tunnel endpoints. `wanguard-antidpi
+	# tunnel-update` (runs on every service start and periodically via cron)
+	# resolves them with nslookup, keeps every observed A record and ages
+	# entries out after expire_hours - the tunnel daddr rotates, one answer
+	# rarely carries all addresses. Until the set is populated the tunnel is
+	# NOT excluded from the queue, so keep the engine strategy empty (graceful
+	# no-op): desynchronizing the tunnel's own TLS would break the tunnel.
+	# At least two labels required (single labels cannot resolve via DNS).
+	#
+	#	list tunnel_hosts 'cdn.example.net'
+
+	# hours between periodic updates (cron); 0 = manual updates only
+	#	option update_interval '6'
+
+	# hours an IP survives without being seen in DNS answers; 0 = never expire
+	#	option expire_hours '24'
+
+	# MACHINE-MANAGED by `tunnel-update`: the current resolver answers plus
+	# entries not yet expired. Do not edit - static pins go to proxy_servers
+	# above. Rendered into the nft set on every apply together with them.
+	#	list proxy_resolved '203.0.113.10'

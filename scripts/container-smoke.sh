@@ -189,35 +189,107 @@ printf '%s\n' "$out" | grep -qE '@[A-Z_]+@' \
 	|| fail "nft-render: expected elements only on local_v4 with an empty proxy_servers"
 # determinism: same config -> byte-identical render
 [ "$out" = "$("$CLI" nft-render)" ] || fail "nft-render not deterministic"
-# filled UCI list -> rendered elements (issue #62 contract, wired here for #61)
+# filled UCI lists -> sorted merged render (issue #62: manual pins UNION
+# resolver-managed answers, dedupe, canonical order)
 uci set wanguard-antidpi.tunnel=tunnel
 uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.7'
 uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/24'
+uci add_list wanguard-antidpi.tunnel.proxy_resolved='192.0.2.7'
+uci add_list wanguard-antidpi.tunnel.proxy_resolved='198.51.100.5'
 uci commit wanguard-antidpi
 out=$("$CLI" nft-render)
 case "$out" in
-	*"elements = { 192.0.2.7, 192.0.2.0/24 }"*) ;;
-	*) fail "nft-render: tunnel.proxy_servers elements not rendered" ;;
+	*"elements = { 192.0.2.0/24, 192.0.2.7, 198.51.100.5 }"*) ;;
+	*) fail "nft-render: proxy set merge (manual UNION resolved, dedupe, sorted) broken" ;;
 esac
 [ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "2" ] \
-	|| fail "nft-render: both sets must carry elements once the list is filled"
-# malformed entries are rejected at render time (render-injection safety)
-uci del_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.7'
-uci del_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/24'
+	|| fail "nft-render: both sets must carry elements once the lists are filled"
+# malformed entries are rejected at render time (render-injection safety) -
+# in BOTH lists, manual and resolver-managed
+uci delete wanguard-antidpi.tunnel
+uci set wanguard-antidpi.tunnel=tunnel
 uci add_list wanguard-antidpi.tunnel.proxy_servers='300.1.1.1'
 uci commit wanguard-antidpi
 "$CLI" nft-render >/dev/null 2>&1 \
 	&& fail "nft-render accepted a malformed proxy_servers entry (octet > 255)"
-uci del_list wanguard-antidpi.tunnel.proxy_servers='300.1.1.1'
-uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/33'
+uci delete wanguard-antidpi.tunnel
+uci set wanguard-antidpi.tunnel=tunnel
+uci add_list wanguard-antidpi.tunnel.proxy_resolved='192.0.2.0/33'
 uci commit wanguard-antidpi
 "$CLI" nft-render >/dev/null 2>&1 \
-	&& fail "nft-render accepted a malformed proxy_servers entry (mask > 32)"
+	&& fail "nft-render accepted a malformed proxy_resolved entry (mask > 32)"
 uci delete wanguard-antidpi.tunnel
 uci commit wanguard-antidpi
 out=$("$CLI" nft-render)
 [ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "1" ] \
 	|| fail "nft-render: config not pristine after the tunnel-section test"
+
+# ---- tunnel resolver updater (issue #62): structural here; the live matrix
+# ---- (stub DNS answers + real table state) is scripts/test-tunnel.sh
+out=$("$CLI" tunnel-update)
+case "$out" in
+	*"no tunnel hosts"*) ;;
+	*) fail "tunnel-update without hosts must be a no-op, got: $out" ;;
+esac
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" tunnel-update)
+case "$out" in
+	*"no tunnel hosts"*) ;;
+	*) fail "tunnel-update DRYRUN without hosts must be a no-op, got: $out" ;;
+esac
+out=$("$CLI" tunnel-status)
+case "$out" in
+	*"hosts: none"*"resolved: none"*"cron: absent"*"table: absent"*"state entries: 0"*) ;;
+	*) fail "tunnel-status unexpected on a fresh host: $out" ;;
+esac
+
+# cron mechanics (issue #62): one tagged line, foreign lines untouched,
+# interval changes update it in place, remove is idempotent
+mkdir -p /etc/crontabs
+printf '13 5 * * * /usr/bin/foreign-job # keep-me\n' > /etc/crontabs/root
+cp /etc/crontabs/root /tmp/smoke-crontab-orig
+uci set wanguard-antidpi.tunnel=tunnel
+uci add_list wanguard-antidpi.tunnel.tunnel_hosts='tunnel.example.net'
+uci commit wanguard-antidpi
+"$CLI" cron-install >/dev/null || fail "cron-install failed"
+[ "$(grep -c 'wanguard-antidpi-tunnel-update' /etc/crontabs/root)" = "1" ] \
+	|| fail "cron-install did not ensure exactly one tagged line"
+grep -q 'keep-me' /etc/crontabs/root || fail "cron-install lost a foreign line"
+cp /etc/crontabs/root /tmp/smoke-crontab-1
+"$CLI" cron-install >/dev/null || fail "cron-install rerun failed"
+cmp -s /etc/crontabs/root /tmp/smoke-crontab-1 || fail "cron-install is not idempotent"
+uci set wanguard-antidpi.tunnel.update_interval='2'
+uci commit wanguard-antidpi
+"$CLI" cron-install >/dev/null || fail "cron-install (interval change) failed"
+[ "$(grep -c 'wanguard-antidpi-tunnel-update' /etc/crontabs/root)" = "1" ] \
+	|| fail "interval change duplicated the cron line"
+grep -q '0 \*/2 \* \* \*' /etc/crontabs/root || fail "interval change not applied to the line"
+cp /etc/crontabs/root /tmp/smoke-crontab-2
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" cron-install)
+case "$out" in
+	*"DRYRUN"*"cron line"*) ;;
+	*) fail "cron-install DRYRUN: wrong output" ;;
+esac
+cmp -s /etc/crontabs/root /tmp/smoke-crontab-2 || fail "cron-install DRYRUN touched the crontab"
+"$CLI" cron-remove >/dev/null || fail "cron-remove failed"
+grep -q 'wanguard-antidpi-tunnel-update' /etc/crontabs/root \
+	&& fail "cron-remove left the tagged line"
+grep -q 'keep-me' /etc/crontabs/root || fail "cron-remove lost a foreign line"
+"$CLI" cron-remove >/dev/null || fail "cron-remove rerun (idempotent) failed"
+# disabled / empty modes keep the crontab clean
+uci set wanguard-antidpi.tunnel.update_interval='0'
+uci commit wanguard-antidpi
+"$CLI" cron-install >/dev/null || fail "cron-install (disabled) failed"
+grep -q 'wanguard-antidpi-tunnel-update' /etc/crontabs/root \
+	&& fail "cron-install scheduled despite update_interval=0"
+uci delete wanguard-antidpi.tunnel
+uci commit wanguard-antidpi
+out=$("$CLI" cron-install)
+case "$out" in
+	*"no tunnel hosts"*) ;;
+	*) fail "cron-install without hosts must be a no-op, got: $out" ;;
+esac
+cmp -s /etc/crontabs/root /tmp/smoke-crontab-orig || fail "crontab not restored"
+rm -f /tmp/smoke-crontab-orig /tmp/smoke-crontab-1 /tmp/smoke-crontab-2
 
 # ---- mihomo routing-mark integration (issue #60; no mihomo binary/process
 # ---- in this container - the graceful paths plus the file mechanics) ----
