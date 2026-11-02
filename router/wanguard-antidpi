@@ -1,0 +1,8 @@
+#!/bin/sh
+# wanguard-antidpi - placeholder CLI (phase 1 bootstrap, issue #56).
+# The real control CLI (nfqws2 engine status, nft/queue diagnostics, uci
+# integration) lands in later phases; this stub only proves the
+# feed -> router pipeline end to end.
+V="/usr/share/wanguard-antidpi/version"
+[ -r "$V" ] || { echo "wanguard-antidpi: no version stamp installed" >&2; exit 1; }
+echo "wanguard-antidpi $(cat "$V") (placeholder - engine integration pending)"

@@ -1,0 +1,136 @@
+name: apk feed
+
+# Builds the package (apk/build.sh), signs the repository index with
+# APK_SIGN_KEY, publishes the feed to the orphan `feed` branch (served via
+# raw.githubusercontent.com) and verifies install inside an OpenWrt container.
+# Release flow: tag v0.1.2 -> package version 0.1.2-r1.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APK_STATIC_URL: https://gitlab.alpinelinux.org/api/v4/projects/5/packages/generic/v3.0.7/x86_64/apk.static
+  APK_STATIC_SHA256: c07bf5356eacc9dd7a8c56bc537f46702f007170287403299d52a04264e74b3c
+
+jobs:
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    outputs:
+      ver: ${{ steps.ver.outputs.ver }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve package version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "ver=${GITHUB_REF_NAME#v}-r1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=0.0.0-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download pinned apk.static 3.0.7
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL" \
+            || curl -fsSL --retry 3 --connect-timeout 20 -o apk.static \
+              "https://github.com/sers88/wanguard/releases/download/ci-tools/apk.static"
+          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
+          chmod +x apk.static
+
+      - name: Build package
+        run: |
+          mkdir out
+          sh apk/build.sh "$GITHUB_WORKSPACE" ./apk.static "${{ steps.ver.outputs.ver }}" out
+          ls -la out
+
+      - name: Inspect package metadata
+        run: |
+          for p in out/*.apk; do
+            echo "== $p"
+            ./apk.static adbdump "$p" | sed -n '/^info:/,/^paths:/p'
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: out/*.apk
+
+  feed:
+    name: Sign index, publish feed branch
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Download pinned apk.static 3.0.7
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 20 -o apk.static "$APK_STATIC_URL" \
+            || curl -fsSL --retry 3 --connect-timeout 20 -o apk.static \
+              "https://github.com/sers88/wanguard/releases/download/ci-tools/apk.static"
+          echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
+          chmod +x apk.static
+
+      - name: Verify signing key against committed public key
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          set -eu
+          [ -n "$APK_SIGN_KEY" ] || { echo "APK_SIGN_KEY secret is not set" >&2; exit 1; }
+          printf '%s\n' "$APK_SIGN_KEY" > private-key.pem
+          openssl ec -in private-key.pem -pubout -out derived.pem
+          diff -u keys/wanguard-antidpi.pem derived.pem
+
+      - name: Sign repository index
+        run: |
+          ./apk.static mkndx --allow-untrusted --sign private-key.pem --output out/packages.adb out/*.apk
+          rm -f private-key.pem
+          ls -la out
+
+      - name: Publish feed branch
+        env:
+          VER: ${{ needs.build.outputs.ver }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p site/packages/x86_64 site/keys
+          cp out/*.apk out/packages.adb site/packages/x86_64/
+          cp keys/wanguard-antidpi.pem site/keys/wanguard-antidpi.pem
+          cd site
+          git init -q -b feed
+          git config user.name "wanguard-antidpi-feed-bot"
+          git config user.email "wanguard-antidpi-feed-bot@users.noreply.github.com"
+          git add -A
+          git commit -qm "feed $VER ($GITHUB_REF_NAME)"
+          git push -qf "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" feed:feed
+
+  feed-test:
+    name: Install test (OpenWrt 25.12.6 container)
+    needs: [build, feed]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from feed in OpenWrt container
+        env:
+          VER: ${{ needs.build.outputs.ver }}
+        run: |
+          docker run --rm -v "$PWD/keys:/hostkeys:ro" openwrt/rootfs:x86_64-25.12.6 sh -exc '
+            cp /hostkeys/wanguard-antidpi.pem /etc/apk/keys/
+            echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x86_64/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
+            apk update
+            apk add wanguard-antidpi
+            test -x /usr/bin/wanguard-antidpi
+            test -f /usr/share/wanguard-antidpi/version
+            test "$(cat /usr/share/wanguard-antidpi/version)" = "'"$VER"'"
+            /usr/bin/wanguard-antidpi | grep -q "'"$VER"'" # placeholder CLI reports the stamp
+            echo FEED-TEST-OK
+          '
