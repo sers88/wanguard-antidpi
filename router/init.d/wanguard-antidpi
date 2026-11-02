@@ -40,7 +40,8 @@ start_service() {
 	# word-split the one-arg-per-line output into argv (IFS includes \n)
 	set -- $("$CLI" engine-cmdline)
 	prog=$1
-	shift	procd_open_instance wanguard-antidpi
+	shift
+	procd_open_instance wanguard-antidpi
 	procd_set_param command "$prog" "$@"
 	# respawn on crash (same policy as wanguard core)
 	procd_set_param respawn 3600 5 0

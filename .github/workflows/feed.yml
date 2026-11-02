@@ -31,7 +31,11 @@ jobs:
         id: ver
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
-            echo "ver=${GITHUB_REF_NAME#v}-r1" >> "$GITHUB_OUTPUT"
+            base="${GITHUB_REF_NAME#v}"
+            case "$base" in
+              *-r[0-9]*) echo "ver=$base" >> "$GITHUB_OUTPUT" ;; # explicit revision tag: v1.0.6-r2
+              *) echo "ver=$base-r1" >> "$GITHUB_OUTPUT" ;;      # vX.Y.Z -> X.Y.Z-r1
+            esac
           else
             echo "ver=0.0.0-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
           fi
@@ -49,9 +53,10 @@ jobs:
         run: |
           set -eu
           pinned=$(grep -m1 '^ZAPRET2_VERSION_DEFAULT=' scripts/fetch-upstream.sh | cut -d= -f2)
-          echo "tag=${GITHUB_REF_NAME#v} pinned=$pinned"
-          [ "${GITHUB_REF_NAME#v}" = "$pinned" ] || {
-            echo "ERROR: release tag v<pkg> must equal the pinned zapret2 version in scripts/fetch-upstream.sh (package major version = upstream version)" >&2
+          base="${GITHUB_REF_NAME#v}"; base="${base%%-r*}"
+          echo "tag base=$base pinned=$pinned"
+          [ "$base" = "$pinned" ] || {
+            echo "ERROR: release tag v<pkg>[-rN] must carry the pinned zapret2 version in scripts/fetch-upstream.sh (package major version = upstream version)" >&2
             exit 1
           }
 

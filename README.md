@@ -72,7 +72,9 @@ until the hostlist/autohostlist phase.
 
 The package major version tracks the upstream engine version: release tag
 `v1.0.6` produces package `1.0.6-r1` (CI fails a tag that does not equal the
-pinned `ZAPRET2_VERSION_DEFAULT`). Engine lifecycle notes:
+pinned `ZAPRET2_VERSION_DEFAULT`). Package-only fixes (without an upstream
+bump) ship as an explicit revision tag: `v1.0.6-r2` produces `1.0.6-r2`.
+Engine lifecycle notes:
 
 - graceful no-op: with the strategy empty (`NFQWS2_OPT=""`, the default until
   blockcheck tuning) the engine starts, binds the queue and passes packets
