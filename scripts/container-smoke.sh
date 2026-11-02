@@ -1,14 +1,20 @@
 #!/bin/sh
 # scripts/container-smoke.sh - install + smoke test of the package inside an
-# OpenWrt container (issue #59). ONE script, TWO modes, so the local dev stand
-# and CI (feed.yml feed-test) run byte-identical checks and their results are
+# OpenWrt container. ONE script, TWO modes, so the local dev stand and CI
+# (feed.yml feed-test) run byte-identical checks and their results are
 # comparable by construction:
 #
 #   local: /out mounted (ro) with the built *.apk   -> apk add --allow-untrusted
 #   feed : /hostkeys mounted (ro) with the feed key -> apk add from signed feed
 #
+# /scripts must be mounted (ro) too: the upstream engine version pin is read
+# from fetch-upstream.sh so the engine-version assertion is independent of
+# the package version (dev snapshots are 0.0.0-rN).
+#
 # Usage: container-smoke.sh <local|feed> <version>
-# Later matrix slices (issue #63) extend the shared assertion section below.
+# Structural checks only (issue #57): no live nft/queue state is touched -
+# live NFQUEUE scenarios are gated by the host-kernel probe (kernel-probe.sh)
+# and land with the test matrix (issue #63).
 set -eu
 
 MODE="${1:?usage: container-smoke.sh <local|feed> <version>}"
@@ -24,6 +30,7 @@ local)
 	;;
 feed)
 	[ -f /hostkeys/wanguard-antidpi.pem ] || { echo "SMOKE-FAIL: /hostkeys not mounted"; exit 1; }
+	[ -f /scripts/fetch-upstream.sh ] || { echo "SMOKE-FAIL: /scripts not mounted"; exit 1; }
 	echo "== install (signed feed)"
 	cp /hostkeys/wanguard-antidpi.pem /etc/apk/keys/
 	echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x86_64/packages.adb" \
@@ -42,18 +49,103 @@ fail() {
 	exit 1
 }
 
-# layout + build stamp (previously the CI feed-test assertions)
-[ -x /usr/bin/wanguard-antidpi ] || fail "/usr/bin/wanguard-antidpi not executable"
-[ -f /usr/share/wanguard-antidpi/version ] || fail "version stamp missing"
-[ "$(cat /usr/share/wanguard-antidpi/version)" = "$VER" ] || fail "stamp does not equal $VER"
-/usr/bin/wanguard-antidpi | grep -q "$VER" || fail "CLI does not report $VER"
+CLI=/usr/bin/wanguard-antidpi
+PKGDIR=/usr/share/wanguard-antidpi
 
-# smoke set (extensible per issue #63)
-sh -n /usr/bin/wanguard-antidpi || fail "syntax check failed"
-out1=$(/usr/bin/wanguard-antidpi)
-out2=$(/usr/bin/wanguard-antidpi)
-[ "$out1" = "$out2" ] || fail "CLI output not deterministic"
+# ---- package registration + stamp ----
 apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \
 	|| fail "package not registered as wanguard-antidpi-$VER"
+[ -f "$PKGDIR/version" ] || fail "version stamp missing"
+[ "$(cat "$PKGDIR/version")" = "$VER" ] || fail "stamp does not equal $VER"
+"$CLI" | grep -q "$VER" || fail "CLI does not report $VER"
+
+# ---- engine payload (issue #57) ----
+[ -x /usr/bin/nfqws2 ] || fail "nfqws2 binary missing"
+PIN=$(grep -m1 '^ZAPRET2_VERSION_DEFAULT=' /scripts/fetch-upstream.sh | cut -d= -f2)
+[ -n "$PIN" ] || fail "cannot read upstream version pin from /scripts/fetch-upstream.sh"
+nfver=$(/usr/bin/nfqws2 --version 2>/dev/null | head -n 1)
+case "$nfver" in
+	"github version v$PIN "*) ;;
+	*) fail "nfqws2 --version ('$nfver') does not match the pinned upstream v$PIN" ;;
+esac
+for l in zapret-lib zapret-antidpi; do
+	f="$PKGDIR/lua/$l.lua.gz"
+	[ -f "$f" ] || fail "$f missing"
+	# gzip magic 1f 8b (container busybox may lack gunzip/od)
+	head -c 2 "$f" | grep -q "$(printf '\037\213')" || fail "$f is not gzip"
+done
+# gzipped lua is supported natively by nfqws2 (--lua-init=@<file>), verified
+# in the container: LuaJIT banner prints, no parse errors (#57 spike)
+
+# ---- own lifecycle scripts ----
+sh -n "$CLI" || fail "CLI syntax"
+sh -n /etc/init.d/wanguard-antidpi || fail "init script syntax"
+grep -q '^USE_PROCD=1' /etc/init.d/wanguard-antidpi || fail "init is not procd"
+grep -q '^START=25' /etc/init.d/wanguard-antidpi || fail "init START=25 missing"
+[ -f "$PKGDIR/wanguard-antidpi.nft" ] || fail "nft template missing"
+
+sh -n /etc/wanguard-antidpi/config || fail "config syntax"
+( . /etc/wanguard-antidpi/config
+	[ "$QNUM" = "300" ] || fail "config QNUM != 300"
+	[ "$DESYNC_MARK" = "0x40000000" ] || fail "config DESYNC_MARK != 0x40000000"
+	[ "$NFQWS2_DEBUG" = "0" ] || fail "config NFQWS2_DEBUG != 0"
+	[ -z "$NFQWS2_OPT" ] || fail "default NFQWS2_OPT not empty (graceful no-op default)"
+) || exit 1
+
+# ---- engine command line (what the init starts) ----
+cl=$("$CLI" engine-cmdline)
+case "$cl" in
+	*--qnum=300*) ;;
+	*) fail "engine-cmdline: no --qnum=300" ;;
+esac
+case "$cl" in
+	*--fwmark=0x40000000*) ;;
+	*) fail "engine-cmdline: no --fwmark=0x40000000" ;;
+esac
+case "$cl" in
+	*--user=daemon*) ;;
+	*) fail "engine-cmdline: no --user=daemon" ;;
+esac
+case "$cl" in
+	*"@$PKGDIR/lua/zapret-lib.lua.gz"*) ;;
+	*) fail "engine-cmdline: zapret-lib.lua.gz missing" ;;
+esac
+case "$cl" in
+	*"@$PKGDIR/lua/zapret-antidpi.lua.gz"*) ;;
+	*) fail "engine-cmdline: zapret-antidpi.lua.gz missing" ;;
+esac
+[ "$(printf '%s\n' "$cl" | grep -c -- '--lua-init=@')" = "2" ] \
+	|| fail "engine-cmdline: expected exactly 2 --lua-init args"
+case "$cl" in
+	*--debug=1*) fail "engine-cmdline: --debug leaked into default (NFQWS2_DEBUG=0)" ;;
+esac
+
+# ---- nft render + DRYRUN contract (no live state touched) ----
+out=$("$CLI" nft-render)
+case "$out" in
+	*"queue flags bypass to 300"*) ;;
+	*) fail "nft-render: queue rule not rendered with QNUM from config" ;;
+esac
+case "$out" in
+	*"table inet wanguard_antidpi"*) ;;
+	*) fail "nft-render: own table missing" ;;
+esac
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" nft-apply)
+case "$out" in
+	*"DRYRUN"*"queue flags bypass to 300"*) ;;
+	*) fail "nft-apply DRYRUN: wrong output" ;;
+esac
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" nft-flush)
+case "$out" in
+	*"DRYRUN"*"wanguard_antidpi"*) ;;
+	*) fail "nft-flush DRYRUN: wrong output" ;;
+esac
+# init DRYRUN paths are exercised on hosts with rc.common; here only the CLI
+# surface they call is proven (rc.common does not exist in the container)
+
+# ---- smoke set: CLI determinism (bootstrap contract, kept from #56) ----
+out1=$("$CLI")
+out2=$("$CLI")
+[ "$out1" = "$out2" ] || fail "CLI output not deterministic"
 
 echo "SMOKE-OK ($MODE, $VER)"

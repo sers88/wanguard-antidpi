@@ -39,6 +39,7 @@ if [ ! -f out/apk.static ]; then
 fi
 
 echo "== building wanguard-antidpi $VER in $IMAGE"
+sh scripts/fetch-upstream.sh
 docker run --rm \
 	-v "$(hostpath "$PWD"):/work" -w /work \
 	"$IMAGE" \

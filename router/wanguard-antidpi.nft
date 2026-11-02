@@ -1,0 +1,22 @@
+#!/usr/sbin/nft -f
+# wanguard-antidpi scope table (issue #57 skeleton; final rule set lands
+# with #61: tunnel-daddr exclusion, scope refinement).
+#
+# Applied by `wanguard-antidpi nft-apply` (declare+delete+define = idempotent
+# re-apply; verified against nftables 1.1.6 / OpenWrt 25.12). @QNUM@ is
+# substituted from /etc/wanguard-antidpi/config by nft-render.
+#
+# - postrouting @ mangle+10: post-NAT egress form, the canonical nfqws hook
+#   (upstream iptables mode hooks POSTROUTING mangle likewise)
+# - meta mark 0x10000000: the mihomo routing-mark scope (DESIGN CONSTANT,
+#   published in README; only mihomo's own DIRECT egress matches)
+# - queue flags bypass: fails open - if the engine dies, marked packets
+#   leave unprocessed instead of dropping
+table inet wanguard_antidpi
+delete table inet wanguard_antidpi
+table inet wanguard_antidpi {
+	chain egress {
+		type filter hook postrouting priority mangle + 10; policy accept;
+		meta mark 0x10000000 queue flags bypass to @QNUM@
+	}
+}

@@ -3,7 +3,9 @@ name: apk feed
 # Builds the package (apk/build.sh), signs the repository index with
 # APK_SIGN_KEY, publishes the feed to the orphan `feed` branch (served via
 # raw.githubusercontent.com) and verifies install inside an OpenWrt container.
-# Release flow: tag v0.1.2 -> package version 0.1.2-r1.
+# Release flow: tag v1.0.6 -> package version 1.0.6-r1. The major version
+# tracks the pinned upstream zapret2 release (scripts/fetch-upstream.sh);
+# a tag guard below fails the build if they diverge.
 on:
   push:
     tags: ['v*']
@@ -41,6 +43,20 @@ jobs:
               "https://github.com/sers88/wanguard/releases/download/ci-tools/apk.static"
           echo "$APK_STATIC_SHA256  apk.static" | sha256sum -c - # pin gates EITHER source
           chmod +x apk.static
+
+      - name: Guard: release tag must match the pinned upstream engine version
+        if: github.ref_type == 'tag'
+        run: |
+          set -eu
+          pinned=$(grep -m1 '^ZAPRET2_VERSION_DEFAULT=' scripts/fetch-upstream.sh | cut -d= -f2)
+          echo "tag=${GITHUB_REF_NAME#v} pinned=$pinned"
+          [ "${GITHUB_REF_NAME#v}" = "$pinned" ] || {
+            echo "ERROR: release tag v<pkg> must equal the pinned zapret2 version in scripts/fetch-upstream.sh (package major version = upstream version)" >&2
+            exit 1
+          }
+
+      - name: Fetch pinned upstream engine payload (nfqws2 + lua)
+        run: sh scripts/fetch-upstream.sh
 
       - name: Build package
         run: |

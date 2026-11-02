@@ -1,0 +1,59 @@
+#!/bin/sh /etc/rc.common
+# wanguard-antidpi init (issue #57): nfqws2 engine scoped to mihomo DIRECT
+# egress. Own lifecycle (ad-on pattern) - upstream zapret2's installer and
+# its init.d/openwrt are NOT used.
+#
+# start: apply the own nft table -> procd instance (respawn on crash)
+# stop : procd kills the instance -> flush the nft table
+#
+# DRYRUN contract (container matrix, issues #57/#63):
+#   WANGUARD_ANTIDPI_DRYRUN=1 start   -> print actions, touch nothing
+#   WANGUARD_ANTIDPI_DRYRUN=1 stop    -> print actions, touch nothing
+#
+# Logging goes to syslog (logread): procd captures engine stdout/stderr,
+# lifecycle events are logged via logger. NFQWS2_DEBUG=1 (config) appends
+# --debug=1 for blockcheck sessions - temporary by design.
+
+USE_PROCD=1
+START=25
+STOP=90
+
+CLI=/usr/bin/wanguard-antidpi
+
+start_service() {
+	if [ "${WANGUARD_ANTIDPI_DRYRUN:-0}" = "1" ]; then
+		"$CLI" nft-apply
+		echo "DRYRUN: would start procd instance:"
+		"$CLI" engine-cmdline
+		return 0
+	fi
+
+	"$CLI" nft-apply || return 1
+
+	# graceful no-op hint (issue #57): without mihomo no packet carries the
+	# 0x10000000 scope mark, the queue stays empty (bypass) and the engine
+	# idles. This is normal - logread carries the explanation.
+	if ! pidof mihomo >/dev/null 2>&1; then
+		logger -t wanguard-antidpi "mihomo not found - processing not active (no traffic matches the scope mark; engine idles)"
+	fi
+
+	# word-split the one-arg-per-line output into argv (IFS includes \n)
+	set -- $("$CLI" engine-cmdline)
+	prog=$1
+	shift	procd_open_instance wanguard-antidpi
+	procd_set_param command "$prog" "$@"
+	# respawn on crash (same policy as wanguard core)
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	if [ "${WANGUARD_ANTIDPI_DRYRUN:-0}" = "1" ]; then
+		echo "DRYRUN: would flush the nft table (procd already stopped the engine)"
+		return 0
+	fi
+	# called by stop() after procd killed the instances
+	"$CLI" nft-flush
+}

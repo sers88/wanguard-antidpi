@@ -6,9 +6,10 @@ engine applied only to mihomo DIRECT egress, as a companion to
 the encrypted proxy tunnel is out of scope (excluded by destination address);
 the engine sees the packets a DPI middlebox can still inspect.
 
-Status: **phase 1 bootstrap** - the signed apk feed pipeline only. The package
-is a placeholder (a stub CLI + build stamp); the real engine integration
-(kmods, nft rules, control CLI, init scripts) lands in later phases.
+Status: **phase 1** - signed apk feed pipeline plus the real engine payload:
+static nfqws2 (pinned upstream zapret2 release) + lua strategies + own procd
+init + config. Scope integration (mihomo `routing-mark` install, the final
+nft rule set, tunnel exclusion) lands in phase 2.
 
 ## Design constants
 
@@ -46,6 +47,47 @@ apk update
 apk add wanguard-antidpi
 ```
 
+## Package contents
+
+| Path | What |
+|---|---|
+| `/usr/bin/nfqws2` | static desync engine from the pinned upstream zapret2 release (shipped unmodified) |
+| `/usr/bin/wanguard-antidpi` | control CLI: version, engine command line, nft render/apply/flush (all state-changing commands are DRYRUN-aware) |
+| `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
+| `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
+| `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@` rendered from the config by `nft-render`) |
+| `/usr/share/wanguard-antidpi/version` | package version stamp |
+| `/etc/wanguard-antidpi/config` | config template (sh-style); apk-protected: user edits survive upgrades |
+| `/etc/init.d/wanguard-antidpi` | procd init: apply own nft table -> engine instance (respawn on crash); stop = kill -> flush table |
+
+Upstream pinning (issue #57): the engine payload comes from the
+`bol-van/zapret2` `openwrt-embedded` release artifact, downloaded at build
+time by `scripts/fetch-upstream.sh` and verified against two pinned sha256
+values - the artifact itself and the canonical
+`binaries/linux-x86_64/nfqws2` hash from the upstream `sha256sum.txt`.
+Nothing else from the artifact is packaged: the add-on owns the lifecycle
+(its own init/nft/config); upstream's installer, init scripts and firewall
+mechanics are not used. `ip2net`/`mdig` and `zapret-auto.lua.gz` are deferred
+until the hostlist/autohostlist phase.
+
+The package major version tracks the upstream engine version: release tag
+`v1.0.6` produces package `1.0.6-r1` (CI fails a tag that does not equal the
+pinned `ZAPRET2_VERSION_DEFAULT`). Engine lifecycle notes:
+
+- graceful no-op: with the strategy empty (`NFQWS2_OPT=""`, the default until
+  blockcheck tuning) the engine starts, binds the queue and passes packets
+  unmodified; without mihomo running, no packet carries the scope mark, the
+  queue stays empty (`bypass`), and the init logs a hint to logread
+- `bypass` queue semantics: if the engine dies, marked packets leave
+  unprocessed instead of dropping (procd respawns it meanwhile)
+- DRYRUN contract: `WANGUARD_ANTIDPI_DRYRUN=1` makes the init/CLI print
+  actions without touching live state - this is what the container test
+  matrix exercises
+
+Note on licensing: this repository's own code is MIT. The upstream engine
+zapret2 does not declare a license; its binary and lua strategies are
+redistributed here unmodified, pinned by sha256.
+
 ## Development
 
 All development and testing runs in Docker containers - the same
@@ -64,9 +106,11 @@ scripts handle Git Bash path-mangling quirks themselves).
 
 What runs where:
 
-- `scripts/dev-build.sh` - downloads the pinned `apk.static` (same pin as CI)
-  and builds `out/*.apk` inside the container. Packages are intentionally
-  unsigned; the feed index signature is what routers verify.
+- `scripts/dev-build.sh` - fetches the pinned upstream engine payload
+  (`scripts/fetch-upstream.sh`, sha256-pinned) and the pinned `apk.static`
+  (same pins as CI), then builds `out/*.apk` inside the container. Packages
+  are intentionally unsigned; the feed index signature is what routers
+  verify.
 - `scripts/kernel-probe.sh` - tries an `nft ... queue num 300 bypass` rule in
   a container. Containers use the **host kernel** (on Windows: the Docker
   Desktop / WSL2 VM kernel), so the verdict describes the machine, not the
@@ -90,8 +134,9 @@ nft idempotency, resolver updater) in later phases.
 - OpenWrt with apk (24.10+/25.x) and mihomo as the proxy core (the add-on
   only ever processes traffic mihomo routes DIRECT)
 - kernel NFQUEUE modules for the live engine phases (`kmod-nft-queue`,
-  `kmod-nfnetlink-queue`; the feed declares them as dependencies when the
-  engine lands)
+  `kmod-nfnetlink-queue`) - declared as package dependencies, pulled from
+  the upstream OpenWrt feed unpinned; the nftables userspace is declared too
+  (present via fw4 on stock 25.x)
 
 ## License
 
