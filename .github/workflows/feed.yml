@@ -60,7 +60,6 @@ jobs:
 
       - name: Build package
         run: |
-          mkdir out
           sh apk/build.sh "$GITHUB_WORKSPACE" ./apk.static "${{ steps.ver.outputs.ver }}" out
           ls -la out
 
