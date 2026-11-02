@@ -11,6 +11,12 @@ static nfqws2 (pinned upstream zapret2 release) + lua strategies + own procd
 init + config. Scope integration (mihomo `routing-mark` install, the final
 nft rule set, tunnel exclusion) lands in phase 2.
 
+**Language policy: ucode-first** (issue #67) - all router-side logic lives in
+a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
+remains only for the thin init shim (rc.common contract) and host/CI
+tooling. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the migration
+lands with the next package revision.
+
 ## Design constants
 
 Published up front (they appear in nft rules and diagnostics; not secrets):
@@ -139,6 +145,9 @@ nft idempotency, resolver updater) in later phases.
   `kmod-nfnetlink-queue`) - declared as package dependencies, pulled from
   the upstream OpenWrt feed unpinned; the nftables userspace is declared too
   (present via fw4 on stock 25.x)
+- ucode + `ucode-mod-fs` + `ucode-mod-uci` for the control CLI (from the
+  ucode-first base revision onward, issue #67; preinstalled on stock 25.x,
+  declared as dependencies like the wanguard core does)
 
 ## License
 
