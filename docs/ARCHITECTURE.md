@@ -75,14 +75,16 @@ Install (`mark-install`, also run by the init shim as the non-fatal
    rewritten as a whole)
 4. validate with the real binary (`mihomo -t`); on failure the inject is
    rolled back from the in-memory pre-inject content
-5. mihomo running -> live reload via its REST API: `PUT
-   /configs?force=true` with the config path under the mihomo workdir
-   (SAFE_PATHS convention - the edited config is copied to
-   `<workdir>/config.yaml` first and the copy is kept in sync);
-   `external-controller` and `secret` are parsed from the mihomo config
-   itself, the secret travels to curl via a temporary header FILE, never
-   through argv. mihomo not running -> nothing to reload, it starts with
-   the mark when it comes up
+5. mihomo running -> live reload via its REST API: `PUT /configs` with the
+   config path under the mihomo workdir (SAFE_PATHS convention - the edited
+   config is copied to `<workdir>/config.yaml` first and the copy is kept
+   in sync); a plain PUT applies the config and does NOT disturb live
+   connections (verified live: connections survive, mihomo logs
+   "Initial configuration complete"); `?force=true` is only the fallback
+   for cores refusing a plain path reload. `external-controller` and
+   `secret` are parsed from the mihomo config itself, the secret travels
+   to curl via a temporary header FILE, never through argv. mihomo not
+   running -> nothing to reload, it starts with the mark when it comes up
 
 Removal (`mark-remove`): restore the backup (spec default - reverts any
 edits made between install and remove; documented) or, without a backup,

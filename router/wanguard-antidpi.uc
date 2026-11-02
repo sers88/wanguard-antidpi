@@ -327,19 +327,32 @@ function reload_mihomo(text, workdir) {
 		if (sv != null && length(sv) > 0)
 			push(hdr, 'Authorization: Bearer ' + sv);
 	}
-	let cmd = 'curl -sS -f -m 10 --connect-timeout 3 -X PUT ';
+	let body = sh_quote('{"path":' + json_str(workdir + '/config.yaml') + '}');
+	let base = 'curl -sS -f -m 10 --connect-timeout 3 -X PUT ';
 	if (length(hdr) > 0) {
 		check_write(AUTH_TMP, writefile(AUTH_TMP, hdr[0] + '\n'));
-		cmd += '-H @' + sh_quote(AUTH_TMP) + ' ';
+		base += '-H @' + sh_quote(AUTH_TMP) + ' ';
 	}
-	cmd += '-d ' + sh_quote('{"path":' + json_str(workdir + '/config.yaml') + '}') + ' ';
-	cmd += sh_quote('http://' + ep + '/configs?force=true') + ' 2>&1';
-	let fp = popen(cmd, 'r');
-	let out = (fp != null) ? fp.read('all') : '';
-	let rc = (fp != null) ? fp.close() : 1;
+	// plain PUT first: applies the config and does not disturb live
+	// connections (verified live: connections survive, mihomo logs
+	// "Initial configuration complete"); force=true as the fallback for
+	// cores that refuse a plain path reload
+	let out = '';
+	let rc = 1;
+	let variant = 0;
+	let f;
+	for (f = 0; f < 2; f++) {
+		variant = f;
+		let url = 'http://' + ep + '/configs' + ((f == 1) ? '?force=true' : '');
+		let fp = popen(base + '-d ' + body + ' ' + sh_quote(url) + ' 2>&1', 'r');
+		out = (fp != null) ? fp.read('all') : '';
+		rc = (fp != null) ? fp.close() : 1;
+		if (rc == 0)
+			break;
+	}
 	unlink(AUTH_TMP);
 	if (rc == 0) {
-		log('mihomo reloaded via REST (' + ep + ') - routing-mark active');
+		log('mihomo reloaded via REST (' + ep + ((variant == 1) ? ', force fallback' : '') + ((out == '') ? '' : ': ' + trim(out)) + ') - routing-mark active');
 		return true;
 	}
 	log('mihomo reload FAILED (rc ' + rc + ')' + ((length(out) > 0) ? ': ' + trim(out) : '') + ' - mark applies on next mihomo restart');
