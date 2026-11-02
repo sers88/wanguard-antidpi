@@ -58,13 +58,13 @@ apk add wanguard-antidpi
 | Path | What |
 |---|---|
 | `/usr/bin/nfqws2` | static desync engine from the pinned upstream zapret2 release (shipped unmodified) |
-| `/usr/bin/wanguard-antidpi` | control CLI: version, engine command line, nft render/apply/flush (all state-changing commands are DRYRUN-aware) |
+| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush (all state-changing commands are DRYRUN-aware) |
 | `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
 | `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
 | `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@` rendered from the config by `nft-render`) |
 | `/usr/share/wanguard-antidpi/version` | package version stamp |
-| `/etc/wanguard-antidpi/config` | config template (sh-style); apk-protected: user edits survive upgrades |
-| `/etc/init.d/wanguard-antidpi` | procd init: apply own nft table -> engine instance (respawn on crash); stop = kill -> flush table |
+| `/etc/config/wanguard-antidpi` | UCI config template (source of truth; apk-protected: user edits survive upgrades) |
+| `/etc/init.d/wanguard-antidpi` | procd init (thin sh shim - the rc.common contract): apply own nft table -> engine instance (respawn on crash); stop = kill -> flush table |
 
 Upstream pinning (issue #57): the engine payload comes from the
 `bol-van/zapret2` `openwrt-embedded` release artifact, downloaded at build
@@ -82,7 +82,7 @@ pinned `ZAPRET2_VERSION_DEFAULT`). Package-only fixes (without an upstream
 bump) ship as an explicit revision tag: `v1.0.6-r2` produces `1.0.6-r2`.
 Engine lifecycle notes:
 
-- graceful no-op: with the strategy empty (`NFQWS2_OPT=""`, the default until
+- graceful no-op: with the strategy list empty (`nfqws2_opt`, the default until
   blockcheck tuning) the engine starts, binds the queue and passes packets
   unmodified; without mihomo running, no packet carries the scope mark, the
   queue stays empty (`bypass`), and the init logs a hint to logread

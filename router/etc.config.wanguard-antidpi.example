@@ -1,0 +1,34 @@
+# /etc/config/wanguard-antidpi - UCI config, source of truth (issue #67).
+# Read by the ucode CLI via the native uci bindings; unknown/missing options
+# fall back to the published defaults (docs/ARCHITECTURE.md).
+# apk protects /etc: user edits survive upgrades - the new default arrives
+# as /etc/config/wanguard-antidpi.apk-new next to it.
+
+config engine 'engine'
+
+	# NFQUEUE number nfqws2 binds (nft-render substitutes it into the table
+	# template); strictly numeric
+	option qnum '300'
+
+	# mark nfqws2 stamps on its own generated/fake packets to prevent loops
+	# (upstream default; keep unless blockcheck says otherwise)
+	option fwmark '0x40000000'
+
+	# user the engine drops privileges to after queue setup (upstream default)
+	option user 'daemon'
+
+	# 1 = append --debug=1 (verbose engine log -> syslog -> `logread | grep
+	# nfqws2`). For blockcheck sessions only - do not leave enabled.
+	option debug '0'
+
+	# Desync strategy: ONE ARGV WORD per list item; '--new' starts the next
+	# profile set (upstream NFQWS2_OPT convention). Each list item is passed
+	# to nfqws2 verbatim (no shell word splitting). Empty = graceful no-op:
+	# the engine binds the queue and passes packets unmodified until the
+	# strategy is tuned from blockcheck sessions (issue #64, hitl).
+	# Example shape (NOT tuned for any specific network):
+	#	list nfqws2_opt '--filter-tcp=443'
+	#	list nfqws2_opt '--filter-l7=tls'
+	#	list nfqws2_opt '--new'
+	#	list nfqws2_opt '--filter-udp=443'
+	#	list nfqws2_opt '--filter-l7=quic'

@@ -12,9 +12,9 @@
 # the package version (dev snapshots are 0.0.0-rN).
 #
 # Usage: container-smoke.sh <local|feed> <version>
-# Structural checks only (issue #57): no live nft/queue state is touched -
-# live NFQUEUE scenarios are gated by the host-kernel probe (kernel-probe.sh)
-# and land with the test matrix (issue #63).
+# Structural checks only: no live nft/queue state is touched - live NFQUEUE
+# scenarios are gated by the host-kernel probe (kernel-probe.sh) and land
+# with the test matrix (issue #63).
 set -eu
 
 MODE="${1:?usage: container-smoke.sh <local|feed> <version>}"
@@ -77,23 +77,30 @@ done
 # gzipped lua is supported natively by nfqws2 (--lua-init=@<file>), verified
 # in the container: LuaJIT banner prints, no parse errors (#57 spike)
 
+# ---- ucode control CLI (issue #67; language policy: sh must never return) ----
+[ "$(head -n 1 "$CLI")" = "#!/usr/bin/ucode" ] || fail "CLI is not ucode (POSIX sh CLI is retired, docs/ARCHITECTURE.md)"
+"$CLI" version >/dev/null 2>&1 || fail "ucode CLI does not execute"
+command -v uci >/dev/null || fail "uci binary missing"
+
+# ---- UCI config (issue #67: source of truth is /etc/config/wanguard-antidpi) ----
+[ -f /etc/config/wanguard-antidpi ] || fail "uci config missing"
+[ "$(uci -q get wanguard-antidpi.engine.qnum)" = "300" ] || fail "config qnum != 300"
+[ "$(uci -q get wanguard-antidpi.engine.fwmark)" = "0x40000000" ] || fail "config fwmark != 0x40000000"
+[ "$(uci -q get wanguard-antidpi.engine.user)" = "daemon" ] || fail "config user != daemon"
+[ "$(uci -q get wanguard-antidpi.engine.debug)" = "0" ] || fail "config debug != 0"
+uci -q get wanguard-antidpi.engine.nfqws2_opt >/dev/null 2>&1 \
+	&& fail "default strategy not empty (graceful no-op default)"
+
 # ---- own lifecycle scripts ----
-sh -n "$CLI" || fail "CLI syntax"
 sh -n /etc/init.d/wanguard-antidpi || fail "init script syntax"
 grep -q '^USE_PROCD=1' /etc/init.d/wanguard-antidpi || fail "init is not procd"
 grep -q '^START=25' /etc/init.d/wanguard-antidpi || fail "init START=25 missing"
 [ -f "$PKGDIR/wanguard-antidpi.nft" ] || fail "nft template missing"
 
-sh -n /etc/wanguard-antidpi/config || fail "config syntax"
-( . /etc/wanguard-antidpi/config
-	[ "$QNUM" = "300" ] || fail "config QNUM != 300"
-	[ "$DESYNC_MARK" = "0x40000000" ] || fail "config DESYNC_MARK != 0x40000000"
-	[ "$NFQWS2_DEBUG" = "0" ] || fail "config NFQWS2_DEBUG != 0"
-	[ -z "$NFQWS2_OPT" ] || fail "default NFQWS2_OPT not empty (graceful no-op default)"
-) || exit 1
-
-# ---- engine command line (what the init starts) ----
+# ---- engine command line (what the init starts; default no-op golden) ----
 cl=$("$CLI" engine-cmdline)
+[ "$(printf '%s\n' "$cl" | grep -c .)" = "6" ] \
+	|| fail "engine-cmdline: expected exactly 6 argv words with the default config"
 case "$cl" in
 	*--qnum=300*) ;;
 	*) fail "engine-cmdline: no --qnum=300" ;;
@@ -107,24 +114,24 @@ case "$cl" in
 	*) fail "engine-cmdline: no --user=daemon" ;;
 esac
 case "$cl" in
-	*"@$PKGDIR/lua/zapret-lib.lua.gz"*) ;;
-	*) fail "engine-cmdline: zapret-lib.lua.gz missing" ;;
-esac
-case "$cl" in
-	*"@$PKGDIR/lua/zapret-antidpi.lua.gz"*) ;;
-	*) fail "engine-cmdline: zapret-antidpi.lua.gz missing" ;;
+	*--debug=1*) fail "engine-cmdline: --debug leaked into default (debug=0)" ;;
 esac
 [ "$(printf '%s\n' "$cl" | grep -c -- '--lua-init=@')" = "2" ] \
 	|| fail "engine-cmdline: expected exactly 2 --lua-init args"
 case "$cl" in
-	*--debug=1*) fail "engine-cmdline: --debug leaked into default (NFQWS2_DEBUG=0)" ;;
+	*"$PKGDIR/lua/zapret-lib.lua.gz"*) ;;
+	*) fail "engine-cmdline: zapret-lib.lua.gz missing" ;;
+esac
+case "$cl" in
+	*"$PKGDIR/lua/zapret-antidpi.lua.gz"*) ;;
+	*) fail "engine-cmdline: zapret-antidpi.lua.gz missing" ;;
 esac
 
 # ---- nft render + DRYRUN contract (no live state touched) ----
 out=$("$CLI" nft-render)
 case "$out" in
 	*"queue flags bypass to 300"*) ;;
-	*) fail "nft-render: queue rule not rendered with QNUM from config" ;;
+	*) fail "nft-render: queue rule not rendered with qnum from config" ;;
 esac
 case "$out" in
 	*"table inet wanguard_antidpi"*) ;;

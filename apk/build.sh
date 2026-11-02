@@ -43,32 +43,34 @@ done
 # NB: cp+chmod, not install(1) - the OpenWrt container busybox has no
 # install(1), and this script is smoke-tested there.
 W="$work/wanguard-antidpi"
-mkdir -p "$W/usr/bin" "$W/usr/share/wanguard-antidpi/lua" "$W/etc/wanguard-antidpi" "$W/etc/init.d"
+mkdir -p "$W/usr/bin" "$W/usr/share/wanguard-antidpi/lua" "$W/etc/config" "$W/etc/init.d"
 # engine payload (static nfqws2 + gzipped lua strategies, unmodified)
 cp "$UP/nfqws2" "$W/usr/bin/nfqws2"
 chmod 755 "$W/usr/bin/nfqws2"
 cp "$UP/zapret-lib.lua.gz" "$UP/zapret-antidpi.lua.gz" "$W/usr/share/wanguard-antidpi/lua/"
 chmod 644 "$W/usr/share/wanguard-antidpi/lua/"*.gz
-# own lifecycle (upstream installer/init/nft mechanics are NOT used)
-cp "$ROOT/router/wanguard-antidpi" "$W/usr/bin/wanguard-antidpi"
+# control CLI - ucode, single file (ucode-first base, issue #67; the POSIX sh
+# CLI is retired: docs/ARCHITECTURE.md language policy)
+cp "$ROOT/router/wanguard-antidpi.uc" "$W/usr/bin/wanguard-antidpi"
 chmod 755 "$W/usr/bin/wanguard-antidpi"
 cp "$ROOT/router/wanguard-antidpi.nft" "$W/usr/share/wanguard-antidpi/wanguard-antidpi.nft"
 chmod 644 "$W/usr/share/wanguard-antidpi/wanguard-antidpi.nft"
 cp "$ROOT/router/init.d/wanguard-antidpi" "$W/etc/init.d/wanguard-antidpi"
 chmod 755 "$W/etc/init.d/wanguard-antidpi"
-# config template shipped as the live conffile: apk protects /etc, so a
+# UCI config template shipped as the live conffile: apk protects /etc, so a
 # user-modified config survives upgrades (new default arrives as
-# config.apk-new next to it)
-cp "$ROOT/router/etc.wanguard-antidpi.config" "$W/etc/wanguard-antidpi/config"
-chmod 644 "$W/etc/wanguard-antidpi/config"
+# wanguard-antidpi.apk-new next to it)
+cp "$ROOT/router/etc.config.wanguard-antidpi.example" "$W/etc/config/wanguard-antidpi"
+chmod 644 "$W/etc/config/wanguard-antidpi"
 # build stamp: the CI install test asserts it equals the package version
 # (and the CLI reports it); later phases surface it in status.
 printf '%s\n' "$VER" > "$W/usr/share/wanguard-antidpi/version"
 
 # kmods from the upstream OpenWrt feed, unpinned (apk resolves the kernel
 # version); nftables = the userspace nft binary (present via fw4, declared
-# as the contract)
-DEPS="kmod-nft-queue kmod-nfnetlink-queue nftables"
+# as the contract); ucode interpreter + fs/uci modules for the CLI - declared
+# explicitly like the wanguard core does (preinstalled on stock 25.x)
+DEPS="kmod-nft-queue kmod-nfnetlink-queue nftables ucode ucode-mod-fs ucode-mod-uci"
 
 "$APK" mkpkg -F "$W" \
 	-I "name:wanguard-antidpi" \
