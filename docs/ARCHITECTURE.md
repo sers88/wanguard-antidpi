@@ -120,8 +120,8 @@ pre/post-uninstall), so `mark-remove` is the documented rollback step.
 `mark-status` prints one `key: value` line per fact (mark / install-on-start
 / backup / mihomo / config / api) for tests and future LuCI.
 
-Contract checks live in `scripts/container-smoke.sh` (file mechanics,
-idempotency, conflict, DRYRUN, stamp) and `scripts/test-mark.sh` (real
+Contract checks live in `tests/container-smoke.sh` (file mechanics,
+idempotency, conflict, DRYRUN, stamp) and `tests/test-mark.sh` (real
 pinned mihomo: `mihomo -t`, start with the mark, live REST reload both
 directions).
 
@@ -141,14 +141,14 @@ hooks only prerouting). Sets:
   no-op). Do not enable desync strategies before the exclusion set is
   populated.
 
-Verification contract: `scripts/test-nft.sh` (live, NET_ADMIN container,
+Verification contract: `tests/test-nft.sh` (live, NET_ADMIN container,
 real pinned mihomo as the marked traffic source): apply shape, re-apply
 byte-identical (idempotent), BYPASS (engine down -> traffic flows, rule
 counter ticks), engine bind (traffic flows through the bound queue), scope
 negatives (direct and unmarked-mihomo fetches never tick the counters),
 flush + re-apply. When the host kernel lacks NFQUEUE the script stays
 structural (`NFT-LIVE-SKIP`) and the live matrix is router-acceptance-only.
-`scripts/container-smoke.sh` asserts the rendered shape (priority, connbytes,
+`tests/container-smoke.sh` asserts the rendered shape (priority, connbytes,
 both exclusions, counters, empty `proxy_servers`, filled-UCI render, merged
 manual+resolved render, render-injection rejection) without live state.
 
@@ -220,7 +220,7 @@ destination exclusion is the primary control, not the only one. Until the
 exclusion set is populated, tunnel packets match the queue - safe only while
 the engine strategy is empty (graceful no-op).
 
-Verification contract: `scripts/test-tunnel.sh` (NET_ADMIN container, stub
+Verification contract: `tests/test-tunnel.sh` (NET_ADMIN container, stub
 `nslookup` on PATH - ucode children spawn via /bin/sh, deterministic, no
 network): multi-A resolution into the sorted UCI list, idempotency (config
 bytes untouched), cross-host dedupe, partial failure, total failure
@@ -237,3 +237,14 @@ The add-on owns the lifecycle of its own table and engine; it never edits
 wanguard or fw4 state. Traffic already leaving through the proxy tunnel is
 out of scope once `proxy_servers` is populated by the updater (#62) - only
 mihomo DIRECT egress (with the scope mark) enters the queue.
+
+## 5. Test matrix = release gate (#63)
+
+Every frozen contract above is verified by `tests/*.sh` scripts that run
+byte-identically on the local dev stand (`scripts/dev-test.sh`, Docker) and
+in CI; the CI `publish` job (sign + push the `feed` branch) needs all four
+matrix jobs green, so a red matrix means the release is never published.
+Live NFQUEUE scenarios self-gate on the host kernel (`NFT-LIVE-SKIP` /
+`TUNNEL-LIVE-SKIP`); on such hosts they are covered by router acceptance
+only. Slice map and the known-limitation note: README, "Test matrix =
+release gate".

@@ -1,11 +1,17 @@
 name: apk feed
 
-# Builds the package (apk/build.sh), signs the repository index with
-# APK_SIGN_KEY, publishes the feed to the orphan `feed` branch (served via
-# raw.githubusercontent.com) and verifies install inside an OpenWrt container.
+# Release pipeline (issue #63 gate): build the package (apk/build.sh), run
+# the container test matrix (the SAME tests/*.sh scripts the dev stand runs
+# via scripts/dev-test.sh), and only publish the feed to the orphan `feed`
+# branch (served via raw.githubusercontent.com) when every matrix job is
+# green. A red matrix = the release is not published. The live-feed install
+# (feed-test) runs right after publishing as the final canary.
+#
 # Release flow: tag v1.0.6 -> package version 1.0.6-r1. The major version
 # tracks the pinned upstream zapret2 release (scripts/fetch-upstream.sh);
-# a tag guard below fails the build if they diverge.
+# a guard in build fails the run if they diverge. Publishing happens for
+# tag pushes only - manual dispatch runs validate the matrix without
+# touching the live feed.
 on:
   push:
     tags: ['v*']
@@ -80,9 +86,97 @@ jobs:
           name: packages
           path: out/*.apk
 
-  feed:
-    name: Sign index, publish feed branch
+  # ---- test matrix (issue #63): the same tests/*.sh scripts the local dev
+  # ---- stand runs; all four must be green before anything is published
+  smoke-test:
+    name: Matrix - install + smoke (layout, conffile, DRYRUN)
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Install + smoke matrix in OpenWrt container (same script as the dev stand)
+        env:
+          VER: ${{ needs.build.outputs.ver }}
+        run: |
+          docker run --rm \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/container-smoke.sh local "$VER"
+
+  mark-test:
+    name: Matrix - mihomo mark integration (real mihomo, NET_ADMIN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Mark integration test in OpenWrt container (pinned real mihomo)
+        run: |
+          docker run --rm --cap-add NET_ADMIN \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-mark.sh
+
+  nft-test:
+    name: Matrix - final nft table live (OpenWrt container, NET_ADMIN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Final table live matrix in OpenWrt container (pinned real mihomo)
+        run: |
+          docker run --rm --cap-add NET_ADMIN \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-nft.sh
+
+  tunnel-test:
+    name: Matrix - tunnel exclusion updater (OpenWrt container, NET_ADMIN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Resolver updater live matrix in OpenWrt container (stub DNS)
+        run: |
+          docker run --rm --cap-add NET_ADMIN \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-tunnel.sh
+
+  # ---- publication gate: reached only when the whole matrix is green.
+  # ---- Tag pushes only - dispatch runs validate without publishing.
+  publish:
+    name: Sign index, publish feed branch (gated by the matrix)
+    needs: [build, smoke-test, mark-test, nft-test, tunnel-test]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,79 +226,23 @@ jobs:
           git commit -qm "feed $VER ($GITHUB_REF_NAME)"
           git push -qf "https://x-access-token:$TOKEN@github.com/$GITHUB_REPOSITORY.git" feed:feed
 
+  # ---- post-publish canary: install from the live feed. Cannot precede
+  # ---- publication by definition; the matrix already install-tested the
+  # ---- SAME artifact (smoke-test, local mode) before it was published.
   feed-test:
-    name: Install + smoke test (OpenWrt 25.12.6 container)
-    needs: [build, feed]
+    name: Live feed install canary (OpenWrt container)
+    needs: [build, publish]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install + smoke test in OpenWrt container (same script as the dev stand)
+      - name: Install + smoke test from the live feed (same script as the dev stand)
         env:
           VER: ${{ needs.build.outputs.ver }}
         run: |
           docker run --rm \
             -v "$PWD/keys:/hostkeys:ro" \
             -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/tests:/tests:ro" \
             openwrt/rootfs:x86_64-25.12.6 \
-            sh /scripts/container-smoke.sh feed "$VER"
-
-  mark-test:
-    name: mihomo mark integration (real mihomo, NET_ADMIN)
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: packages
-          path: out
-
-      - name: Mark integration test in OpenWrt container (pinned real mihomo)
-        run: |
-          docker run --rm --cap-add NET_ADMIN \
-            -v "$PWD/out:/out:ro" \
-            -v "$PWD/scripts:/scripts:ro" \
-            openwrt/rootfs:x86_64-25.12.6 \
-            sh /scripts/test-mark.sh
-
-  nft-test:
-    name: final nft table live (OpenWrt container, NET_ADMIN)
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: packages
-          path: out
-
-      - name: Final table live matrix in OpenWrt container (pinned real mihomo)
-        run: |
-          docker run --rm --cap-add NET_ADMIN \
-            -v "$PWD/out:/out:ro" \
-            -v "$PWD/scripts:/scripts:ro" \
-            openwrt/rootfs:x86_64-25.12.6 \
-            sh /scripts/test-nft.sh
-
-  tunnel-test:
-    name: tunnel exclusion updater (OpenWrt container, NET_ADMIN)
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: packages
-          path: out
-
-      - name: Resolver updater live matrix in OpenWrt container (stub DNS)
-        run: |
-          docker run --rm --cap-add NET_ADMIN \
-            -v "$PWD/out:/out:ro" \
-            -v "$PWD/scripts:/scripts:ro" \
-            openwrt/rootfs:x86_64-25.12.6 \
-            sh /scripts/test-tunnel.sh
+            sh /tests/container-smoke.sh feed "$VER"

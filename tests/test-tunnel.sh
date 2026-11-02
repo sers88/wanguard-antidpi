@@ -1,10 +1,10 @@
 #!/bin/sh
-# scripts/test-tunnel.sh - the tunnel exclusion resolver updater, live
+# tests/test-tunnel.sh - the tunnel exclusion resolver updater, live
 # (issue #62). Runs INSIDE an OpenWrt container with --cap-add NET_ADMIN:
 #
 #   docker run --rm --cap-add NET_ADMIN \
-#     -v <out>:/out:ro -v <scripts>:/scripts:ro \
-#     openwrt/rootfs:x86_64-25.12.6 sh /scripts/test-tunnel.sh
+#     -v <out>:/out:ro -v <tests>:/tests:ro \
+#     openwrt/rootfs:x86_64-25.12.6 sh /tests/test-tunnel.sh
 #
 # DNS answers come from a stub `nslookup` on PATH (ucode children spawn via
 # /bin/sh, so PATH stubs work - the wanguard-core test pattern): the matrix

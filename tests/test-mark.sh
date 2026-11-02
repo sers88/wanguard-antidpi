@@ -1,11 +1,11 @@
 #!/bin/sh
-# scripts/test-mark.sh - mihomo routing-mark integration test (issue #60).
+# tests/test-mark.sh - mihomo routing-mark integration test (issue #60).
 # Runs INSIDE an OpenWrt container (network for the pinned mihomo fetch,
 # NET_ADMIN for the real SO_MARK socket path):
 #
 #   docker run --rm --cap-add NET_ADMIN \
-#     -v <out>:/out:ro -v <scripts>:/scripts:ro \
-#     openwrt/rootfs:x86_64-25.12.6 sh /scripts/test-mark.sh
+#     -v <out>:/out:ro -v <tests>:/tests:ro \
+#     openwrt/rootfs:x86_64-25.12.6 sh /tests/test-mark.sh
 #
 # Covers what container-smoke.sh cannot (smoke has no mihomo binary):
 #   - real `mihomo -t` validation after the inject

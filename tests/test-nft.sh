@@ -1,11 +1,11 @@
 #!/bin/sh
-# scripts/test-nft.sh - the FINAL wanguard_antidpi table, live (issue #61).
+# tests/test-nft.sh - the FINAL wanguard_antidpi table, live (issue #61).
 # Runs INSIDE an OpenWrt container with --cap-add NET_ADMIN (network for the
 # pinned mihomo fetch):
 #
 #   docker run --rm --cap-add NET_ADMIN \
-#     -v <out>:/out:ro -v <scripts>:/scripts:ro \
-#     openwrt/rootfs:x86_64-25.12.6 sh /scripts/test-nft.sh
+#     -v <out>:/out:ro -v <tests>:/tests:ro \
+#     openwrt/rootfs:x86_64-25.12.6 sh /tests/test-nft.sh
 #
 # Structural checks always run; the LIVE packet matrix runs only when the
 # host kernel supports NFQUEUE (same probe as kernel-probe.sh, inline). On a

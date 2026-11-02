@@ -178,10 +178,10 @@ redistributed here unmodified, pinned by sha256.
 
 All development and testing runs in Docker containers - the same
 `openwrt/rootfs:x86_64-25.12.6` image CI uses; the router is only touched at
-final acceptance. One command from zero to smoke:
+final acceptance. One command from zero to the full test matrix:
 
 ```sh
-sh scripts/dev-test.sh            # kernel probe -> local build -> install + smoke
+sh scripts/dev-test.sh            # kernel probe -> build -> smoke -> mark -> nft -> tunnel
 sh scripts/dev-build.sh 0.1.2-r1  # build only -> out/*.apk
 sh scripts/kernel-probe.sh        # NFQUEUE capability probe only
 ```
@@ -204,34 +204,58 @@ What runs where:
   here; `NFQUEUE-UNAVAILABLE` (never fatal) means container tests stay
   structural/dry-run and live desync scenarios are validated only at router
   acceptance.
-- `scripts/container-smoke.sh` - install + smoke assertions inside the
-  container, two modes: `local` (untrusted install of `out/*.apk`, used by
-  `dev-test.sh`) and `feed` (signed feed install, used by CI `feed-test`).
-  One script for both modes, so local and CI results are comparable by
-  construction.
-- `scripts/dev-test.sh` - probe, build, fresh-container install + smoke in one
-  command; exits non-zero on failure.
-- `scripts/test-mark.sh` - mihomo routing-mark integration test with a REAL
+- `scripts/dev-test.sh` - probe, build, then the whole test matrix in fresh
+  containers, one command; exits non-zero on failure.
+- `tests/container-smoke.sh` - install + smoke matrix inside the container,
+  two modes: `local` (untrusted install of `out/*.apk`, used by
+  `dev-test.sh` and CI `smoke-test`) and `feed` (signed feed install, used
+  by CI `feed-test`). One script for both modes, so local and CI results are
+  comparable by construction. Covers file layout, the version stamp,
+  structural render/DRYRUN contracts and the conffile contract.
+- `tests/test-mark.sh` - mihomo routing-mark integration test with a REAL
   pinned mihomo binary inside the container (needs `--cap-add NET_ADMIN`):
   `mihomo -t` after the inject, start with the mark, live REST reload in both
-  directions, idempotency, conflict, DRYRUN, graceful no-config. Runs in CI
-  (job `mark-test`) with the same container.
-- `scripts/test-nft.sh` - the final scope table, live (needs
+  directions, idempotency, conflict, DRYRUN, graceful no-config.
+- `tests/test-nft.sh` - the final scope table, live (needs
   `--cap-add NET_ADMIN`): apply shape + re-apply idempotency, BYPASS
   (engine down -> marked traffic flows), engine queue bind, scope negatives
   (unmarked traffic never ticks the counters), flush. Uses the same pinned
-  mihomo as the marked traffic source; runs in CI (job `nft-test`); on a
-  kernel without NFQUEUE it stays structural (`NFT-LIVE-SKIP`).
-- `scripts/test-tunnel.sh` - the tunnel exclusion resolver updater, live
+  mihomo as the marked traffic source; on a kernel without NFQUEUE it stays
+  structural (`NFT-LIVE-SKIP`).
+- `tests/test-tunnel.sh` - the tunnel exclusion resolver updater, live
   (needs `--cap-add NET_ADMIN`, no network: DNS answers come from a stub
   `nslookup` on PATH): multi-A resolution into the sorted UCI list,
   idempotency (config bytes untouched), cross-host dedupe, partial and total
   resolution failures, per-IP expiry, live apply with a populated set,
-  update-while-live, no-table guard, render-injection guard. Runs in CI
-  (job `tunnel-test`); without NFQUEUE in the host kernel the live apply
-  part stays structural (`TUNNEL-LIVE-SKIP`).
+  update-while-live, no-table guard, render-injection guard; without NFQUEUE
+  in the host kernel the live apply part stays structural
+  (`TUNNEL-LIVE-SKIP`).
 
-The smoke set grows into the full container test matrix (#63).
+### Test matrix = release gate (issue #63)
+
+The same `tests/*.sh` scripts run locally (`scripts/dev-test.sh`, one
+command) and in CI; a red matrix blocks publication - the `publish` job
+needs every matrix job green:
+
+| Slice | Script | What it proves |
+|-------|--------|----------------|
+| Install | `tests/container-smoke.sh` (local + feed modes) | `apk add` (untrusted artifact / signed feed), file layout, version stamp, conffile contract: a user-modified `/etc/config/wanguard-antidpi` survives a reinstall of the same version, the incoming default lands next to it as `.apk-new` |
+| Syntax + DRYRUN | `tests/container-smoke.sh` | `sh -n` on the init script; `nft-apply` / `nft-flush` / `mark-install` / `tunnel-update` / `cron-install` DRYRUN never touch live state (the init shim's DRYRUN paths need `rc.common` - router acceptance only) |
+| mihomo integration | `tests/test-mark.sh` | real pinned mihomo: inject -> `mihomo -t` ok -> mihomo starts with the mark; a repeated inject is a no-op; remove restores the original bytes; live REST reload both directions |
+| nft table | `tests/test-nft.sh` | apply shape (priority 101, 2 queue rules, both sets), re-apply byte-identical, bypass with the engine down, engine queue bind, scope negatives, flush |
+| Resolver updater | `tests/test-tunnel.sh` | multi-A answers into the sorted UCI list, set-update idempotency, dedupe, partial/total failure behavior, per-IP expiry, live apply/update, no-table guard |
+| Graceful no-op | across the matrix | empty strategy + 6-word `engine-cmdline` golden (smoke), marked traffic flows with the engine down (`test-nft.sh` BYPASS), graceful no-mihomo-config paths (`test-mark.sh`, smoke) |
+
+Known limitation: live NFQUEUE scenarios (real packets processed through the
+queue) cannot run in a container whose host kernel lacks queue support - on
+such hosts the matrix stays structural (`NFT-LIVE-SKIP` /
+`TUNNEL-LIVE-SKIP`) and those cases are covered by router acceptance.
+
+CI pipeline (`feed.yml`): `build` -> matrix (`smoke-test`, `mark-test`,
+`nft-test`, `tunnel-test` in parallel) -> `publish` (sign the index, push
+the `feed` branch; tag pushes only) -> `feed-test` (install from the live
+feed as the final canary; cannot precede publication by definition - the
+matrix already install-tested the same artifact before it was published).
 
 ## Requirements
 

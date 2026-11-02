@@ -1,20 +1,20 @@
 #!/bin/sh
-# scripts/container-smoke.sh - install + smoke test of the package inside an
+# tests/container-smoke.sh - install + smoke test of the package inside an
 # OpenWrt container. ONE script, TWO modes, so the local dev stand and CI
-# (feed.yml feed-test) run byte-identical checks and their results are
-# comparable by construction:
+# (feed.yml smoke-test / feed-test jobs) run byte-identical checks and their
+# results are comparable by construction:
 #
 #   local: /out mounted (ro) with the built *.apk   -> apk add --allow-untrusted
 #   feed : /hostkeys mounted (ro) with the feed key -> apk add from signed feed
 #
-# /scripts must be mounted (ro) too: the upstream engine version pin is read
-# from fetch-upstream.sh so the engine-version assertion is independent of
-# the package version (dev snapshots are 0.0.0-rN).
+# Mounts: /tests (this script) AND /scripts (the upstream engine version pin
+# is read from fetch-upstream.sh so the engine-version assertion is
+# independent of the package version - dev snapshots are 0.0.0-rN).
 #
 # Usage: container-smoke.sh <local|feed> <version>
 # Structural checks only: no live nft/queue state is touched - live NFQUEUE
-# scenarios are gated by the host-kernel probe (kernel-probe.sh) and land
-# with the test matrix (issue #63).
+# scenarios live in tests/test-nft.sh and tests/test-tunnel.sh (self-gated by
+# the host-kernel probe; matrix overview: README, issue #63).
 set -eu
 
 MODE="${1:?usage: container-smoke.sh <local|feed> <version>}"
@@ -225,7 +225,7 @@ out=$("$CLI" nft-render)
 	|| fail "nft-render: config not pristine after the tunnel-section test"
 
 # ---- tunnel resolver updater (issue #62): structural here; the live matrix
-# ---- (stub DNS answers + real table state) is scripts/test-tunnel.sh
+# ---- (stub DNS answers + real table state) is tests/test-tunnel.sh
 out=$("$CLI" tunnel-update)
 case "$out" in
 	*"no tunnel hosts"*) ;;
@@ -366,6 +366,30 @@ case "$out" in
 	*) fail "mark-status: conflict not reported" ;;
 esac
 rm -rf /etc/mihomo /tmp/smoke-mihomo-orig.yaml /tmp/smoke-mihomo-conflict.yaml
+
+# ---- conffile contract (issue #63 matrix slice 1): apk3 protects /etc -
+# ---- a user-modified config must survive a reinstall of the SAME version,
+# ---- and the incoming default must land next to it as *.apk-new (verified
+# ---- empirically on the image's apk-tools 3.0.5). Runs last: the probe
+# ---- option stays in the config afterwards (the container is ephemeral).
+echo "== conffile: modified config survives a reinstall"
+uci set wanguard-antidpi.engine.conffile_probe='1'
+uci commit wanguard-antidpi
+case "$MODE" in
+local)
+	apk add --allow-untrusted --force-reinstall /out/*.apk >/dev/null
+	;;
+feed)
+	apk add --force-reinstall wanguard-antidpi >/dev/null
+	;;
+esac
+[ "$(uci -q get wanguard-antidpi.engine.conffile_probe)" = "1" ] \
+	|| fail "conffile: user modification did not survive the reinstall"
+[ -f /etc/config/wanguard-antidpi.apk-new ] \
+	|| fail "conffile: incoming default did not land as *.apk-new"
+grep -q conffile_probe /etc/config/wanguard-antidpi \
+	|| fail "conffile: probe option lost from the config file"
+echo "CONFFILE-OK (modification survived, default next to it as .apk-new)"
 
 # ---- smoke set: CLI determinism (bootstrap contract, kept from #56) ----
 out1=$("$CLI")
