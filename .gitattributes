@@ -1,0 +1,4 @@
+# Router-side scripts and CI must stay LF (busybox sh on OpenWrt chokes on CRLF)
+* text=auto eol=lf
+# Keys are binary material
+*.pem -text
