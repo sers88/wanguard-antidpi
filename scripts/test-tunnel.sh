@@ -160,7 +160,10 @@ case "$out" in
 esac
 got=$(resolved_list)
 [ "$got" = "192.0.2.11 198.51.100.7 " ] || fail "expired entries not dropped: [$got]"
-echo "EXPIRE-OK (stale dropped, refreshed kept)"
+grep -qE '^(192\.0\.2\.10|192\.0\.2\.12) ' "$STATE" \
+	&& fail "expired entries still in the state file (must not accumulate)"
+[ "$(grep -c . "$STATE")" = "2" ] || fail "state entries != 2 after expiry"
+echo "EXPIRE-OK (stale dropped from UCI, live set and state file)"
 
 # ---- [7] live apply with a populated set ----
 echo "== [7] live table apply (populated set)"

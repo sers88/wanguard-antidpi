@@ -837,8 +837,13 @@ function cmd_tunnel_update() {
 		exit(0);
 	}
 
-	// the state file is refreshed on every run (timestamps), set or not
-	save_state(st);
+	// the state file is refreshed on every run (timestamps), set or not -
+	// but only with the surviving entries (expired ones must not accumulate
+	// forever)
+	let st2 = {};
+	for (let i = 0; i < length(surv); i++)
+		st2[surv[i]] = st[surv[i]];
+	save_state(st2);
 	if (!changed) {
 		print('wanguard-antidpi: tunnel set unchanged (' + length(cur) + ' entries) - nothing to do\n');
 		exit(0);
