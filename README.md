@@ -6,11 +6,13 @@ engine applied only to mihomo DIRECT egress, as a companion to
 the encrypted proxy tunnel is out of scope (excluded by destination address);
 the engine sees the packets a DPI middlebox can still inspect.
 
-Status: **phase 2** - ucode-first base, the engine payload, and the mihomo
-scope integration: static nfqws2 (pinned upstream zapret2 release) + lua
-strategies + own procd init + UCI config + idempotent mihomo `routing-mark`
-install with live REST reload. Still ahead in phase 2: the final nft rule
-set and tunnel exclusion (#61/#62).
+Status: **phase 2** - ucode-first base, the engine payload, the mihomo scope
+integration and the final nft rule set: static nfqws2 (pinned upstream
+zapret2 release) + lua strategies + own procd init + UCI config + idempotent
+mihomo `routing-mark` install with live REST reload + the scope table
+(priority 101, connbytes windows, tunnel/local exclusions, queue bypass).
+Still ahead in phase 2: the tunnel exclusion set updater (#62) and the test
+matrix (#63).
 
 **Language policy: ucode-first** (issue #67) - all router-side logic lives in
 a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
@@ -35,6 +37,7 @@ Published up front (they appear in nft rules and diagnostics; not secrets):
 | DESYNC_MARK | `0x40000000` / `0x20000000` | nfqws per-packet strategy marks |
 | NFQUEUE number | `300` | bypass queue for desynchronized packets |
 | nft table | `inet wanguard_antidpi` | own table; never touches wanguard / fw4 tables |
+| connbytes windows | tcp 443 `1-20`, udp 443 `1-5` | only the start of every connection enters the queue (zapret2 config.default) |
 
 ## Installation
 
@@ -94,6 +97,11 @@ Engine lifecycle notes:
   blockcheck tuning) the engine starts, binds the queue and passes packets
   unmodified; without mihomo running, no packet carries the scope mark, the
   queue stays empty (`bypass`), and the init logs a hint to logread
+- tunnel exclusion: the `proxy_servers` set ships EMPTY (issue #62 maintains
+  the `tunnel.proxy_servers` UCI list and the table renders it on every
+  apply). Until it is populated the tunnel itself matches the queue - keep
+  the strategy list empty, or desynchronizing the tunnel's own TLS would
+  break it
 - `bypass` queue semantics: if the engine dies, marked packets leave
   unprocessed instead of dropping (procd respawns it meanwhile)
 - DRYRUN contract: `WANGUARD_ANTIDPI_DRYRUN=1` makes the init/CLI print
@@ -172,9 +180,14 @@ What runs where:
   `mihomo -t` after the inject, start with the mark, live REST reload in both
   directions, idempotency, conflict, DRYRUN, graceful no-config. Runs in CI
   (job `mark-test`) with the same container.
+- `scripts/test-nft.sh` - the final scope table, live (needs
+  `--cap-add NET_ADMIN`): apply shape + re-apply idempotency, BYPASS
+  (engine down -> marked traffic flows), engine queue bind, scope negatives
+  (unmarked traffic never ticks the counters), flush. Uses the same pinned
+  mihomo as the marked traffic source; runs in CI (job `nft-test`); on a
+  kernel without NFQUEUE it stays structural (`NFT-LIVE-SKIP`).
 
-The smoke set grows into the full container test matrix (nft idempotency,
-resolver updater) in later phases.
+The smoke set grows into the full container test matrix (#63).
 
 ## Requirements
 

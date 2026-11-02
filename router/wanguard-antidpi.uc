@@ -14,7 +14,8 @@
 //   engine-version  first line of `nfqws2 --version`
 //   engine-cmdline  full nfqws2 argv, one argument per line (frozen contract:
 //                   exactly what the init shim starts, byte-for-byte)
-//   nft-render      print the rendered nft ruleset (template + config qnum)
+//   nft-render      print the rendered nft ruleset (template + UCI engine/
+//                   tunnel options: qnum, fwmark, proxy_servers set elements)
 //   nft-apply       apply the table (idempotent; DRYRUN-aware)
 //   nft-flush       delete the table (idempotent; DRYRUN-aware)
 //   mark-install    inject routing-mark into the mihomo config (issue #60):
@@ -81,10 +82,48 @@ function load_config() {
 		opt: (type(s.nfqws2_opt) == 'array') ? s.nfqws2_opt : []
 	};
 	// qnum is substituted into the nft ruleset and into shell commands - keep
-	// it strictly numeric
+	// it strictly numeric; fwmark goes into both the engine argv and the nft
+	// anti-loop match, keep it a strict hex word (render-injection safety)
 	if (!match(c.qnum, /^[0-9]+$/))
 		die('config qnum must be numeric, got: ' + c.qnum);
+	if (!match(c.fwmark, /^0x[0-9a-fA-F]+$/))
+		die('config fwmark must be hex (0x...), got: ' + c.fwmark);
 	return c;
+}
+
+function load_tunnel() {
+	// soft section (issue #61/#62 contract): missing section/options render an
+	// empty proxy_servers set; entries are validated at render time
+	let s = uci.cursor().get_all(CONF, 'tunnel');
+	return {
+		proxy_servers: (s == null || type(s.proxy_servers) != 'array') ? [] : s.proxy_servers
+	};
+}
+
+function valid_addr_entry(e) {
+	// strict 'a.b.c.d' or 'a.b.c.d/nn' - entries land inside a generated nft
+	// file, so anything unusual must be rejected, not escaped
+	if (e == null || length(e) == 0)
+		return false;
+	let host = e;
+	let sl = index(e, '/');
+	if (sl != null && sl >= 0) {
+		let mask = substr(e, sl + 1);
+		if (!match(mask, /^[0-9]+$/) || int(mask) > 32)
+			return false;
+		host = substr(e, 0, sl);
+	}
+	let parts = split(host, '.');
+	if (length(parts) != 4)
+		return false;
+	for (let i = 0; i < 4; i++) {
+		let p = parts[i];
+		if (!match(p, /^[0-9]+$/) || length(p) > 3 || int(p) > 255)
+			return false;
+		if (length(p) > 1 && substr(p, 0, 1) == '0')
+			return false; // no leading zeros: keeps the render canonical
+	}
+	return true;
 }
 
 function cmd_version() {
@@ -123,28 +162,47 @@ function cmd_engine_cmdline() {
 		print(c.opt[i] + '\n');
 }
 
-function render_nft(c) {
+function render_nft() {
+	// substitutions (issue #61): @QNUM@ queue number, @FWMARK@ the desync
+	// anti-loop mark (must equal the engine's --fwmark), @PROXY_ELEMENTS@
+	// the rendered set elements for tunnel.proxy_servers (#62 fills the UCI)
+	let c = load_config();
+	let t = load_tunnel();
 	let tpl = readfile(NFT_TEMPLATE);
 	if (tpl == null)
 		die('nft template missing: ' + NFT_TEMPLATE);
-	return replace(tpl, /@QNUM@/g, c.qnum);
+	let els = [];
+	for (let i = 0; i < length(t.proxy_servers); i++) {
+		let e = t.proxy_servers[i];
+		if (!valid_addr_entry(e))
+			die('tunnel.proxy_servers entry is not a canonical IPv4/CIDR: "' + e + '"');
+		push(els, e);
+	}
+	// manual join: ucode join() returns null (2026.01.16)
+	let elsline = '';
+	for (let i = 0; i < length(els); i++)
+		elsline += ((i > 0) ? ', ' : '') + els[i];
+	let r = replace(tpl, /@QNUM@/g, c.qnum);
+	r = replace(r, /@FWMARK@/g, c.fwmark);
+	r = replace(r, /@PROXY_ELEMENTS@/g, (length(els) > 0) ? '\t\telements = { ' + elsline + ' }\n' : '');
+	return r;
 }
 
 function cmd_nft_render() {
-	print(render_nft(load_config()));
+	print(render_nft());
 }
 
 function cmd_nft_apply() {
 	let c = load_config();
 	if (dryrun()) {
 		print('DRYRUN: would apply nft table inet ' + TABLE + ':\n');
-		print(render_nft(c));
+		print(render_nft());
 		return;
 	}
 	// fixed tmp name: the engine lifecycle is single-instance (procd) and the
 	// file is unlinked right after nft -f consumed it
 	let tmp = '/tmp/wanguard-antidpi.nft';
-	writefile(tmp, render_nft(c));
+	writefile(tmp, render_nft());
 	let rc = system('nft -f ' + tmp);
 	unlink(tmp);
 	if (rc == 0)

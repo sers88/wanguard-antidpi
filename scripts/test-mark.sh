@@ -62,7 +62,7 @@ set -- /out/wanguard-antidpi-*.apk
 apk add --allow-untrusted "$@" >/dev/null
 apk add curl >/dev/null 2>&1 || true
 cd /tmp
-curl -sSL -o mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
+curl -sSL --retry 5 --retry-all-errors --retry-delay 3 -o mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
 echo "${MIHOMO_SHA256}  mihomo.gz" | sha256sum -c - >/dev/null || fail "mihomo.gz sha256 mismatch"
 gzip -dc mihomo.gz > /usr/bin/mihomo
 chmod 755 /usr/bin/mihomo

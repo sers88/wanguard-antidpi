@@ -1,22 +1,69 @@
 #!/usr/sbin/nft -f
-# wanguard-antidpi scope table (issue #57 skeleton; final rule set lands
-# with #61: tunnel-daddr exclusion, scope refinement).
+# wanguard-antidpi scope table - FINAL rule set (issue #61).
 #
 # Applied by `wanguard-antidpi nft-apply` (declare+delete+define = idempotent
-# re-apply; verified against nftables 1.1.6 / OpenWrt 25.12). @QNUM@ is
-# substituted from /etc/wanguard-antidpi/config by nft-render.
+# re-apply; verified against nftables 1.1.6 / OpenWrt 25.12). nft-render
+# substitutes three tokens from /etc/config/wanguard-antidpi: the queue
+# number (engine.qnum), the desync fwmark (engine.fwmark - must match the
+# engine's --fwmark), and the proxy_servers set elements (tunnel.proxy_servers
+# UCI list; an empty list renders an empty set). NB: the @lowercase words
+# below are nft SET references, not placeholders - do not substitute them.
 #
-# - postrouting @ mangle+10: post-NAT egress form, the canonical nfqws hook
-#   (upstream iptables mode hooks POSTROUTING mangle likewise)
-# - meta mark 0x10000000: the mihomo routing-mark scope (DESIGN CONSTANT,
-#   published in README; only mihomo's own DIRECT egress matches)
-# - queue flags bypass: fails open - if the engine dies, marked packets
+# Scope: ONLY mihomo's own egress enters the queue (the routing-mark contract,
+# issue #60). LAN-direct and router-local traffic carry no mark and never
+# match; the 0x10000000 mask filters out the wanguard policy marks
+# (0x64..0x258) exactly. The table is namespaced: it never touches `inet fw4`
+# or `inet wanguard`.
+#
+# - priority 101: post-NAT (fw4 srcnat = 100), before fw4 mangle_postrouting
+#   (150) and filter (200) - no hook overlap
+# - oifname intentionally NOT filtered: mihomo egress may leave via any
+#   interface (uplink change, pppoe fallback) - the mark IS the scope
+# - queue flags bypass: fails open - if the engine dies, matched packets
 #   leave unprocessed instead of dropping
+# - IPv4 only (the `ip daddr` expressions make IPv6 packets skip the rules):
+#   the reference stand routes no IPv6; revisit with the hostlist phase
 table inet wanguard_antidpi
 delete table inet wanguard_antidpi
 table inet wanguard_antidpi {
+	# same membership as the wanguard core's local_v4 (issue #61 spec):
+	# destinations here are local/LAN - never desynchronized
+	set local_v4 {
+		type ipv4_addr
+		flags interval
+		elements = { 10.0.0.0/8, 172.16.0.0/12,
+			     192.168.0.0/16, 224.0.0.0/4,
+			     255.255.255.255 }
+	}
+	# upstream proxy/tunnel endpoints, populated from UCI tunnel.proxy_servers
+	# by nft-render on EVERY apply (never populate dynamically: an apply
+	# rebuilds the table). EMPTY BY DESIGN until issue #62 lands: without the
+	# exclusion the tunnel packets match the queue - keep the engine strategy
+	# empty (graceful no-op) or desynchronizing the tunnel's own TLS would
+	# break it.
+	set proxy_servers {
+		type ipv4_addr
+		flags interval
+@PROXY_ELEMENTS@	}
 	chain egress {
-		type filter hook postrouting priority mangle + 10; policy accept;
-		meta mark 0x10000000 queue flags bypass to @QNUM@
+		type filter hook postrouting priority 101; policy accept;
+		# TCP 443: only the first 20 packets of every connection
+		# (ClientHello + early data; zapret2 config.default connbytes)
+		meta mark & 0x10000000 == 0x10000000 \
+		meta mark & @FWMARK@ == 0 \
+		ip daddr != @proxy_servers \
+		ip daddr != @local_v4 \
+		tcp dport 443 ct original packets 1-20 \
+		counter \
+		queue num @QNUM@ bypass
+		# UDP 443 (QUIC): only the first 5 packets (Initial packet;
+		# zapret2 config.default connbytes)
+		meta mark & 0x10000000 == 0x10000000 \
+		meta mark & @FWMARK@ == 0 \
+		ip daddr != @proxy_servers \
+		ip daddr != @local_v4 \
+		udp dport 443 ct original packets 1-5 \
+		counter \
+		queue num @QNUM@ bypass
 	}
 }

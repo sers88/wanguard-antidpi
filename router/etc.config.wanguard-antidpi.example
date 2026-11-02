@@ -50,3 +50,15 @@ config mihomo 'mihomo'
 	# itself; the secret never leaves the router (passed to curl via a
 	# temporary header file, not through argv).
 	option workdir '/usr/share/mihomo'
+
+config tunnel 'tunnel'
+
+	# upstream proxy/tunnel endpoints excluded from the add-on's queue scope
+	# (issues #61/#62): rendered into the nft set `proxy_servers` on every
+	# apply. Maintained by the resolver updater (issue #62) - until it is
+	# populated the tunnel is NOT excluded from the queue, so keep the engine
+	# strategy empty (graceful no-op): desynchronizing the tunnel's own TLS
+	# would break the tunnel. Canonical IPv4 or CIDR entries.
+	#
+	#	list proxy_servers '203.0.113.7'
+	#	list proxy_servers '203.0.113.0/24'

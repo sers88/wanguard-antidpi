@@ -130,8 +130,8 @@ esac
 # ---- nft render + DRYRUN contract (no live state touched) ----
 out=$("$CLI" nft-render)
 case "$out" in
-	*"queue flags bypass to 300"*) ;;
-	*) fail "nft-render: queue rule not rendered with qnum from config" ;;
+	*"queue num 300 bypass"*) ;;
+	*) fail "nft-render: queue rules not rendered with qnum from config" ;;
 esac
 case "$out" in
 	*"table inet wanguard_antidpi"*) ;;
@@ -139,7 +139,7 @@ case "$out" in
 esac
 out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" nft-apply)
 case "$out" in
-	*"DRYRUN"*"queue flags bypass to 300"*) ;;
+	*"DRYRUN"*"queue num 300 bypass"*) ;;
 	*) fail "nft-apply DRYRUN: wrong output" ;;
 esac
 out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" nft-flush)
@@ -149,6 +149,75 @@ case "$out" in
 esac
 # init DRYRUN paths are exercised on hosts with rc.common; here only the CLI
 # surface they call is proven (rc.common does not exist in the container)
+
+# ---- final table shape (issue #61) ----
+out=$("$CLI" nft-render)
+case "$out" in
+	*"priority 101"*) ;;
+	*) fail "nft-render: postrouting priority 101 missing" ;;
+esac
+[ "$(printf '%s\n' "$out" | grep -c 'queue num 300 bypass')" = "2" ] \
+	|| fail "nft-render: expected exactly 2 queue rules (tcp + udp 443)"
+case "$out" in
+	*"tcp dport 443 ct original packets 1-20"*) ;;
+	*) fail "nft-render: tcp connbytes rule missing" ;;
+esac
+case "$out" in
+	*"udp dport 443 ct original packets 1-5"*) ;;
+	*) fail "nft-render: udp connbytes rule missing" ;;
+esac
+[ "$(printf '%s\n' "$out" | grep -c 'meta mark & 0x10000000 == 0x10000000')" = "2" ] \
+	|| fail "nft-render: scope mark match missing on some rules"
+[ "$(printf '%s\n' "$out" | grep -c 'meta mark & 0x40000000 == 0')" = "2" ] \
+	|| fail "nft-render: desync anti-loop match missing on some rules"
+[ "$(printf '%s\n' "$out" | grep -c 'ip daddr != @proxy_servers')" = "2" ] \
+	|| fail "nft-render: proxy_servers exclusion missing on some rules"
+[ "$(printf '%s\n' "$out" | grep -c 'ip daddr != @local_v4')" = "2" ] \
+	|| fail "nft-render: local_v4 exclusion missing on some rules"
+case "$out" in
+	*"counter"*"queue num 300"*) ;;
+	*) fail "nft-render: no counter before queue" ;;
+esac
+case "$out" in
+	*"set local_v4"*"192.168.0.0/16"*) ;;
+	*) fail "nft-render: local_v4 set missing/incomplete" ;;
+esac
+printf '%s\n' "$out" | grep -qE '@[A-Z_]+@' \
+	&& fail "nft-render: unsubstituted placeholder leaked"
+# proxy_servers ships EMPTY (issue #62 fills the UCI list; render maps it)
+[ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "1" ] \
+	|| fail "nft-render: expected elements only on local_v4 with an empty proxy_servers"
+# determinism: same config -> byte-identical render
+[ "$out" = "$("$CLI" nft-render)" ] || fail "nft-render not deterministic"
+# filled UCI list -> rendered elements (issue #62 contract, wired here for #61)
+uci set wanguard-antidpi.tunnel=tunnel
+uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.7'
+uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/24'
+uci commit wanguard-antidpi
+out=$("$CLI" nft-render)
+case "$out" in
+	*"elements = { 192.0.2.7, 192.0.2.0/24 }"*) ;;
+	*) fail "nft-render: tunnel.proxy_servers elements not rendered" ;;
+esac
+[ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "2" ] \
+	|| fail "nft-render: both sets must carry elements once the list is filled"
+# malformed entries are rejected at render time (render-injection safety)
+uci del_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.7'
+uci del_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/24'
+uci add_list wanguard-antidpi.tunnel.proxy_servers='300.1.1.1'
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>&1 \
+	&& fail "nft-render accepted a malformed proxy_servers entry (octet > 255)"
+uci del_list wanguard-antidpi.tunnel.proxy_servers='300.1.1.1'
+uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.0/33'
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>&1 \
+	&& fail "nft-render accepted a malformed proxy_servers entry (mask > 32)"
+uci delete wanguard-antidpi.tunnel
+uci commit wanguard-antidpi
+out=$("$CLI" nft-render)
+[ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "1" ] \
+	|| fail "nft-render: config not pristine after the tunnel-section test"
 
 # ---- mihomo routing-mark integration (issue #60; no mihomo binary/process
 # ---- in this container - the graceful paths plus the file mechanics) ----

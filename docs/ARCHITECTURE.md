@@ -49,8 +49,19 @@ UCI layout (`/etc/config/wanguard-antidpi`, section `engine`):
 - `WANGUARD_ANTIDPI_DRYRUN=1`: every state-changing command prints what it
   would do, touches nothing, exits 0 - this is the container test surface
 - `engine-cmdline`: one argv word per line - exactly what the init shim starts
-- nft table shape: own `inet wanguard_antidpi` table, postrouting priority
-  `mangle + 10`, `queue flags bypass` (fails open if the engine dies)
+- nft table shape (issue #61, final): own `inet wanguard_antidpi` table,
+  postrouting `priority 101` (post-NAT, right after fw4 srcnat), two queue
+  rules - `tcp dport 443 ct original packets 1-20` and
+  `udp dport 443 ct original packets 1-5` (zapret2 config.default connbytes) -
+  each scoped by `meta mark & 0x10000000 == 0x10000000` AND
+  `meta mark & @fwmark@ == 0` (desync anti-loop) AND
+  `ip daddr != @proxy_servers` AND `ip daddr != @local_v4`, ending in
+  `counter` + `queue num <qnum> bypass` (fails open if the engine dies). No
+  `oifname` filter: the mark IS the scope. IPv4 only.
+- the `proxy_servers` set is RENDERED from the UCI list
+  `tunnel.proxy_servers` on every apply - never populate it dynamically
+  with `nft add element`: an apply rebuilds the whole table and would wipe
+  dynamically added elements (#62 maintains the UCI list, not the set)
 - marks: `0x10000000` (mihomo scope) and `0x40000000` (nfqws desync)
 - versioning: package major = pinned upstream version (`vX.Y.Z` -> `X.Y.Z-r1`);
   package-only fixes ship as explicit revision tags (`vX.Y.Z-rN` -> `X.Y.Z-rN`)
@@ -100,6 +111,31 @@ idempotency, conflict, DRYRUN, stamp) and `scripts/test-mark.sh` (real
 pinned mihomo: `mihomo -t`, start with the mark, live REST reload both
 directions).
 
+## 3.2 the scope table (#61)
+
+`table inet wanguard_antidpi` is the add-on's own namespaced table; it never
+touches `inet fw4` or `inet wanguard` (its postrouting hook at priority 101
+sits between fw4 srcnat (100) and fw4 mangle_postrouting (150), and wanguard
+hooks only prerouting). Sets:
+
+- `local_v4` - same membership as the wanguard core's set (RFC1918 +
+  broadcast): local/LAN destinations are never desynchronized
+- `proxy_servers` - upstream tunnel endpoints; EMPTY in this release. Until
+  #62 populates the UCI list, tunnel packets match the queue - which is safe
+  only while the engine strategy is empty (graceful no-op). Do not enable
+  desync strategies before the exclusion lands.
+
+Verification contract: `scripts/test-nft.sh` (live, NET_ADMIN container,
+real pinned mihomo as the marked traffic source): apply shape, re-apply
+byte-identical (idempotent), BYPASS (engine down -> traffic flows, rule
+counter ticks), engine bind (traffic flows through the bound queue), scope
+negatives (direct and unmarked-mihomo fetches never tick the counters),
+flush + re-apply. When the host kernel lacks NFQUEUE the script stays
+structural (`NFT-LIVE-SKIP`) and the live matrix is router-acceptance-only.
+`scripts/container-smoke.sh` asserts the rendered shape (priority, connbytes,
+both exclusions, counters, empty `proxy_servers`, filled-UCI render,
+render-injection rejection) without live state.
+
 Contract changes are frozen with golden fixtures byte-for-byte (the wanguard
 core pattern); the container smoke and the CI gate assert the CLI stays ucode.
 
@@ -107,5 +143,6 @@ core pattern); the container smoke and the CI gate assert the CLI stays ucode.
 
 The add-on owns the lifecycle of its own table and engine; it never edits
 wanguard or fw4 state. Traffic already leaving through the proxy tunnel is out
-of scope (excluded by destination address, #62); only mihomo DIRECT egress
-(with the scope mark) enters the queue.
+of scope once `proxy_servers` is populated (#62) - the exclusion ships with
+the table (issue #61) but stays empty until the updater lands; only mihomo
+DIRECT egress (with the scope mark) enters the queue.
