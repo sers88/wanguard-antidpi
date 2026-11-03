@@ -6,15 +6,14 @@ engine applied only to mihomo DIRECT egress, as a companion to
 the encrypted proxy tunnel is out of scope (excluded by destination address);
 the engine sees the packets a DPI middlebox can still inspect.
 
-Status: **phase 2** - ucode-first base, the engine payload, the mihomo scope
-integration, the final nft rule set and the tunnel exclusion updater:
-static nfqws2 (pinned upstream zapret2 release) + lua strategies + own procd
-init + UCI config + idempotent mihomo `routing-mark` install with live REST
-reload + the scope table (priority 101, connbytes windows, tunnel/local
-exclusions, queue bypass) + the tunnel resolver updater that keeps the
-exclusion set current (multi-A answers, rotating daddrs, per-IP expiry,
-cron-refreshed). Still ahead in phase 2: the test matrix consolidation
-(#63).
+Status: implemented and accepted end to end - the ucode-first base (#67),
+the pinned nfqws2 (zapret2) payload, the mihomo scope integration (#60),
+the final scope table (#61), the tunnel exclusion updater (#62), the test
+matrix as the release gate (#63), desync strategy tuning with the
+engine-level tunnel exclusion (#64), and router acceptance including a
+full uninstall / restore cycle (#65). The engine ships in a **graceful
+no-op** state; desync strategies are provider-specific by nature and are
+configured per router (see Tuning below).
 
 **Language policy: ucode-first** (issue #67) - all router-side logic lives in
 a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
@@ -70,6 +69,26 @@ Published up front (they appear in nft rules and diagnostics; not secrets):
 | nft table | `inet wanguard_antidpi` | own table; never touches wanguard / fw4 tables |
 | connbytes windows | tcp 443 `1-20`, udp 443 `1-5` | only the start of every connection enters the queue (zapret2 config.default) |
 
+### Compatibility contract
+
+Who owns what, and what this add-on never touches (consolidated contract;
+details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), section 5):
+
+- **owned by this add-on**: fwmark `0x10000000` (the mihomo `routing-mark`
+  scope mark), fwmark `0x40000000` (nfqws2 strategy mark, `engine.fwmark`),
+  NFQUEUE `300` (`engine.qnum`), the own nft table `inet wanguard_antidpi`;
+  fwmark `0x20000000` stays reserved for blockcheck2 staging runs (its
+  hardwired `DESYNC_MARK` must be patched away from `0x10000000` - see
+  Tuning)
+- **never written by this add-on**: the `inet wanguard` and `inet fw4`
+  tables, policy routing (`ip rule`) - proven by the acceptance uninstall
+  audit (#65): both foreign tables byte-identical, `ip rule` untouched
+- **foreign files edited** (exactly two, both reversible):
+  `/etc/mihomo/config.yaml` - one idempotent root-level `routing-mark`
+  line (backup + `mihomo -t` validation + live REST reload + restore on
+  remove), and `/etc/crontabs/root` - one tagged cron line (foreign lines
+  preserved; dropped on service stop)
+
 ## Installation
 
 ### Via the signed apk feed
@@ -94,6 +113,14 @@ echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x8
 apk update
 apk add wanguard-antidpi
 ```
+
+Feed caching: the `packages.adb` index is served through GitHub's CDN and
+can lag the published `feed` branch by ~5-10 minutes. If `apk update` right
+after a release does not show the new version yet, wait and retry - do not
+work around it with query strings in the feed URL (apk concatenates the
+repository URL with package names, which corrupts the fetch). `apk
+upgrade` never downgrades, so a stale index cannot roll a newer install
+back.
 
 ## Package contents
 
@@ -235,6 +262,34 @@ notes from tuning this add-on:
   asked for them), and prefer strategies that survive on **all** your paths
   and leave the controls working.
 
+## Operations
+
+- **status / diagnostics**: `wanguard-antidpi mark-status` (mihomo
+  integration facts), `tunnel-status` (exclusion set + cron), `engine-cmdline`
+  (the exact nfqws2 argv), `version` / `engine-version`. Any state-changing
+  command accepts `WANGUARD_ANTIDPI_DRYRUN=1` to print actions without
+  touching live state.
+- **engine debug logging**: `uci set wanguard-antidpi.engine.debug='1'; uci
+  commit wanguard-antidpi; /etc/init.d/wanguard-antidpi restart` - nfqws2
+  then runs with `--debug=1` and logs per-packet verdicts to syslog
+  (`logread | grep nfqws2`). Verbose by design; meant for tuning sessions -
+  turn it back off with `'0'`.
+- **exclude a destination from desync manually**: static pins go to
+  `tunnel.proxy_servers` (canonical IPv4/CIDR each), then restart the
+  service - the merged set (static pins + resolver answers) is re-rendered
+  into the nft set, and the engine argv re-renders its
+  `--ipset-exclude-ip`:
+
+  ```sh
+  uci add_list wanguard-antidpi.tunnel.proxy_servers='203.0.113.10'
+  uci commit wanguard-antidpi
+  /etc/init.d/wanguard-antidpi restart
+  ```
+
+- **temporarily disable processing** without uninstalling: see Rollback
+  (stop + disable; the scope mark stays in the mihomo config and is
+  harmless without the queue rules).
+
 ## Development
 
 All development and testing runs in Docker containers - the same
@@ -317,6 +372,25 @@ CI pipeline (`feed.yml`): `build` -> matrix (`smoke-test`, `mark-test`,
 the `feed` branch; tag pushes only) -> `feed-test` (install from the live
 feed as the final canary; cannot precede publication by definition - the
 matrix already install-tested the same artifact before it was published).
+
+### Updating the upstream engine
+
+The pin lives in `scripts/fetch-upstream.sh` as the single source of truth:
+`ZAPRET2_VERSION_DEFAULT` plus two sha256 constants (the release tarball
+and the canonical `binaries/linux-x86_64/nfqws2` hash from the upstream
+`sha256sum.txt`). Bumping the engine:
+
+1. update the pin (version + both hashes) in `scripts/fetch-upstream.sh`;
+2. `sh scripts/dev-test.sh` - the build fetches the new artifact, verifies
+   both hashes, and the whole matrix must stay green;
+3. tag `vX.Y.Z` (package `X.Y.Z-r1`) and push - CI runs the same matrix and
+   publishes the feed only on green; a tag that disagrees with the pin
+   fails the CI version guard.
+
+Package-only fixes (config/render/tests, no engine change) ship as an
+explicit revision tag `vX.Y.Z-rN` without touching the pin. Consumers: the
+feed index is CDN-cached (see Installation) - give it a few minutes before
+`apk update && apk upgrade` on the router.
 
 ## Requirements
 

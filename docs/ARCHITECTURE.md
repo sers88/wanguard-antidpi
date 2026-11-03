@@ -242,7 +242,31 @@ wanguard or fw4 state. Traffic already leaving through the proxy tunnel is
 out of scope once `proxy_servers` is populated by the updater (#62) - only
 mihomo DIRECT egress (with the scope mark) enters the queue.
 
-## 5. Test matrix = release gate (#63)
+## 5. Compatibility contract (consolidated, issue #66)
+
+Ownership and the never-touch list in one place (details in the sections
+above):
+
+| Artifact | Owner | This add-on |
+|---|---|---|
+| fwmark `0x10000000` | wanguard-antidpi | the scope mark - mihomo `routing-mark`; installed/removed idempotently (3.1) |
+| fwmark `0x40000000` | wanguard-antidpi | nfqws2 strategy mark (`engine.fwmark`) |
+| fwmark `0x20000000` | unassigned | reserved for blockcheck2 staging runs: its hardwired `DESYNC_MARK=0x10000000` MUST be patched to a free bit before running (README Tuning) |
+| NFQUEUE `300` | wanguard-antidpi | owns (`engine.qnum`) |
+| nft table `inet wanguard_antidpi` | wanguard-antidpi | own namespaced table, postrouting @ 101 |
+| nft tables `inet wanguard`, `inet fw4` | wanguard core / fw4 | **never written or flushed** (acceptance uninstall audit, #65: both byte-identical before/after) |
+| policy routing (`ip rule`) | wanguard core | never touched (audit: identical before/after) |
+| `/etc/mihomo/config.yaml` | mihomo | the one foreign file edited: one root-level `routing-mark` line - idempotent, backed up, `mihomo -t`-validated, live-reloaded, restored on remove (3.1) |
+| `/etc/crontabs/root` | system | one tagged cron line; foreign lines preserved; dropped on service stop (3.3) |
+| `/usr/share/mihomo/config.yaml` | mihomo workdir | kept in sync as the SAFE_PATHS reload copy (3.1); restored in sync on remove |
+
+Conflict-safety notes: wanguard core policy marks live in `0x64..0x258` and
+match by exact value, so the add-on's marks cannot disturb policy routing;
+the add-on's postrouting hook (priority 101) sits between fw4 srcnat (100)
+and fw4 mangle_postrouting (150) without altering either. The contract is
+one-sided by design: the wanguard core needs no knowledge of this add-on.
+
+## 6. Test matrix = release gate (#63)
 
 Every frozen contract above is verified by `tests/*.sh` scripts that run
 byte-identically on the local dev stand (`scripts/dev-test.sh`, Docker) and
