@@ -174,6 +174,67 @@ Note on licensing: this repository's own code is MIT. The upstream engine
 zapret2 does not declare a license; its binary and lua strategies are
 redistributed here unmodified, pinned by sha256.
 
+## Tuning desync strategies (issue #64)
+
+The engine ships in a **graceful no-op** state: the UCI list
+`wanguard-antidpi.engine.nfqws2_opt` is empty, nfqws2 passes packets through
+untouched. Desync strategies are configured by filling that list - **one list
+item = one nfqws2 argv word** - and restarting the service:
+
+```sh
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-tcp=443'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--payload=tls_client_hello'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--lua-desync=multisplit:pos=midsld'
+uci commit wanguard-antidpi
+/etc/init.d/wanguard-antidpi restart
+```
+
+Rollback: `uci delete wanguard-antidpi.engine.nfqws2_opt; uci commit
+wanguard-antidpi` and restart - the engine returns to the no-op.
+
+Things that hold for ANY strategy on this add-on:
+
+- **`--payload=<type>` is mandatory** before a chain of `--lua-desync=...`
+  functions. Without it the lua functions receive no packet types and the
+  whole chain is silently inert (engine runs, CPU stays at zero, traffic is
+  unchanged). Canonical types: `tls_client_hello` (TCP), `quic_initial`
+  (UDP), `http_req` (plain HTTP). `--filter-tcp=443` / `--filter-udp=443`
+  scope each chain to its protocol.
+- **Tunnel destinations are excluded at the engine level too** (defense in
+  depth, issue #64): the engine argv automatically carries
+  `--ipset-exclude-ip=<merged tunnel set>` whenever the tunnel lists are
+  populated - the same validated, deduped, sorted set the nft table
+  excludes. Even if a rotated tunnel address reaches the queue before the
+  nft set updates, desync never touches tunnel traffic. This is rendered by
+  `wanguard-antidpi engine-cmdline` and needs no configuration.
+- The nft table gates what reaches the queue at all: mihomo DIRECT egress
+  (routing mark), tcp/udp 443 only, first packets of a connection
+  (connbytes 20/5), destination outside the local networks and the tunnel
+  sets.
+
+**Finding a strategy that works for YOUR provider** is provider-specific by
+nature - a strategy tuned on one ISP's DPI commonly fails on another. The
+upstream `blockcheck2.sh` (zapret2 repository, same version tag as the
+pinned engine) automates the search: run it ON the router, it tests dozens
+of strategy variants against blocked domains of your choice through its own
+temporary nft table and queue, and prints which ones worked. Practical
+notes from tuning this add-on:
+
+- stage the whole upstream tree in `/tmp` (blockcheck2.sh, `blockcheck2.d/`,
+  `common/`, `config.default`, lua copies; the openwrt-embedded engine
+  tarball has no `mdig` binary - a small nslookup-based stub satisfies
+  blockcheck2's resolve paths);
+- pass `QNUM=<free queue> BATCH=1 SKIP_DNSCHECK=1 SKIP_IPBLOCK=1
+  ENABLE_HTTP=0` and `NFQWS2=/usr/bin/nfqws2`;
+- **WARNING: blockcheck2 hardwires `DESYNC_MARK=0x10000000`.** If other
+  software on the router already uses that fwmark (this add-on's mihomo
+  integration does), patch the staging copy to a free bit before running -
+  otherwise blockcheck's notrack rules hit that traffic too;
+- run it per egress path you want to cover, keep unblocked control sites in
+  the loop (some foolings - notably `tcp_md5` - break servers that never
+  asked for them), and prefer strategies that survive on **all** your paths
+  and leave the controls working.
+
 ## Development
 
 All development and testing runs in Docker containers - the same

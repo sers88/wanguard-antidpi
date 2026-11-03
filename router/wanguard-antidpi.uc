@@ -218,6 +218,20 @@ function cmd_engine_cmdline() {
 	print('--lua-init=@' + BASE + '/lua/zapret-antidpi.lua.gz\n');
 	if (c.debug == '1')
 		print('--debug=1\n');
+	// defense in depth (issues #62/#64): tunnel destinations are excluded at
+	// the nft level (primary control) AND at the engine level - desync must
+	// never touch tunnel traffic even when a rotated daddr reaches the queue
+	// before the nft set is updated. Same merged set as the nft render
+	// (validated, deduped, sorted); the CSV is a single safe argv word
+	// (strict IPv4/CIDR entries cannot contain commas). Emitted only when the
+	// set is non-empty: the default-config golden stays a 6-word no-op.
+	let els = merge_proxy_entries(load_tunnel());
+	if (length(els) > 0) {
+		let csv = els[0];
+		for (let i = 1; i < length(els); i++)
+			csv = csv + ',' + els[i];
+		print('--ipset-exclude-ip=' + csv + '\n');
+	}
 	// strategy words verbatim: one UCI list item = one argv word (the shell
 	// word-split contract is gone with the ucode base)
 	for (let i = 0; i < length(c.opt); i++)

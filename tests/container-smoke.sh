@@ -126,6 +126,21 @@ case "$cl" in
 	*"$PKGDIR/lua/zapret-antidpi.lua.gz"*) ;;
 	*) fail "engine-cmdline: zapret-antidpi.lua.gz missing" ;;
 esac
+# strategy words pass through verbatim (issue #64): one UCI list item =
+# one argv word. Generic example here - the productive strategy is
+# provider-specific and lives outside this repository.
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-tcp=443'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--payload=tls_client_hello'
+uci commit wanguard-antidpi
+cl=$("$CLI" engine-cmdline)
+printf '%s\n' "$cl" | grep -Fqx -- '--filter-tcp=443' \
+	|| fail "engine-cmdline: strategy word --filter-tcp=443 not rendered verbatim"
+printf '%s\n' "$cl" | grep -Fqx -- '--payload=tls_client_hello' \
+	|| fail "engine-cmdline: strategy word --payload=tls_client_hello not rendered verbatim"
+uci delete wanguard-antidpi.engine.nfqws2_opt
+uci commit wanguard-antidpi
+[ "$(printf '%s\n' "$("$CLI" engine-cmdline)" | grep -c .)" = "6" ] \
+	|| fail "engine-cmdline: default 6-word golden broken after strategy removal"
 
 # ---- nft render + DRYRUN contract (no live state touched) ----
 out=$("$CLI" nft-render)
@@ -204,6 +219,14 @@ case "$out" in
 esac
 [ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "2" ] \
 	|| fail "nft-render: both sets must carry elements once the lists are filled"
+# defense in depth (issue #64): the engine argv carries the SAME merged set
+# as one --ipset-exclude-ip word - desync never touches tunnel destinations
+# even when a rotated daddr reaches the queue before the nft set updates
+cl=$("$CLI" engine-cmdline)
+case "$cl" in
+	*--ipset-exclude-ip=192.0.2.0/24,192.0.2.7,198.51.100.5*) ;;
+	*) fail "engine-cmdline: ipset-exclude-ip (merged tunnel set) missing" ;;
+esac
 # malformed entries are rejected at render time (render-injection safety) -
 # in BOTH lists, manual and resolver-managed
 uci delete wanguard-antidpi.tunnel

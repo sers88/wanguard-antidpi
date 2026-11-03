@@ -214,11 +214,15 @@ Triggers:
   crontab files itself; `update_interval=0` or no hosts -> the line stays
   absent.
 
-Defense in depth (documented for #64): once desync strategies are enabled,
-their nfqws2 filters must match only non-tunnel traffic - the nft-level
-destination exclusion is the primary control, not the only one. Until the
-exclusion set is populated, tunnel packets match the queue - safe only while
-the engine strategy is empty (graceful no-op).
+Defense in depth (implemented in r9, issue #64): once desync strategies are
+enabled, their nfqws2 filters must match only non-tunnel traffic - the
+nft-level destination exclusion is the primary control, not the only one.
+`engine-cmdline` renders `--ipset-exclude-ip=<merged set>` (same validated,
+deduped, sorted set as the nft render) whenever the tunnel lists are
+populated, so desync never touches tunnel traffic even when a rotated daddr
+reaches the queue before the nft set updates. Until the exclusion set is
+populated, tunnel packets match the queue - safe only while the engine
+strategy is empty (graceful no-op).
 
 Verification contract: `tests/test-tunnel.sh` (NET_ADMIN container, stub
 `nslookup` on PATH - ucode children spawn via /bin/sh, deterministic, no
