@@ -15,6 +15,17 @@
 # (0x64..0x258) exactly. The table is namespaced: it never touches `inet fw4`
 # or `inet wanguard`.
 #
+# - output priority -401 (predefrag): nfqws-generated packets (the fwmark)
+#   are untracked BEFORE conntrack. Without this, a fake that hits a conntrack
+#   churn window (DPI RSTs, entry rotation) re-enters conntrack with a fresh
+#   unconfirmed entry and the postrouting confirm clashes with the confirmed
+#   tuple -> NF_DROP -> rawsend sendto() EPERM (issue #68: live
+#   insert_failed/drop counter correlation; ~1480 drops/day in the wild, all
+#   of them the 54-byte fake segment). The same rule ships in upstream
+#   zapret2's own firewall setup ("avoid drop by INVALID conntrack state").
+#   Fakes copy the queued, post-NAT packet, so untracking changes nothing
+#   else for them: no NAT is needed, and the egress rules below already
+#   exclude the mark from the queue.
 # - priority 101: post-NAT (fw4 srcnat = 100), before fw4 mangle_postrouting
 #   (150) and filter (200) - no hook overlap
 # - oifname intentionally NOT filtered: mihomo egress may leave via any
@@ -45,6 +56,10 @@ table inet wanguard_antidpi {
 		type ipv4_addr
 		flags interval
 @PROXY_ELEMENTS@	}
+	chain predefrag {
+		type filter hook output priority -401; policy accept;
+		meta mark & @FWMARK@ != 0 notrack
+	}
 	chain egress {
 		type filter hook postrouting priority 101; policy accept;
 		# TCP 443: only the first 20 packets of every connection

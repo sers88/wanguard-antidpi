@@ -96,6 +96,10 @@ printf '%s\n' "$r1" | grep -qE '@[A-Z_]+@' && fail "unsubstituted placeholder in
 case "$r1" in *"priority 101"*) ;; *) fail "no priority 101" ;; esac
 [ "$(printf '%s\n' "$r1" | grep -c 'queue num 300 bypass')" = "2" ] \
 	|| fail "expected exactly 2 queue rules in the render"
+case "$r1" in
+	*"priority -401"*"notrack"*) ;;
+	*) fail "no predefrag notrack chain in the render (issue #68)" ;;
+esac
 
 # ---- kernel probe (NFQUEUE support) ----
 LIVE=1
@@ -151,6 +155,10 @@ esac
 # (input form) prints as `queue flags bypass to 300`
 [ "$(nft list chain inet $TABLE egress | grep -c 'queue flags bypass to 300')" = "2" ] \
 	|| fail "applied chain: expected 2 queue rules"
+case "$(nft list chain inet $TABLE predefrag)" in
+	*"priority -401"*"notrack"*) ;;
+	*) fail "applied chain: predefrag notrack missing (issue #68)" ;;
+esac
 nft list set inet $TABLE local_v4 >/dev/null || fail "local_v4 set missing"
 nft list set inet $TABLE proxy_servers >/dev/null || fail "proxy_servers set missing"
 [ "$(nft list set inet $TABLE proxy_servers | grep -c 'elements = ')" = "0" ] \

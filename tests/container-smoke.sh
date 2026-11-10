@@ -193,6 +193,15 @@ case "$out" in
 	*"counter"*"queue num 300"*) ;;
 	*) fail "nft-render: no counter before queue" ;;
 esac
+# notrack predefrag (issue #68): engine-generated packets are untracked before
+# conntrack - without it a fake that hits a conntrack churn window is
+# confirm-dropped by the kernel (rawsend sendto EPERM, insert_failed race)
+case "$out" in
+	*"priority -401"*"notrack"*) ;;
+	*) fail "nft-render: predefrag notrack chain missing (issue #68)" ;;
+esac
+[ "$(printf '%s\n' "$out" | grep -c 'meta mark & 0x40000000 != 0 notrack')" = "1" ] \
+	|| fail "nft-render: expected exactly 1 engine notrack rule"
 case "$out" in
 	*"set local_v4"*"192.168.0.0/16"*) ;;
 	*) fail "nft-render: local_v4 set missing/incomplete" ;;

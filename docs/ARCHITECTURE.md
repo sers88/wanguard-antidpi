@@ -49,7 +49,7 @@ options live in this section, issue #62):
 | Component | Role |
 |---|---|
 | mihomo | proxy core; with `routing-mark 0x10000000` its own DIRECT egress is the add-on's scope (the CLI installs the mark idempotently, #60) |
-| nftables (`table inet wanguard_antidpi`) | own table: postrouting @ mangle+10, `meta mark 0x10000000 queue flags bypass to <qnum>`; never touches wanguard / fw4 tables (final rule set: #61) |
+| nftables (`table inet wanguard_antidpi`) | own table: output `predefrag` @ -401 (engine mark `notrack`, #68) + postrouting @ 101, `meta mark 0x10000000 queue flags bypass to <qnum>`; never touches wanguard / fw4 tables (final rule set: #61, notrack: #68) |
 | nfqws2 (zapret2) | desync engine, single instance, `--qnum=<qnum>`, gzipped lua strategies loaded via `--lua-init=@`; graceful no-op when the strategy is empty |
 | wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status, tunnel-update/status, cron-install/remove; DRYRUN-aware |
 | resolver updater (#62) | `tunnel-update`: nslookup per `tunnel_hosts` entry, maintains `tunnel.proxy_resolved` in UCI with per-IP expiry (state file), re-applies the table only when the set changed and the table lives |
@@ -62,7 +62,12 @@ options live in this section, issue #62):
   would do, touches nothing, exits 0 - this is the container test surface
 - `engine-cmdline`: one argv word per line - exactly what the init shim starts
 - nft table shape (issue #61, final): own `inet wanguard_antidpi` table,
-  postrouting `priority 101` (post-NAT, right after fw4 srcnat), two queue
+  output `predefrag` @ `priority -401` - `meta mark & @fwmark@ != 0 notrack`
+  untracks engine-generated packets BEFORE conntrack: without it a fake in a
+  conntrack churn window (DPI RSTs, entry rotation) is confirm-dropped by the
+  kernel (`insert_failed` clash -> NF_DROP -> rawsend sendto EPERM, issue #68;
+  the same rule ships in upstream zapret2's own firewall setup) - plus the
+  postrouting `priority 101` chain (post-NAT, right after fw4 srcnat), two queue
   rules - `tcp dport 443 ct original packets 1-20` and
   `udp dport 443 ct original packets 1-5` (zapret2 config.default connbytes) -
   each scoped by `meta mark & 0x10000000 == 0x10000000` AND

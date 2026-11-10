@@ -130,7 +130,7 @@ back.
 | `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`); all state-changing commands are DRYRUN-aware |
 | `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
 | `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
-| `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@` rendered from the config by `nft-render`) |
+| `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@`, `@FWMARK@`, `@PROXY_ELEMENTS@` rendered from the config by `nft-render`; includes the pre-CR conntrack notrack for engine packets, #68) |
 | `/usr/share/wanguard-antidpi/version` | package version stamp |
 | `/etc/config/wanguard-antidpi` | UCI config template (source of truth; apk-protected: user edits survive upgrades) |
 | `/etc/init.d/wanguard-antidpi` | procd init (thin sh shim - the rc.common contract): ensure mihomo mark -> refresh tunnel exclusion set (non-fatal) -> apply own nft table -> ensure the periodic-update cron line -> engine instance (respawn on crash); stop = kill -> drop cron line -> flush table |
@@ -358,7 +358,7 @@ needs every matrix job green:
 | Install | `tests/container-smoke.sh` (local + feed modes) | `apk add` (untrusted artifact / signed feed), file layout, version stamp, conffile contract: a user-modified `/etc/config/wanguard-antidpi` survives a reinstall of the same version, the incoming default lands next to it as `.apk-new` |
 | Syntax + DRYRUN | `tests/container-smoke.sh` | `sh -n` on the init script; `nft-apply` / `nft-flush` / `mark-install` / `tunnel-update` / `cron-install` DRYRUN never touch live state (the init shim's DRYRUN paths need `rc.common` - router acceptance only) |
 | mihomo integration | `tests/test-mark.sh` | real pinned mihomo: inject -> `mihomo -t` ok -> mihomo starts with the mark; a repeated inject is a no-op; remove restores the original bytes; live REST reload both directions |
-| nft table | `tests/test-nft.sh` | apply shape (priority 101, 2 queue rules, both sets), re-apply byte-identical, bypass with the engine down, engine queue bind, scope negatives, flush |
+| nft table | `tests/test-nft.sh` | apply shape (priority 101, 2 queue rules, both sets, notrack predefrag #68), re-apply byte-identical, bypass with the engine down, engine queue bind, scope negatives, flush |
 | Resolver updater | `tests/test-tunnel.sh` | multi-A answers into the sorted UCI list, set-update idempotency, dedupe, partial/total failure behavior, per-IP expiry, live apply/update, no-table guard |
 | Graceful no-op | across the matrix | empty strategy + 6-word `engine-cmdline` golden (smoke), marked traffic flows with the engine down (`test-nft.sh` BYPASS), graceful no-mihomo-config paths (`test-mark.sh`, smoke) |
 
