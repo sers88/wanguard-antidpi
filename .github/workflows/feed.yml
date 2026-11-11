@@ -74,6 +74,14 @@ jobs:
           sh apk/build.sh "$GITHUB_WORKSPACE" ./apk.static "${{ steps.ver.outputs.ver }}" out
           ls -la out
 
+      - name: Guard - one tag, both packages (issue #78)
+        run: |
+          set -eu
+          for p in wanguard-antidpi luci-app-wanguard-antidpi; do
+            f="out/$p-${{ steps.ver.outputs.ver }}.apk"
+            [ -f "$f" ] || { echo "ERROR: $f missing - one tag must ship both packages" >&2; exit 1; }
+          done
+
       - name: Inspect package metadata
         run: |
           for p in out/*.apk; do
@@ -211,11 +219,33 @@ jobs:
             openwrt/rootfs:x86_64-25.12.6 \
             sh /tests/test-apply.sh
 
+  luci-test:
+    name: Matrix - luci menu + ACL (OpenWrt container)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: LuCI menu + ACL matrix in OpenWrt container (luci-base from the image feed)
+        env:
+          VER: ${{ needs.build.outputs.ver }}
+        run: |
+          docker run --rm \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-luci.sh "$VER"
+
   # ---- publication gate: reached only when the whole matrix is green.
   # ---- Tag pushes only - dispatch runs validate without publishing.
   publish:
     name: Sign index, publish feed branch (gated by the matrix)
-    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test]
+    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, luci-test]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:

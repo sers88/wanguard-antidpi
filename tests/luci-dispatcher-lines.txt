@@ -1,0 +1,24 @@
+# tests/luci-dispatcher-lines.txt - dispatcher fidelity guard for
+# tests/luci-menu-test.uc (issue #78).
+#
+# The harness replicates the LuCI dispatcher's menu.d merge + ACL logic
+# verbatim. Each non-comment line below MUST be present (grep -F) in the
+# installed /usr/share/ucode/luci/dispatcher.uc; the test greps the real
+# file so an upstream LuCI change to this logic fails the matrix loudly and
+# the harness gets re-derived instead of silently diverging.
+#
+# Whitespace inside a line is significant (grep -F); leading indentation is
+# not (the lines are matched as substrings).
+node.children ??= {};
+node.children[s[0]] ??= { satisfied: true };
+if (type(spec[k]) == t)
+node[k] = spec[k];
+node.satisfied = check_depends(spec);
+else if (type(spec.action) == 'object')
+let read = ('read' in groups?.[group]);
+let write = ('write' in groups?.[group]);
+if (!read && !write)
+return writable;
+if (node?.depends?.acl) {
+case null:  node.satisfied = false; break;
+case false: node.readonly = true;   break;

@@ -1,0 +1,23 @@
+{
+	"admin/network/wanguard": {
+		"title": "WAN Guard",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-wanguard-antidpi" ]
+		}
+	},
+	"admin/network/wanguard/antidpi": {
+		"title": "Anti-DPI",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "wanguard/antidpi"
+		},
+		"depends": {
+			"acl": [ "luci-app-wanguard-antidpi" ]
+		}
+	}
+}

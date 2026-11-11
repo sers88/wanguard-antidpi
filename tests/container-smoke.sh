@@ -23,7 +23,9 @@ VER="${2:?missing version}"
 case "$MODE" in
 local)
 	[ -d /out ] || { echo "SMOKE-FAIL: /out not mounted"; exit 1; }
-	set -- /out/*.apk
+	# core package only - the luci package has its own matrix
+	# (tests/test-luci.sh, issue #78) and would pull luci-base from the feed
+	set -- /out/wanguard-antidpi-*.apk
 	[ -f "$1" ] || { echo "SMOKE-FAIL: no package in /out"; exit 1; }
 	echo "== install (untrusted, local build): $1"
 	apk add --allow-untrusted "$@"
@@ -36,7 +38,13 @@ feed)
 	echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x86_64/packages.adb" \
 		>> /etc/apk/repositories.d/customfeeds.list
 	apk update
-	apk add wanguard-antidpi
+	# both packages, one tag (issue #78): the canary proves the luci package
+	# is published and installable, not just the core
+	apk add wanguard-antidpi luci-app-wanguard-antidpi
+	[ -f /usr/share/luci/menu.d/wanguard-antidpi.json ] \
+		|| { echo "SMOKE-FAIL: luci menu file missing after the feed install"; exit 1; }
+	[ -f /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json ] \
+		|| { echo "SMOKE-FAIL: luci acl file missing after the feed install"; exit 1; }
 	;;
 *)
 	echo "SMOKE-FAIL: unknown mode '$MODE'"
@@ -511,10 +519,10 @@ uci set wanguard-antidpi.engine.conffile_probe='1'
 uci commit wanguard-antidpi
 case "$MODE" in
 local)
-	apk add --allow-untrusted --force-reinstall /out/*.apk >/dev/null
+	apk add --allow-untrusted --force-reinstall /out/wanguard-antidpi-*.apk >/dev/null
 	;;
 feed)
-	apk add --force-reinstall wanguard-antidpi >/dev/null
+	apk add --force-reinstall wanguard-antidpi luci-app-wanguard-antidpi >/dev/null
 	;;
 esac
 [ "$(uci -q get wanguard-antidpi.engine.conffile_probe)" = "1" ] \

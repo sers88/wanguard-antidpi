@@ -1,0 +1,190 @@
+#!/bin/sh
+# tests/test-luci.sh - luci-app-wanguard-antidpi menu + ACL matrix (issue #78).
+#
+# ONE script for the local dev stand (scripts/dev-test.sh step 9) and CI
+# (feed.yml luci-test job): mount /out (ro) with the built *.apk and /tests
+# (ro) with this script + the harness + the fixture, then:
+#
+#   [1] install core + luci packages (the luci-base dependency resolves from
+#       the image feeds - the only matrix step that needs the network)
+#   [2] dispatcher fidelity guard: the harness replicates the installed
+#       dispatcher's merge/ACL logic verbatim, the pinned lines must exist
+#   [3] golden guards: parent node vs the luci-app-wanguard fixture,
+#       child node completeness (per-field merge protection, #75)
+#   [4] sort-order probes: the #75 A_fixed/A_default lessons, executable
+#   [5] tree scenarios: merged / standalone / read-only / ACL-negative
+#   [6] byte-identical-parent proof: a parent carrying the luci-app-wanguard
+#       ACL group is HIDDEN in standalone mode (dispatcher apply_tree_acls)
+#       - which is why the shipped parent carries OUR group (deviation from
+#       the issue's literal byte-identity, documented in the issue comment)
+#   [7] live menu.d shape with a simulated luci-app-wanguard installed
+#   [8] apk del removes the tab, keeps the simulated luci-app-wanguard file
+#       and the core package
+#
+# Usage: test-luci.sh <version>
+set -eu
+
+VER="${1:?missing version}"
+
+fail() {
+	echo "LUCI-FAIL: $1"
+	exit 1
+}
+
+expect() { # expect <what> <expected-line> <actual-output>
+	printf '%s\n' "$3" | grep -Fqx "$2" \
+		|| fail "$1: expected [$2], got: $(printf '%s\n' "$3" | head -n 5)"
+}
+
+MENU=/usr/share/luci/menu.d/wanguard-antidpi.json
+ACL=/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json
+FIXT=/tests/fixtures/luci-app-wanguard.menu.json
+UC=/tests/luci-menu-test.uc
+DISP=/usr/share/ucode/luci/dispatcher.uc
+
+mkdir -p /tmp/luci
+printf '%s\n' '{ "access-group": { "luci-app-wanguard": { "read": {}, "write": {} }, "luci-app-wanguard-antidpi": { "read": {}, "write": {} } } }' > /tmp/luci/acl-both.json
+printf '%s\n' '{ "access-group": { "luci-app-wanguard-antidpi": { "read": {}, "write": {} } } }' > /tmp/luci/acl-ours.json
+printf '%s\n' '{ "access-group": { "luci-app-wanguard-antidpi": { "read": {} } } }' > /tmp/luci/acl-ours-ro.json
+printf '%s\n' '{ "access-group": {} }' > /tmp/luci/acl-none.json
+# reduced stand-in for the #79 placeholder (parent + inactive-tab child)
+printf '%s\n' \
+	'{' \
+	'	"admin/network/wanguard": { "title": "WAN Guard", "order": 60, "action": { "type": "firstchild" }, "depends": { "acl": [ "luci-app-wanguard" ] } },' \
+	'	"admin/network/wanguard/antidpi": { "title": "Anti-DPI placeholder", "order": 10, "action": { "type": "view", "path": "wanguard/antidpi-placeholder" }, "depends": { "acl": [ "luci-app-wanguard" ] } }' \
+	'}' > /tmp/luci/stub-luci-app-wanguard.json
+
+echo "== [1] install core + luci packages (luci-base resolves from the image feed)"
+apk update >/dev/null
+apk add --allow-untrusted /out/*.apk
+apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \
+	|| fail "core package not registered as wanguard-antidpi-$VER"
+apk list --installed 2>/dev/null | grep -q "^luci-app-wanguard-antidpi-$VER " \
+	|| fail "luci package not registered as luci-app-wanguard-antidpi-$VER"
+apk list --installed 2>/dev/null | grep -q "^luci-base-" \
+	|| fail "luci-base dependency did not resolve"
+[ -f "$MENU" ] || fail "menu file missing"
+[ -f "$ACL" ] || fail "acl file missing"
+ls -l "$MENU" | grep -q '^-rw-r--r--' || fail "menu file must be 0644"
+ls -l "$ACL" | grep -q '^-rw-r--r--' || fail "acl file must be 0644"
+
+echo "== [2] dispatcher fidelity guard"
+[ -f "$DISP" ] || fail "dispatcher.uc not found - luci-base missing?"
+while IFS= read -r line; do
+	case "$line" in ''|'#'*) continue ;; esac
+	grep -qF -- "$line" "$DISP" \
+		|| fail "dispatcher line drifted - re-derive tests/luci-menu-test.uc: $line"
+done < /tests/luci-dispatcher-lines.txt
+echo "DISPATCHER-FIDELITY-OK"
+
+echo "== [3] golden guards (fixture + child completeness)"
+out=$(ucode "$UC" parentguard "$FIXT" "$MENU" luci-app-wanguard-antidpi) \
+	|| fail "parentguard exited non-zero: $out"
+printf '%s\n' "$out" | grep -q '^PARENT-GUARD-OK' || fail "parentguard: $out"
+out=$(ucode "$UC" childguard "$MENU") || fail "childguard exited non-zero: $out"
+printf '%s\n' "$out" | grep -q '^CHILD-GUARD-OK' || fail "childguard: $out"
+echo "GUARDS-OK"
+
+echo "== [4] sort-order probes (#75 A_fixed / A_default, executable)"
+mkdir -p /tmp/luci/sort-ok /tmp/luci/sort-bad
+# correct name: ours sorts after luci-app-wanguard.json -> the real node wins
+cp /tmp/luci/stub-luci-app-wanguard.json /tmp/luci/sort-ok/luci-app-wanguard.json
+cp "$MENU" /tmp/luci/sort-ok/wanguard-antidpi.json
+out=$(ucode "$UC" tree /tmp/luci/sort-ok /tmp/luci/acl-both.json)
+expect 'sort-order: wanguard-antidpi.json wins' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+# the default name (luci-app-wanguard-antidpi.json) sorts BEFORE
+# luci-app-wanguard.json ('-' < '.'), the placeholder wins - the filename is
+# part of the contract
+cp /tmp/luci/stub-luci-app-wanguard.json /tmp/luci/sort-bad/luci-app-wanguard.json
+cp "$MENU" /tmp/luci/sort-bad/luci-app-wanguard-antidpi.json
+out=$(ucode "$UC" tree /tmp/luci/sort-bad /tmp/luci/acl-both.json)
+expect 'sort-order: default filename loses to the placeholder' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=10 path=wanguard/antidpi-placeholder' \
+	"$out"
+echo "SORTORDER-OK"
+
+echo "== [5] tree scenarios (merged / standalone / read-only / acl-negative)"
+mkdir -p /tmp/luci/merged /tmp/luci/standalone /tmp/luci/byteparent
+cp "$FIXT" /tmp/luci/merged/luci-app-wanguard.json
+cp "$MENU" /tmp/luci/merged/wanguard-antidpi.json
+out=$(ucode "$UC" tree /tmp/luci/merged /tmp/luci/acl-both.json)
+expect 'merged: parent' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard-antidpi children=antidpi,devices,diagnostics,groups,overview' \
+	"$out"
+expect 'merged: antidpi' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+
+cp "$MENU" /tmp/luci/standalone/wanguard-antidpi.json
+out=$(ucode "$UC" tree /tmp/luci/standalone /tmp/luci/acl-ours.json)
+expect 'standalone: parent (one tab)' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard-antidpi children=antidpi' \
+	"$out"
+expect 'standalone: antidpi' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+
+out=$(ucode "$UC" tree /tmp/luci/standalone /tmp/luci/acl-ours-ro.json)
+expect 'read-only session: readonly flag on antidpi' \
+	'wanguard.antidpi: satisfied=1 readonly=1 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+
+out=$(ucode "$UC" tree /tmp/luci/standalone /tmp/luci/acl-none.json)
+expect 'acl-negative: parent hidden' \
+	'wanguard.parent: satisfied=0 readonly=0 title=WAN Guard acl=luci-app-wanguard-antidpi children=antidpi' \
+	"$out"
+expect 'acl-negative: antidpi hidden' \
+	'wanguard.antidpi: satisfied=0 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+echo "TREE-OK"
+
+echo "== [6] byte-identical parent would hide the standalone menu (deviation proof)"
+# The issue's literal byte-identity (parent acl = luci-app-wanguard) cannot
+# ship: in standalone mode that ACL group does not exist, apply_tree_acls()
+# marks the parent unsatisfied and the WHOLE Wanguard menu disappears - the
+# very scenario the parent duplication exists for. The shipped parent carries
+# our own group instead (everything else identical); this scenario pins the
+# proof. See the dispatcher apply_tree_acls/check_acl_depends verbatim
+# functions in tests/luci-menu-test.uc.
+printf '%s\n' \
+	'{' \
+	'	"admin/network/wanguard": { "title": "WAN Guard", "order": 60, "action": { "type": "firstchild" }, "depends": { "acl": [ "luci-app-wanguard" ] } },' \
+	'	"admin/network/wanguard/antidpi": { "title": "Anti-DPI", "order": 35, "action": { "type": "view", "path": "wanguard/antidpi" }, "depends": { "acl": [ "luci-app-wanguard-antidpi" ] } }' \
+	'}' > /tmp/luci/byteparent/wanguard-antidpi.json
+out=$(ucode "$UC" tree /tmp/luci/byteparent /tmp/luci/acl-ours.json)
+expect 'byte-identical parent hidden in standalone (deviation is load-bearing)' \
+	'wanguard.parent: satisfied=0 readonly=0 title=WAN Guard acl=luci-app-wanguard children=antidpi' \
+	"$out"
+echo "BYTEPARENT-PROOF-OK"
+
+echo "== [7] live menu.d shape (simulated luci-app-wanguard installed)"
+cp "$FIXT" /usr/share/luci/menu.d/luci-app-wanguard.json
+out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-both.json)
+expect 'live: parent' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard-antidpi children=antidpi,devices,diagnostics,groups,overview' \
+	"$out"
+expect 'live: antidpi' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+echo "LIVE-MENU-OK"
+
+echo "== [8] apk del removes the tab, keeps the simulated luci-app-wanguard + core"
+apk del luci-app-wanguard-antidpi >/dev/null
+[ ! -f "$MENU" ] || fail "apk del left the menu file"
+[ ! -f "$ACL" ] || fail "apk del left the acl file"
+[ -f /usr/share/luci/menu.d/luci-app-wanguard.json ] \
+	|| fail "apk del touched the simulated luci-app-wanguard menu file"
+apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \
+	|| fail "apk del removed the core package (must stay)"
+out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-both.json)
+expect 'uninstall: luci tabs remain' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard children=devices,diagnostics,groups,overview' \
+	"$out"
+expect 'uninstall: antidpi node gone' \
+	'wanguard.antidpi: absent' \
+	"$out"
+echo "UNINSTALL-OK"
+
+echo "LUCI-OK ($VER)"

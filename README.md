@@ -114,8 +114,23 @@ echo "https://raw.githubusercontent.com/sers88/wanguard-antidpi/feed/packages/x8
 
 # 3. install
 apk update
-apk add wanguard-antidpi
+apk add wanguard-antidpi luci-app-wanguard-antidpi
 ```
+
+### Install combinations (issue #78)
+
+One tag ships both packages at the same version; they are independent in
+both directions (the LuCI app does NOT depend on luci-app-wanguard):
+
+| Installed | Result |
+|---|---|
+| core only | no LuCI integration; everything via the CLI |
+| core + `luci-app-wanguard` | WAN Guard menu; the Anti-DPI tab arrives with `luci-app-wanguard-antidpi` |
+| core + `luci-app-wanguard-antidpi` | standalone WAN Guard menu with a single Anti-DPI tab |
+| all three | WAN Guard menu with the full tab set plus Anti-DPI |
+
+`apk del luci-app-wanguard-antidpi` removes the Anti-DPI tab and nothing
+else (the core package keeps running).
 
 Feed caching: the `packages.adb` index is served through GitHub's CDN and
 can lag the published `feed` branch by ~5-10 minutes. If `apk update` right
@@ -137,6 +152,13 @@ back.
 | `/usr/share/wanguard-antidpi/version` | package version stamp |
 | `/etc/config/wanguard-antidpi` | UCI config template (source of truth; apk-protected: user edits survive upgrades) |
 | `/etc/init.d/wanguard-antidpi` | procd init (thin sh shim - the rc.common contract): ensure mihomo mark -> refresh tunnel exclusion set (non-fatal) -> apply own nft table -> ensure the periodic-update cron line -> engine instance (respawn on crash); stop = kill -> drop cron line -> flush table |
+
+### luci-app-wanguard-antidpi (issue #78)
+
+| Path | What |
+|---|---|
+| `/usr/share/luci/menu.d/wanguard-antidpi.json` | menu nodes: the `admin/network/wanguard` parent (replicating luci-app-wanguard's node so the menu works standalone, ACL switched to this package's group) + the `admin/network/wanguard/antidpi` child. The FILE NAME is part of the contract: `wanguard-antidpi.json` sorts after `luci-app-wanguard.json` in menu.d glob order, so the real node wins the per-field merge against the placeholder (#75); the default package-derived name sorts before it and would lose |
+| `/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json` | ACL group `luci-app-wanguard-antidpi`: exec `/usr/bin/wanguard-antidpi`, read/write the `wanguard-antidpi` UCI config, ubus `file` read/exec |
 
 Upstream pinning (issue #57): the engine payload comes from the
 `bol-van/zapret2` `openwrt-embedded` release artifact, downloaded at build
@@ -425,6 +447,16 @@ What runs where:
   update-while-live, no-table guard, render-injection guard; without NFQUEUE
   in the host kernel the live apply part stays structural
   (`TUNNEL-LIVE-SKIP`).
+- `tests/test-luci.sh` - the LuCI menu + ACL matrix (issue #78; needs the
+  network for the `luci-base` dependency): install both packages, dispatcher
+  fidelity guard (the merge/ACL harness in `tests/luci-menu-test.uc`
+  replicates the installed dispatcher verbatim - the pinned lines in
+  `tests/luci-dispatcher-lines.txt` must exist in it), parent-node golden
+  guard against the `luci-app-wanguard` fixture, child-node completeness,
+  sort-order probes (both the winning name and the losing default name),
+  merged / standalone / read-only / ACL-negative tree scenarios, the
+  byte-identical-parent deviation proof, the live menu.d shape and the
+  `apk del` behavior.
 
 ### Test matrix = release gate (issue #63)
 
@@ -440,14 +472,16 @@ needs every matrix job green:
 | nft table | `tests/test-nft.sh` | apply shape (priority 101, 2 queue rules, both sets, notrack predefrag #68), re-apply byte-identical, bypass with the engine down, engine queue bind, scope negatives, flush |
 | Resolver updater | `tests/test-tunnel.sh` | multi-A answers into the sorted UCI list, set-update idempotency, dedupe, partial/total failure behavior, per-IP expiry, live apply/update, no-table guard |
 | Graceful no-op | across the matrix | empty strategy + 6-word `engine-cmdline` golden (smoke), marked traffic flows with the engine down (`test-nft.sh` BYPASS), graceful no-mihomo-config paths (`test-mark.sh`, smoke) |
+| LuCI menu + ACL | `tests/test-luci.sh` | both packages install (luci-base dependency resolves), dispatcher fidelity guard, parent-node golden guard (fixture) + child completeness, sort-order (winning + losing name), merged/standalone/read-only/acl-negative trees, byte-identical-parent deviation proof, live menu.d shape, `apk del` removes the tab only |
 
 Known limitation: live NFQUEUE scenarios (real packets processed through the
 queue) cannot run in a container whose host kernel lacks queue support - on
 such hosts the matrix stays structural (`NFT-LIVE-SKIP` /
 `TUNNEL-LIVE-SKIP`) and those cases are covered by router acceptance.
 
-CI pipeline (`feed.yml`): `build` -> matrix (`smoke-test`, `mark-test`,
-`nft-test`, `tunnel-test` in parallel) -> `publish` (sign the index, push
+CI pipeline (`feed.yml`): `build` (one tag = both packages, guard asserted) ->
+matrix (`smoke-test`, `mark-test`, `nft-test`, `tunnel-test`, `status-test`,
+`apply-test`, `luci-test` in parallel) -> `publish` (sign the index, push
 the `feed` branch; tag pushes only) -> `feed-test` (install from the live
 feed as the final canary; cannot precede publication by definition - the
 matrix already install-tested the same artifact before it was published).
