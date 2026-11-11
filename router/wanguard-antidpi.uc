@@ -43,6 +43,12 @@
 //                   re-reads its lists on HUP - no restart, no dropped
 //                   connections; verified against the pinned binary)
 //   whitelist-status   machine-readable whitelist state
+//   status [--json]  read-only state surface for the LuCI page (issue #76):
+//                   service/engine/nft/tunnel/whitelist/mihomo/pending/events
+//                   in one call; --json = one JSON document (stable keys),
+//                   default = human key: value lines. Every surface degrades
+//                   explicitly (null/false + a "degraded" reason in JSON) -
+//                   the page renders "unavailable" from the same keys
 //
 // DRYRUN contract: WANGUARD_ANTIDPI_DRYRUN=1 makes every state-changing
 // command print what it would do, touch nothing, exit 0. This is how the
@@ -55,7 +61,7 @@
 
 'use strict';
 
-import { access, popen, readfile, writefile, unlink } from 'fs';
+import { access, popen, readfile, stat, writefile, unlink } from 'fs';
 import * as uci from 'uci';
 
 const BASE = '/usr/share/wanguard-antidpi';
@@ -247,7 +253,10 @@ function cmd_engine_version() {
 	print(line + '\n');
 }
 
-function cmd_engine_cmdline() {
+function engine_argv() {
+	// the exact nfqws2 argv (without the binary path) the init shim starts;
+	// cmd_engine_cmdline prints it one word per line (frozen contract), the
+	// status surface re-reads it (issue #76)
 	let c = load_config();
 	// whitelist mode (issue #70): strict validation at render time - the
 	// hostlist file is a hard engine dependency (nfqws2 refuses to start
@@ -259,15 +268,16 @@ function cmd_engine_cmdline() {
 			die('whitelist.enabled=1 but whitelist.domains is empty - add domains or set whitelist.enabled to 0');
 		validate_whitelist_domains(w.domains);
 	}
-	print(ENGINE + '\n');
-	print('--qnum=' + c.qnum + '\n');
-	print('--fwmark=' + c.fwmark + '\n');
-	print('--user=' + c.user + '\n');
 	// gzipped lua is supported natively by nfqws2 (--lua-init=@<file>)
-	print('--lua-init=@' + BASE + '/lua/zapret-lib.lua.gz\n');
-	print('--lua-init=@' + BASE + '/lua/zapret-antidpi.lua.gz\n');
+	let a = [
+		'--qnum=' + c.qnum,
+		'--fwmark=' + c.fwmark,
+		'--user=' + c.user,
+		'--lua-init=@' + BASE + '/lua/zapret-lib.lua.gz',
+		'--lua-init=@' + BASE + '/lua/zapret-antidpi.lua.gz'
+	];
 	if (c.debug == '1')
-		print('--debug=1\n');
+		push(a, '--debug=1');
 	// defense in depth (issues #62/#64): tunnel destinations are excluded at
 	// the nft level (primary control) AND at the engine level - desync must
 	// never touch tunnel traffic even when a rotated daddr reaches the queue
@@ -280,7 +290,7 @@ function cmd_engine_cmdline() {
 		let csv = els[0];
 		for (let i = 1; i < length(els); i++)
 			csv = csv + ',' + els[i];
-		print('--ipset-exclude-ip=' + csv + '\n');
+		push(a, '--ipset-exclude-ip=' + csv);
 	}
 	// whitelist mode emission (issue #70): --hostlist constrains desync to
 	// the listed hosts (suffix match, subdomains auto apply). Needs strategy
@@ -290,14 +300,22 @@ function cmd_engine_cmdline() {
 	// it is re-emitted after every --new profile separator.
 	let wl_emit = (w.enabled == '1' && length(c.opt) > 0);
 	if (wl_emit)
-		print('--hostlist=' + HOSTLIST + '\n');
+		push(a, '--hostlist=' + HOSTLIST);
 	// strategy words verbatim: one UCI list item = one argv word (the shell
 	// word-split contract is gone with the ucode base)
 	for (let i = 0; i < length(c.opt); i++) {
-		print(c.opt[i] + '\n');
+		push(a, c.opt[i]);
 		if (wl_emit && c.opt[i] == '--new' && i + 1 < length(c.opt))
-			print('--hostlist=' + HOSTLIST + '\n');
+			push(a, '--hostlist=' + HOSTLIST);
 	}
+	return a;
+}
+
+function cmd_engine_cmdline() {
+	print(ENGINE + '\n');
+	let a = engine_argv();
+	for (let i = 0; i < length(a); i++)
+		print(a[i] + '\n');
 }
 
 function render_nft() {
@@ -1199,6 +1217,348 @@ function cmd_whitelist_status() {
 }
 
 
+// ---------------------------------------------------------------------------
+// status (issue #76): the read-only state surface behind the LuCI page.
+// ONE subcommand instead of a pile of exec calls from the browser. Every
+// surface degrades explicitly - null/false data plus an entry in the
+// "degraded" map - and nothing throws on missing surfaces: the page renders
+// its "unavailable" states from the same stable keys. Read-only by design:
+// no DRYRUN interaction, no config writes, no signaling.
+//
+// The JSON document (one line, printf %J) mirrors the DESIGN.md contract
+// (private tracker, spike-75): service/engine/nft/tunnel/whitelist/mihomo/
+// pending/events. The default (non-JSON) output is a human key: value view
+// for ops - mark-status style.
+// ---------------------------------------------------------------------------
+
+function status_pidof(bin) {
+	let fp = popen('pidof ' + sh_quote(bin) + ' 2>/dev/null', 'r');
+	let out = trim((fp != null) ? fp.read('all') : '');
+	if (fp != null)
+		fp.close();
+	return (length(out) > 0) ? out : null;
+}
+
+function status_proc_cmdline(pid) {
+	let txt = readfile('/proc/' + pid + '/cmdline');
+	if (txt == null)
+		return null;
+	let parts = split(txt, '\0');
+	let argv = [];
+	for (let i = 0; i < length(parts); i++)
+		if (length(parts[i]) > 0)
+			push(argv, parts[i]);
+	return (length(argv) > 0) ? argv : null;
+}
+
+function status_proc_uptime(pid, sysup) {
+	// seconds since the process started, from /proc/<pid>/stat field 22
+	// (starttime, jiffies). Jiffies-per-second is not detectable portably -
+	// HZ=100 is the OpenWrt default; a nonsensical result (negative or larger
+	// than the system uptime) degrades to null instead of lying to the UI.
+	let st = readfile('/proc/' + pid + '/stat');
+	if (st == null || sysup == null)
+		return null;
+	let fields = split(st, ' ');
+	if (length(fields) < 22 || match(fields[21], /^[0-9]+$/) == null)
+		return null;
+	let up = sysup - int(fields[21]) / 100;
+	if (up < 0 || up > sysup + 5)
+		return null;
+	return int(up);
+}
+
+function status_service_info() {
+	let enabled = false;
+	let fp = popen('ls /etc/rc.d/ 2>/dev/null', 'r');
+	let out = (fp != null) ? fp.read('all') : '';
+	if (fp != null)
+		fp.close();
+	let lines = split(out, '\n');
+	for (let i = 0; i < length(lines); i++)
+		if (match(lines[i], /^S[0-9]+wanguard-antidpi$/) != null)
+			enabled = true;
+	let pid = status_pidof('nfqws2');
+	let sysup = null;
+	let uptxt = readfile('/proc/uptime');
+	if (uptxt != null) {
+		let u = trim(split(trim(uptxt), ' ')[0]);
+		let dot = index(u, '.');
+		if (dot != null && dot > 0)
+			u = substr(u, 0, dot);
+		if (match(u, /^[0-9]+$/) != null)
+			sysup = int(u);
+	}
+	return {
+		enabled: enabled,
+		pid: pid,
+		uptime_s: (pid != null) ? status_proc_uptime(pid, sysup) : null
+	};
+}
+
+function status_engine_info() {
+	// the RENDERED argv (engine_argv) is the source of truth for what the
+	// init shim starts; the running process cmdline is captured alongside so
+	// the UI can show a drift between configured and live
+	let c = load_config();
+	let argv = engine_argv();
+	let newc = 0;
+	let lists = [];
+	let seen = {};
+	for (let i = 0; i < length(argv); i++) {
+		if (argv[i] == '--new')
+			newc++;
+		if (substr(argv[i], 0, 11) == '--hostlist=' && seen[argv[i]] == null) {
+			seen[argv[i]] = true;
+			push(lists, substr(argv[i], 11));
+		}
+	}
+	// no strategy words at all = the graceful no-op (zero profiles); each
+	// --new starts the next profile set
+	let profiles = (length(c.opt) == 0) ? 0 : newc + 1;
+	let ver = null;
+	if (access(ENGINE, 'x')) {
+		let fp = popen(ENGINE + ' --version 2>/dev/null', 'r');
+		let out = (fp != null) ? fp.read('all') : '';
+		if (fp != null)
+			fp.close();
+		ver = trim(split(out, '\n')[0]);
+		if (length(ver) == 0)
+			ver = null;
+	}
+	let pid = status_pidof('nfqws2');
+	return {
+		pid: pid,
+		version: ver,
+		profiles: profiles,
+		hostlists: lists,
+		running_argv: (pid != null) ? status_proc_cmdline(pid) : null
+	};
+}
+
+function status_nft_counters() {
+	// the template owns exactly two counter statements (tcp 443 rule first,
+	// udp 443 second - frozen order, test-golden locked). Text `nft list`
+	// is NOT parseable for this: a zero counter is printed as a bare
+	// `counter` word without values (same family as the md5-vs-counters
+	// gotcha), so the machine-readable `nft -j` JSON is parsed instead.
+	// Returns null when the table is absent.
+	if (system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') != 0)
+		return null;
+	let fp = popen('nft -j list table inet ' + TABLE + ' 2>/dev/null', 'r');
+	let out = (fp != null) ? fp.read('all') : '';
+	if (fp != null)
+		fp.close();
+	let doc = json(out);
+	if (doc == null || type(doc.nftables) != 'array')
+		return null;
+	let res = [];
+	for (let i = 0; i < length(doc.nftables); i++) {
+		let r = doc.nftables[i].rule;
+		if (r == null || type(r.expr) != 'array')
+			continue;
+		let has_queue = false;
+		let cnt = null;
+		for (let j = 0; j < length(r.expr); j++) {
+			if (type(r.expr[j].queue) == 'object')
+				has_queue = true;
+			if (type(r.expr[j].counter) == 'object')
+				cnt = r.expr[j].counter;
+		}
+		if (has_queue && cnt != null)
+			push(res, cnt);
+	}
+	if (length(res) < 2)
+		return null;
+	return {
+		tcp: { packets: int(res[0].packets), bytes: int(res[0].bytes) },
+		udp: { packets: int(res[1].packets), bytes: int(res[1].bytes) }
+	};
+}
+
+function status_tunnel_info() {
+	let t = load_tunnel();
+	let st = load_state();
+	let now = time();
+	let win = int(t.expire_hours) * 3600;
+	let merged = merge_proxy_entries(t);
+	let entries = [];
+	for (let i = 0; i < length(merged); i++) {
+		let e = merged[i];
+		let src = (index_of(t.proxy_servers, e) >= 0) ? 'pin' : 'resolved';
+		let exp = null; // pins never expire; expire_hours=0 = never
+		if (src == 'resolved' && int(t.expire_hours) > 0) {
+			let left = win;
+			if (st[e] != null)
+				left = win - (now - st[e]);
+			exp = (left < 0) ? 0 : int((left + 1800) / 3600);
+		}
+		push(entries, { ip: e, source: src, expires_h: exp });
+	}
+	let parts = split_cron_lines(read_crontab_lines());
+	return {
+		hosts: t.tunnel_hosts,
+		entries: entries,
+		update_interval_h: int(t.update_interval),
+		expire_hours: int(t.expire_hours),
+		cron: { ok: (length(parts.ours) == 1), lines: length(parts.ours) }
+	};
+}
+
+function status_whitelist_info() {
+	let w = load_whitelist();
+	let st = stat(HOSTLIST);
+	return {
+		mode: (w.enabled == '1') ? 'whitelist' : 'blanket',
+		domains: w.domains,
+		file: { exists: (st != null), mtime: (st != null) ? st.mtime : null }
+	};
+}
+
+function status_mihomo_info() {
+	let m = load_mihomo();
+	let text = readfile(m.conffile);
+	if (text == null)
+		return {
+			state: null, mark: null, install_on_start: !access(NOSTAMP, 'r'),
+			backup: false, running: mihomo_running(), api: null, config: m.conffile,
+			config_missing: true
+		};
+	let st = mark_state(text);
+	return {
+		state: st.state,
+		mark: st.value,
+		install_on_start: !access(NOSTAMP, 'r'),
+		backup: access(m.conffile + BACKUP_SUFFIX, 'r'),
+		running: mihomo_running(),
+		api: api_endpoint(text),
+		config: m.conffile,
+		config_missing: false
+	};
+}
+
+function status_pending_info() {
+	// staged-vs-committed UCI delta (`uci changes`) - the UI's "N pending
+	// change" counter. Section tokens are best effort: uci changes lines are
+	// '<conf>.<section>[.option]=value' or '<conf>.<name>=<type>'.
+	let fp = popen('uci -q changes ' + sh_quote(CONF) + ' 2>/dev/null', 'r');
+	let out = (fp != null) ? fp.read('all') : '';
+	if (fp == null)
+		return { count: null, sections: [], degraded: 'uci unavailable' };
+	if (fp.close() != 0 && length(trim(out)) == 0)
+		return { count: null, sections: [], degraded: 'uci changes failed' };
+	let sections = {};
+	let count = 0;
+	let lines = split(out, '\n');
+	for (let i = 0; i < length(lines); i++) {
+		let ln = trim(lines[i]);
+		if (length(ln) == 0)
+			continue;
+		count++;
+		let rest = (substr(ln, 0, length(CONF) + 1) == CONF + '.') ? substr(ln, length(CONF) + 1) : ln;
+		let dot = index(rest, '.');
+		sections[(dot != null && dot > 0) ? substr(rest, 0, dot) : rest] = true;
+	}
+	let arr = [];
+	for (let k in sections)
+		push(arr, k);
+	sort(arr);
+	return { count: count, sections: arr };
+}
+
+function status_events_info() {
+	// filtered syslog tail (nfqws2 / wanguard-antidpi). logread is probed
+	// first: containers and minimal setups have no running syslogd - that is
+	// a degraded surface, not an empty result.
+	if (system('logread >/dev/null 2>&1') != 0)
+		return { available: false, lines: [] };
+	let fp = popen('logread 2>/dev/null | grep -E "nfqws2|wanguard-antidpi" | tail -n 20', 'r');
+	let out = (fp != null) ? fp.read('all') : '';
+	if (fp != null)
+		fp.close();
+	let lines = [];
+	let raw = split(out, '\n');
+	for (let i = 0; i < length(raw); i++) {
+		let ln = trim(raw[i]);
+		if (length(ln) > 0)
+			push(lines, ln);
+	}
+	return { available: true, lines: lines };
+}
+
+function cmd_status() {
+	let want_json = false;
+	for (let i = 1; i < length(ARGV); i++)
+		if (ARGV[i] == '--json')
+			want_json = true;
+
+	let degraded = {};
+	let nftc = status_nft_counters();
+	if (nftc == null)
+		degraded.nft = 'table absent';
+	let t = status_tunnel_info();
+	let w = status_whitelist_info();
+	let m = status_mihomo_info();
+	if (m.config_missing)
+		degraded.mihomo = 'mihomo config missing';
+	if (!access(ENGINE, 'x'))
+		degraded.engine = 'engine binary missing';
+	let p = status_pending_info();
+	if (p.degraded != null)
+		degraded.pending = p.degraded;
+	let ev = status_events_info();
+	if (!ev.available)
+		degraded.events = 'logread unavailable';
+	let en = status_engine_info();
+	if (degraded.engine == null && en.version == null)
+		degraded.engine = 'engine version probe failed';
+
+	let s = {
+		service: status_service_info(),
+		engine: {
+			pid: en.pid,
+			version: en.version,
+			profiles: en.profiles,
+			hostlists: en.hostlists,
+			running_argv: en.running_argv
+		},
+		nft: { table_present: (nftc != null), counters: nftc },
+		tunnel: t,
+		whitelist: w,
+		mihomo: m,
+		pending: { count: p.count, sections: p.sections },
+		events: ev.lines,
+		degraded: degraded
+	};
+
+	if (want_json) {
+		printf('%J\n', s);
+		return;
+	}
+
+	// human ops view (mark-status style key: value lines)
+	print('service: enabled=' + (s.service.enabled ? 'yes' : 'no') +
+		((s.service.pid != null) ? ', engine pid ' + s.service.pid : ', engine not running') +
+		((s.service.uptime_s != null) ? ' (uptime ' + s.service.uptime_s + 's)' : '') + '\n');
+	print('engine: ' + ((s.engine.version != null) ? s.engine.version : 'unknown') +
+		', profiles ' + s.engine.profiles + ', hostlists ' + length(s.engine.hostlists) +
+		((s.engine.running_argv != null) ? ', running argv captured' : '') + '\n');
+	print('nft: ' + (s.nft.table_present ?
+		('table present (tcp ' + s.nft.counters.tcp.packets + ' pkts / udp ' + s.nft.counters.udp.packets + ' pkts)') :
+		'table absent') + '\n');
+	print('tunnel: ' + length(s.tunnel.entries) + ' entries (hosts ' + length(s.tunnel.hosts) +
+		', cron ' + (s.tunnel.cron.ok ? 'ok' : 'missing') + ')\n');
+	print('whitelist: ' + s.whitelist.mode + ' (' + length(s.whitelist.domains) + ' domains, file ' +
+		(s.whitelist.file.exists ? 'present' : 'absent') + ')\n');
+	print('mihomo: ' + (m.config_missing ? 'config missing' : ((m.running ? 'running' : 'stopped') +
+		', mark ' + m.state)) + '\n');
+	print('pending: ' + ((p.count != null) ? (p.count + ' staged change(s)') : 'unknown') + '\n');
+	print('events: ' + (ev.available ? (length(ev.lines) + ' line(s)') : 'unavailable') + '\n');
+	if (length(keys(degraded)) > 0)
+		print('degraded: ' + join_lines(keys(degraded)) + '\n');
+}
+
+
 let cmd = (length(ARGV) > 0) ? ARGV[0] : 'version';
 switch (cmd) {
 case 'version':
@@ -1269,7 +1629,11 @@ case 'whitelist-status':
 	cmd_whitelist_status();
 	break;
 
+case 'status':
+	cmd_status();
+	break;
+
 default:
-	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status]\n');
+	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status|status [--json]]\n');
 	exit(2);
 }

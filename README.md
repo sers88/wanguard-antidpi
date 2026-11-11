@@ -329,6 +329,13 @@ whitelist mode stays enabled.
   (the exact nfqws2 argv), `version` / `engine-version`. Any state-changing
   command accepts `WANGUARD_ANTIDPI_DRYRUN=1` to print actions without
   touching live state.
+- **status surface (issue #76)**: `wanguard-antidpi status [--json]` - the
+  whole read-only state (service / engine / nft counters / tunnel entries /
+  whitelist / mihomo mark / pending UCI delta / syslog tail) in ONE call for
+  the LuCI page. `--json` emits a single JSON document with stable keys;
+  every unavailable surface degrades explicitly (null data + an entry in
+  the `degraded` map) instead of failing - the page renders its
+  "unavailable" states from the same keys. Read-only by design.
 - **engine debug logging**: `uci set wanguard-antidpi.engine.debug='1'; uci
   commit wanguard-antidpi; /etc/init.d/wanguard-antidpi restart` - nfqws2
   then runs with `--debug=1` and logs per-packet verdicts to syslog
