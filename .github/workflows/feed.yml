@@ -191,11 +191,31 @@ jobs:
             openwrt/rootfs:x86_64-25.12.6 \
             sh /tests/test-status.sh
 
+  apply-test:
+    name: Matrix - apply orchestration (OpenWrt container, NET_ADMIN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Apply orchestration matrix in OpenWrt container (stub init + stub DNS)
+        run: |
+          docker run --rm --cap-add NET_ADMIN \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-apply.sh
+
   # ---- publication gate: reached only when the whole matrix is green.
   # ---- Tag pushes only - dispatch runs validate without publishing.
   publish:
     name: Sign index, publish feed branch (gated by the matrix)
-    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test]
+    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:

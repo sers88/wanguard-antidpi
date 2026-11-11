@@ -43,6 +43,15 @@
 //                   re-reads its lists on HUP - no restart, no dropped
 //                   connections; verified against the pinned binary)
 //   whitelist-status   machine-readable whitelist state
+//   apply [--check]  idempotent orchestration behind the LuCI page (issue
+//                   #77): mark-ensure -> tunnel-update -> nft-apply ->
+//                   whitelist-refresh -> engine (restart-vs-SIGHUP per the
+//                   #70 evidence: list content = HUP, strategy words =
+//                   restart through the init script). Exit codes: 0 ok,
+//                   1 validation failure, 2 partial (a non-fatal step kept
+//                   a fallback). --check = read-only preflight (human or
+//                   --json report); repeated apply without config changes
+//                   = no-op
 //   status [--json]  read-only state surface for the LuCI page (issue #76):
 //                   service/engine/nft/tunnel/whitelist/mihomo/pending/events
 //                   in one call; --json = one JSON document (stable keys),
@@ -96,6 +105,8 @@ const CRON_TAG = 'wanguard-antidpi-tunnel-update';
 // file must stay world-readable: the HUP-time reload happens under the
 // dropped engine user.
 const HOSTLIST = BASE + '/whitelist.hosts';
+const INIT = '/etc/init.d/wanguard-antidpi';
+const CLI_SELF = '/usr/bin/wanguard-antidpi';
 
 function die(msg) {
 	warn('wanguard-antidpi: ' + msg + '\n');
@@ -1559,6 +1570,324 @@ function cmd_status() {
 }
 
 
+// ---------------------------------------------------------------------------
+// apply (issue #77): the idempotent orchestration point behind the LuCI page.
+// ONE subcommand instead of the UI assembling a call sequence. The real run
+// drives the SAME subcommands the init shim drives (as child processes, so
+// their output/log lines stay byte-identical whether invoked directly or
+// through apply):
+//
+//   mark-ensure -> tunnel-update -> nft-apply -> whitelist-refresh -> engine
+//
+// The engine step decides restart-vs-SIGHUP from evidence (#70: list CONTENT
+// is re-read on HUP without dropping the queue or live connections; strategy
+// word changes need a full restart through the init script):
+//   - engine dead + strategy words present -> init restart (starts it)
+//   - rendered argv drifted beyond the --hostlist words -> init restart
+//   - only --hostlist words / hostlist file content changed -> SIGHUP
+//   - nothing changed -> no-op (idempotency; repeated apply is safe)
+//
+// Exit codes (DESIGN.md contract): 0 ok, 1 validation failure (config does
+// not render, nft apply failed, restart failed), 2 partial (a non-fatal step
+// kept a fallback - e.g. tunnel-update kept the last known exclusion set on
+// a total resolution failure).
+//
+// --check: preflight WITHOUT mutations - config renders, nft table in force,
+// mark installed with our value, engine running, hostlist file present when
+// the engine consumes it. Human output; --json adds a machine-readable
+// report. DRYRUN (the README convention) prints the full plan without
+// touching any live state.
+// ---------------------------------------------------------------------------
+
+function apply_running_argv() {
+	// the live engine argv (binary path dropped) for the restart-vs-HUP
+	// decision; null = not running (or /proc unreadable)
+	let pid = engine_pid();
+	if (length(pid) == 0)
+		return null;
+	let pids = split(trim(pid), ' ');
+	let argv = status_proc_cmdline(pids[0]);
+	if (argv == null || length(argv) < 1)
+		return null;
+	let r = [];
+	for (let i = 1; i < length(argv); i++)
+		push(r, argv[i]);
+	return r;
+}
+
+function apply_argv_without_hostlist(a) {
+	let r = [];
+	for (let i = 0; i < length(a); i++)
+		if (substr(a[i], 0, 11) != '--hostlist=')
+			push(r, a[i]);
+	return r;
+}
+
+function apply_argv_equal(a, b) {
+	if (length(a) != length(b))
+		return false;
+	for (let i = 0; i < length(a); i++)
+		if (a[i] != b[i])
+			return false;
+	return true;
+}
+
+function apply_hostlist_wouldbe() {
+	// the canonical text whitelist-refresh would write right now, or null for
+	// blanket mode (mirror of whitelist_refresh_run's content pipeline; the
+	// caller has rendered engine_argv() first, so the domains are already
+	// validated and this cannot die)
+	let w = load_whitelist();
+	if (w.enabled != '1' || length(w.domains) == 0)
+		return null;
+	let seen = {};
+	let doms = [];
+	for (let i = 0; i < length(w.domains); i++)
+		if (seen[w.domains[i]] == null) {
+			seen[w.domains[i]] = true;
+			push(doms, w.domains[i]);
+		}
+	sort(doms);
+	return join_lines(doms) + '\n';
+}
+
+function apply_engine_decision(file_changed) {
+	// pure computation over live state + the rendered argv (no mutations):
+	// 'restart' (through the init script), 'reload' (SIGHUP) or 'noop'
+	let c = load_config();
+	let new_argv = engine_argv();
+	let old_argv = apply_running_argv();
+	if (old_argv == null)
+		return (length(c.opt) > 0)
+			? { action: 'restart', reason: 'engine not running - starting with ' + length(c.opt) + ' strategy words' }
+			: { action: 'noop', reason: 'engine not running, no strategy words - nothing to start' };
+	if (!apply_argv_equal(old_argv, new_argv)) {
+		if (apply_argv_equal(apply_argv_without_hostlist(old_argv), apply_argv_without_hostlist(new_argv)))
+			return { action: 'reload', reason: 'hostlist words changed - SIGHUP keeps the live connections' };
+		return { action: 'restart', reason: 'engine argv drifted (strategy/filters) - restart required' };
+	}
+	if (file_changed)
+		return { action: 'reload', reason: 'hostlist file content changed - SIGHUP re-reads the lists' };
+	return { action: 'noop', reason: 'engine argv and lists are up to date' };
+}
+
+function apply_child(args, quiet) {
+	// run one of the CLI's own subcommands as a child process (output/log
+	// lines stay byte-identical to a direct invocation; JSON mode swallows
+	// them so the document stays parseable)
+	return system(CLI_SELF + ' ' + args + ((quiet) ? ' >/dev/null 2>&1' : ''));
+}
+
+function apply_check_run(want_json) {
+	let checks = {};
+	let ok = true;
+
+	// config: the full engine argv render (UCI strict section, whitelist
+	// validation, address validation). Probed in a child so a die() inside
+	// the render cannot kill the check itself; the child's stderr carries
+	// the human-readable reason.
+	let cfg_rc = system(CLI_SELF + ' engine-cmdline >/dev/null 2>&1');
+	if (cfg_rc != 0) {
+		let fp = popen(CLI_SELF + ' engine-cmdline 2>&1 >/dev/null', 'r');
+		let cerr = trim((fp != null) ? fp.read('all') : '');
+		if (fp != null)
+			fp.close();
+		checks.config = { ok: false, detail: (length(cerr) > 0) ? cerr : 'engine-cmdline render failed' };
+		ok = false;
+	} else {
+		checks.config = { ok: true, detail: null };
+	}
+
+	// nft: table in force AND the template still renders
+	let table_live = (system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') == 0);
+	let nft_rc = system(CLI_SELF + ' nft-render >/dev/null 2>&1');
+	checks.nft = {
+		ok: (table_live && nft_rc == 0),
+		present: table_live,
+		detail: (!table_live) ? 'table absent' : ((nft_rc != 0) ? 'nft-render failed' : null)
+	};
+	if (!checks.nft.ok)
+		ok = false;
+
+	// mark: installed with OUR value (a foreign value is a hard fail - the
+	// add-on never touches it, and without our mark the scope silently does
+	// not exist)
+	let m = load_mihomo();
+	let text = readfile(m.conffile);
+	if (text == null) {
+		checks.mark = { ok: false, value: null, detail: 'mihomo config missing (' + m.conffile + ')' };
+		ok = false;
+	} else {
+		let st = mark_state(text);
+		checks.mark = (st.state == 'installed')
+			? { ok: true, value: st.value, detail: null }
+			: {
+				ok: false, value: st.value,
+				detail: (st.state == 'conflict')
+					? ('foreign routing-mark: ' + st.value + ' (needs ' + MARK_LINE + ' - never touched by this add-on)')
+					: 'routing-mark not installed'
+			};
+		if (!checks.mark.ok)
+			ok = false;
+	}
+
+	// engine: running
+	let pid = engine_pid();
+	checks.engine = (length(pid) > 0)
+		? { ok: true, pid: pid, detail: null }
+		: { ok: false, pid: null, detail: 'engine not running' };
+	if (length(pid) == 0)
+		ok = false;
+
+	// hostlist: present when the engine consumes it (whitelist on + strategy
+	// words); blanket mode and wordless whitelists never read the file
+	let w = load_whitelist();
+	let c = load_config();
+	let needed = (w.enabled == '1' && length(w.domains) > 0 && length(c.opt) > 0);
+	let exists = access(HOSTLIST, 'r');
+	checks.hostlist = {
+		ok: (!needed || exists),
+		needed: needed,
+		exists: exists,
+		detail: (needed && !exists)
+			? ('whitelist mode consumes ' + HOSTLIST + ' but the file is missing (run whitelist-refresh)')
+			: null
+	};
+	if (needed && !exists)
+		ok = false;
+
+	if (want_json) {
+		printf('%J\n', { ok: ok, checks: checks });
+	} else {
+		print('check: config: ' + (checks.config.ok ? 'ok' : 'FAILED - ' + checks.config.detail) + '\n');
+		print('check: nft: ' + (checks.nft.ok ? 'ok' : 'FAILED - ' + checks.nft.detail) + '\n');
+		print('check: mark: ' + (checks.mark.ok ? ('ok (' + checks.mark.value + ')') : 'FAILED - ' + checks.mark.detail) + '\n');
+		print('check: engine: ' + (checks.engine.ok ? ('ok (pid ' + checks.engine.pid + ')') : 'FAILED - ' + checks.engine.detail) + '\n');
+		print('check: hostlist: ' + (checks.hostlist.ok
+			? (checks.hostlist.needed ? 'ok (file present)' : 'ok (not consumed in this mode)')
+			: 'FAILED - ' + checks.hostlist.detail) + '\n');
+		print('check-result: ' + (ok ? 'ok' : 'FAILED') + '\n');
+	}
+	exit(ok ? 0 : 1);
+}
+
+function cmd_apply() {
+	let want_check = false;
+	let want_json = false;
+	for (let i = 1; i < length(ARGV); i++) {
+		if (ARGV[i] == '--check')
+			want_check = true;
+		else if (ARGV[i] == '--json')
+			want_json = true;
+		else
+			die('apply: unknown argument: ' + ARGV[i]);
+	}
+	if (want_check)
+		return apply_check_run(want_json);
+
+	// preflight render: every validation die() in the config path fires
+	// HERE, before any mutation (validation failure -> exit 1, nothing
+	// touched)
+	let c = load_config();
+	engine_argv();
+
+	if (dryrun()) {
+		let cur = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
+		let wouldbe = apply_hostlist_wouldbe();
+		let d = apply_engine_decision(cur != wouldbe);
+		print('DRYRUN: would ensure the routing-mark integration\n');
+		print('DRYRUN: would update the tunnel exclusion set (' + length(load_tunnel().tunnel_hosts) + ' host(s) configured)\n');
+		print('DRYRUN: would apply nft table inet ' + TABLE + '\n');
+		print('DRYRUN: would ' + ((wouldbe == null) ? ('remove ' + HOSTLIST + ' (blanket mode)') : ('render ' + HOSTLIST)) + '\n');
+		print('DRYRUN: engine: would ' + d.action + ' (' + d.reason + ')\n');
+		print('DRYRUN: apply plan printed - no changes made\n');
+		exit(0);
+	}
+
+	let steps = {};
+	let fatal = false;
+	let partial = false;
+
+	// [1] mark integration (child: exit 0 = ok/skip/non-fatal - conflict and
+	// missing-config stay graceful per the mark-ensure contract; 1 = the
+	// injected config failed validation and was rolled back)
+	steps.mark = (apply_child('mark-ensure', want_json) == 0) ? 'ok' : 'failed';
+	if (steps.mark == 'failed')
+		fatal = true;
+
+	// [2] tunnel exclusion set (non-fatal by contract: a total resolution
+	// failure keeps the last known set; the table below still applies)
+	if (length(load_tunnel().tunnel_hosts) == 0) {
+		steps.tunnel = 'skipped';
+		if (!want_json)
+			print('apply: tunnel: skipped (no hosts configured)\n');
+	} else {
+		steps.tunnel = (apply_child('tunnel-update', want_json) == 0) ? 'ok' : 'kept-last-known';
+		if (steps.tunnel != 'ok')
+			partial = true;
+	}
+
+	// [3] nft scope table
+	steps.nft = (apply_child('nft-apply', want_json) == 0) ? 'applied' : 'failed';
+	if (steps.nft == 'failed')
+		fatal = true;
+	else if (!want_json)
+		print('apply: nft: applied\n');
+
+	// [4] hostlist render + change detection for the engine step
+	let file_before = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
+	if (apply_child('whitelist-refresh', want_json) != 0) {
+		steps.whitelist = 'failed';
+		fatal = true;
+	} else {
+		steps.whitelist = 'refreshed';
+		if (!want_json)
+			print('apply: whitelist: refreshed\n');
+	}
+	let file_after = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
+	let file_changed = (file_before != file_after);
+
+	// [5] engine: restart-vs-SIGHUP per the #70 evidence
+	let d = apply_engine_decision(file_changed);
+	if (d.action == 'restart') {
+		let rc = system(INIT + ' restart >/dev/null 2>&1');
+		if (rc == 0) {
+			steps.engine = 'restarted';
+			if (!want_json)
+				print('apply: engine: restarted - ' + d.reason + '\n');
+			system('logger -t wanguard-antidpi ' + sh_quote('apply: engine restarted (' + d.reason + ')'));
+		} else {
+			steps.engine = 'failed';
+			warn('wanguard-antidpi: apply: init restart failed (rc ' + rc + ')\n');
+			fatal = true;
+		}
+	} else if (d.action == 'reload') {
+		let pid = engine_pid();
+		let hp = (length(pid) > 0) ? trim(split(pid, ' ')[0]) : null;
+		if (hp == null || system('kill -HUP ' + hp) != 0) {
+			steps.engine = 'failed';
+			warn('wanguard-antidpi: apply: failed to signal the engine\n');
+			fatal = true;
+		} else {
+			steps.engine = 'reloaded';
+			if (!want_json)
+				print('apply: engine: reloaded (SIGHUP pid ' + hp + ') - ' + d.reason + '\n');
+			system('logger -t wanguard-antidpi ' + sh_quote('apply: engine reloaded via SIGHUP (pid ' + hp + ') - ' + d.reason));
+		}
+	} else {
+		steps.engine = 'noop';
+		if (!want_json)
+			print('apply: engine: no-op - ' + d.reason + '\n');
+	}
+
+	if (want_json)
+		printf('%J\n', { ok: !fatal, partial: partial, steps: steps });
+	else
+		print('apply-result: ' + (fatal ? 'FAILED' : (partial ? 'PARTIAL' : 'ok')) + '\n');
+	exit(fatal ? 1 : (partial ? 2 : 0));
+}
+
+
 let cmd = (length(ARGV) > 0) ? ARGV[0] : 'version';
 switch (cmd) {
 case 'version':
@@ -1629,11 +1958,15 @@ case 'whitelist-status':
 	cmd_whitelist_status();
 	break;
 
+case 'apply':
+	cmd_apply();
+	break;
+
 case 'status':
 	cmd_status();
 	break;
 
 default:
-	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status|status [--json]]\n');
+	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status|apply [--check]|status [--json]]\n');
 	exit(2);
 }

@@ -130,7 +130,7 @@ back.
 | Path | What |
 |---|---|
 | `/usr/bin/nfqws2` | static desync engine from the pinned upstream zapret2 release (shipped unmodified) |
-| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`); all state-changing commands are DRYRUN-aware |
+| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`), whitelist render/reload/status, `apply [--check]` (idempotent orchestration for the LuCI page) and `status [--json]` (read-only state surface); all state-changing commands are DRYRUN-aware |
 | `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
 | `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
 | `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@`, `@FWMARK@`, `@PROXY_ELEMENTS@` rendered from the config by `nft-render`; includes the pre-CR conntrack notrack for engine packets, #68) |
@@ -336,6 +336,18 @@ whitelist mode stays enabled.
   every unavailable surface degrades explicitly (null data + an entry in
   the `degraded` map) instead of failing - the page renders its
   "unavailable" states from the same keys. Read-only by design.
+- **apply (issue #77)**: `wanguard-antidpi apply [--check] [--json]` - the
+  idempotent orchestration point: mark-ensure -> tunnel-update -> nft-apply
+  -> whitelist-refresh -> engine. The engine step decides restart-vs-SIGHUP
+  from evidence: list content changes re-read on SIGHUP without dropping
+  the queue or live connections; strategy word changes restart through the
+  init script (which re-runs the same idempotent steps). Repeated apply
+  without config changes is a no-op. Exit codes: 0 ok, 1 validation
+  failure, 2 partial (a non-fatal step kept a fallback - e.g. tunnel-update
+  kept the last known exclusion set). `--check` is a read-only preflight
+  (config renders, nft table in force, mark installed with our value,
+  engine running, hostlist present when consumed) with a human report or
+  `--json`. DRYRUN prints the plan without touching live state.
 - **engine debug logging**: `uci set wanguard-antidpi.engine.debug='1'; uci
   commit wanguard-antidpi; /etc/init.d/wanguard-antidpi restart` - nfqws2
   then runs with `--debug=1` and logs per-packet verdicts to syslog

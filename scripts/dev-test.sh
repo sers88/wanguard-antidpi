@@ -7,6 +7,7 @@
 # [3] nft scope table (tests/test-nft.sh, live when the host kernel allows)
 # [4] tunnel resolver updater (tests/test-tunnel.sh, stub DNS)
 # [5] status surface (tests/test-status.sh, live engine part when allowed)
+# [6] apply orchestration (tests/test-apply.sh, stub init + stub DNS)
 # Router not required; only Docker must be up. CI runs byte-identical scripts
 # (same tests/*.sh, same mounts, same container image), so local and CI
 # results are comparable by construction.
@@ -25,14 +26,14 @@ hostpath() {
 	if uname -s | grep -qiE 'mingw|msys|cygwin'; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
 }
 
-echo "=== [1/6] kernel probe (NFQUEUE support in the container kernel)"
+echo "=== [1/8] kernel probe (NFQUEUE support in the container kernel)"
 probe=$(sh scripts/kernel-probe.sh) || {
 	printf '%s\n' "$probe"
 	exit 1
 }
 printf '%s\n' "$probe"
 
-echo "=== [2/6] local build"
+echo "=== [2/8] local build"
 sh scripts/dev-build.sh "$@"
 
 ls out/wanguard-antidpi-*.apk >/dev/null 2>&1 || {
@@ -43,7 +44,7 @@ pkg=$(ls out/wanguard-antidpi-*.apk | head -n 1)
 ver=${pkg#*/wanguard-antidpi-}
 ver=${ver%.apk}
 
-echo "=== [3/7] install + smoke matrix (fresh container)"
+echo "=== [3/8] install + smoke matrix (fresh container)"
 docker run --rm \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/scripts"):/scripts:ro" \
@@ -51,33 +52,40 @@ docker run --rm \
 	"$IMAGE" \
 	sh /tests/container-smoke.sh local "$ver"
 
-echo "=== [4/7] mihomo mark integration (fresh container, NET_ADMIN)"
+echo "=== [4/8] mihomo mark integration (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-mark.sh
 
-echo "=== [5/7] nft scope table (fresh container, NET_ADMIN)"
+echo "=== [5/8] nft scope table (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-nft.sh
 
-echo "=== [6/7] tunnel resolver updater (fresh container, NET_ADMIN)"
+echo "=== [6/8] tunnel resolver updater (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-tunnel.sh
 
-echo "=== [7/7] status surface (fresh container, NET_ADMIN)"
+echo "=== [7/8] status surface (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-status.sh
+
+echo "=== [8/8] apply orchestration (fresh container, NET_ADMIN)"
+docker run --rm --cap-add NET_ADMIN \
+	-v "$(hostpath "$PWD/out"):/out:ro" \
+	-v "$(hostpath "$PWD/tests"):/tests:ro" \
+	"$IMAGE" \
+	sh /tests/test-apply.sh
 
 if printf '%s\n' "$probe" | grep -q '^NFQUEUE-OK'; then
 	echo "DEV-TEST-OK (matrix green: $ver; NFQUEUE live scenarios testable here)"
