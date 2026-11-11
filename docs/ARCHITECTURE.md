@@ -240,6 +240,66 @@ NFQUEUE in the host kernel the live apply part stays structural
 no-ops, DRYRUN forms, `tunnel-status`, cron mechanics with foreign-line
 preservation).
 
+## 3.4 SNI whitelist (#70)
+
+Scope guarantee: desync is applied ONLY to whitelisted destinations -
+everything else passes the queue unmodified. The control surface is the UCI
+`whitelist` soft section (same contract as `tunnel`); the engine consumes a
+rendered hostlist file.
+
+Data model:
+
+- input: `whitelist.enabled` (`1` = whitelist mode; only the literal `1`
+  enables), `whitelist.domains` (strict DNS names, no wildcards - the engine
+  matches by suffix with subdomains auto applying)
+- output: `/usr/share/wanguard-antidpi/whitelist.hosts` (machine-managed:
+  one domain per line, LF, deduped, canonical order, 0644 - the SIGHUP-time
+  reload runs under the dropped engine user)
+- blanket mode (`enabled=0` or no section): file removed, argv unchanged -
+  byte-identical to the pre-#70 golden
+
+Render algorithm (`whitelist-refresh`):
+
+1. validate every domain (strict hostname check - the file is engine-parsed,
+   render-injection safety); `enabled=1` with an empty list dies loudly (a
+   half-enabled config must not silently fall back to blanket desync)
+2. dedupe + sort, one host per line, single trailing LF
+3. write + verify-after-write (ucode write failures are silent) + chmod 644
+4. whitelist mode off or empty -> the file is removed (idempotent)
+
+Engine argv (`engine-cmdline`): `--hostlist=<file>` is emitted per PROFILE -
+before the first strategy word and after every `--new` separator - when
+whitelist mode is on AND the strategy list is non-empty (an empty strategy
+has nothing to constrain; the default golden stays untouched). The file is a
+HARD engine dependency: nfqws2 refuses to start when it is missing, which is
+why the init shim refreshes the file BEFORE the engine start - a failed
+refresh that keeps the previous file is the soft direction, a truly absent
+file fails the start loudly instead of silently desyncing everything.
+
+Engine facts (verified in the container against the pinned binary):
+the hostlist binds per profile ("profile N include hostlist"); a missing
+hostlist file keeps the engine from starting; an empty file starts fine but
+matches nothing (never produced here - see render step 1); there is no mtime
+auto-reload, lists are re-read on SIGHUP ("Lists will be reloaded") without
+dropping the queue or live connections.
+
+Triggers:
+
+- every service start (init shim, non-fatal, before the engine start)
+- content changes: `whitelist-reload` = refresh + SIGHUP to a running
+  engine; no running engine -> graceful no-op, applies on next start
+- mode switches (enable/disable) require a service restart: the argv changes
+  with the mode, and only a restart re-renders it
+
+Verification contract: `tests/container-smoke.sh` asserts the structural
+surface (fresh-host status, file render exactness + idempotency, DRYRUN
+forms, per-profile argv emission, enabled+empty-strategy golden, garbage
+domains dying loudly in both `whitelist-refresh` and `engine-cmdline` with
+the file left intact, disable removing the file, pristine state after). The
+end-to-end workflow (engine started via the exact shim recipe, then
+`whitelist-reload` refreshing + reloading the list under the dropped user)
+was verified in the container against the pinned engine.
+
 ## 4. Scope discipline
 
 The add-on owns the lifecycle of its own table and engine; it never edits
@@ -264,6 +324,7 @@ above):
 | `/etc/mihomo/config.yaml` | mihomo | the one foreign file edited: one root-level `routing-mark` line - idempotent, backed up, `mihomo -t`-validated, live-reloaded, restored on remove (3.1) |
 | `/etc/crontabs/root` | system | one tagged cron line; foreign lines preserved; dropped on service stop (3.3) |
 | `/usr/share/mihomo/config.yaml` | mihomo workdir | kept in sync as the SAFE_PATHS reload copy (3.1); restored in sync on remove |
+| `/usr/share/wanguard-antidpi/whitelist.hosts` | wanguard-antidpi | machine-managed engine hostlist (3.4): rendered from UCI, removed when whitelist mode is off |
 
 Conflict-safety notes: wanguard core policy marks live in `0x64..0x258` and
 match by exact value, so the add-on's marks cannot disturb policy routing;

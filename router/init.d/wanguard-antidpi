@@ -5,7 +5,9 @@
 #
 # start: ensure the mihomo routing-mark (idempotent inject + live REST reload,
 #        non-fatal) -> refresh the tunnel exclusion set (resolver updater,
-#        non-fatal; the persisted list covers boot-time DNS outages) -> apply
+#        non-fatal; the persisted list covers boot-time DNS outages) -> render
+#        the SNI whitelist hostlist (non-fatal; the engine refuses to start
+#        without the file, so a missing file fails the start loudly) -> apply
 #        the own nft table -> ensure the periodic update cron line -> procd
 #        instance (respawn)
 # stop : procd kills the instance -> drop the cron line -> flush the nft table
@@ -35,6 +37,8 @@ start_service() {
 		echo "DRYRUN: would ensure the mihomo routing-mark (mark-ensure)"
 		echo "DRYRUN: would refresh the tunnel exclusion set (tunnel-update)"
 		"$CLI" tunnel-update
+		echo "DRYRUN: would render the SNI whitelist hostlist (whitelist-refresh)"
+		"$CLI" whitelist-refresh
 		echo "DRYRUN: would ensure the periodic update cron line (cron-install)"
 		"$CLI" cron-install
 		echo "DRYRUN: would start procd instance:"
@@ -54,6 +58,15 @@ start_service() {
 	# Non-fatal: boot-time DNS outages keep the last known UCI list (it
 	# persists across reboots); the periodic cron run heals it later.
 	"$CLI" tunnel-update || logger -t wanguard-antidpi "tunnel-update failed (non-fatal; keeping the last known set)"
+
+	# SNI whitelist (issue #70): render the hostlist BEFORE the engine start -
+	# nfqws2 refuses to start when the --hostlist file is missing, so a failed
+	# refresh must never leave whitelist mode with a truly absent file (the
+	# start below then fails loudly instead of silently desyncing everything;
+	# a failed refresh that keeps the previous file is the soft direction).
+	# Non-fatal for the rest of the start sequence by the same contract as
+	# tunnel-update.
+	"$CLI" whitelist-refresh || logger -t wanguard-antidpi "whitelist-refresh failed (non-fatal; see logread)"
 
 	"$CLI" nft-apply || return 1
 

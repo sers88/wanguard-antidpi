@@ -323,6 +323,108 @@ esac
 cmp -s /etc/crontabs/root /tmp/smoke-crontab-orig || fail "crontab not restored"
 rm -f /tmp/smoke-crontab-orig /tmp/smoke-crontab-1 /tmp/smoke-crontab-2
 
+# ---- SNI whitelist (issue #70): structural here. The pinned-binary facts
+# ---- (per-profile hostlist binding, SIGHUP list reload, missing-file start
+# ---- refusal, no mtime auto-reload) are proven in the container against the
+# ---- engine itself and documented in the CLI header.
+out=$("$CLI" whitelist-status)
+case "$out" in
+	*"enabled: 0"*"file: absent"*"engine argv: not included"*) ;;
+	*) fail "whitelist-status unexpected on a fresh host: $out" ;;
+esac
+# enabled + domains -> the file is rendered (dedupe + canonical order)
+uci set wanguard-antidpi.whitelist=whitelist
+uci set wanguard-antidpi.whitelist.enabled='1'
+uci add_list wanguard-antidpi.whitelist.domains='rutracker.org'
+uci add_list wanguard-antidpi.whitelist.domains='ej.ru'
+uci add_list wanguard-antidpi.whitelist.domains='bbc.com'
+uci add_list wanguard-antidpi.whitelist.domains='ej.ru'
+uci commit wanguard-antidpi
+"$CLI" whitelist-refresh >/dev/null || fail "whitelist-refresh failed"
+printf 'bbc.com\nej.ru\nrutracker.org\n' > /tmp/smoke-wl-expected
+cmp -s "$PKGDIR/whitelist.hosts" /tmp/smoke-wl-expected \
+	|| fail "whitelist-refresh: file is not the sorted deduped domain list"
+cp "$PKGDIR/whitelist.hosts" /tmp/smoke-wl-1
+"$CLI" whitelist-refresh >/dev/null || fail "whitelist-refresh rerun failed"
+cmp -s "$PKGDIR/whitelist.hosts" /tmp/smoke-wl-1 || fail "whitelist-refresh is not idempotent"
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" whitelist-refresh)
+case "$out" in
+	*DRYRUN*"whitelist.hosts"*) ;;
+	*) fail "whitelist-refresh DRYRUN: wrong output" ;;
+esac
+cmp -s "$PKGDIR/whitelist.hosts" /tmp/smoke-wl-1 || fail "whitelist-refresh DRYRUN touched the file"
+# engine argv: the hostlist directly precedes the strategy words (same
+# profile) and is re-emitted after every --new (per-profile binding)
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-tcp=443'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--payload=tls_client_hello'
+uci commit wanguard-antidpi
+cl=$("$CLI" engine-cmdline)
+[ "$(printf '%s\n' "$cl" | grep -c .)" = "9" ] \
+	|| fail "engine-cmdline: expected 6 golden + hostlist + 2 strategy words"
+[ "$(printf '%s\n' "$cl" | grep -c -- '--hostlist=')" = "1" ] \
+	|| fail "engine-cmdline: expected exactly one --hostlist for a single profile"
+printf '%s\n' "$cl" | tail -n 3 > /tmp/smoke-wl-tail
+printf '%s\n' "--hostlist=$PKGDIR/whitelist.hosts" '--filter-tcp=443' '--payload=tls_client_hello' \
+	> /tmp/smoke-wl-tail-expected
+cmp -s /tmp/smoke-wl-tail /tmp/smoke-wl-tail-expected \
+	|| fail "engine-cmdline: --hostlist must directly precede the strategy words"
+uci delete wanguard-antidpi.engine.nfqws2_opt
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-tcp=443'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--new'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-udp=443'
+uci commit wanguard-antidpi
+[ "$(printf '%s\n' "$("$CLI" engine-cmdline)" | grep -c -- '--hostlist=')" = "2" ] \
+	|| fail "engine-cmdline: hostlist not re-emitted after --new (per-profile binding)"
+# whitelist-reload: DRYRUN touches nothing; no running engine -> graceful no-op
+out=$(WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" whitelist-reload)
+case "$out" in
+	*DRYRUN*"HUP"*) ;;
+	*) fail "whitelist-reload DRYRUN: wrong output" ;;
+esac
+out=$("$CLI" whitelist-reload)
+case "$out" in
+	*"engine not running"*) ;;
+	*) fail "whitelist-reload without a running engine must be a graceful no-op, got: $out" ;;
+esac
+out=$("$CLI" whitelist-status)
+case "$out" in
+	*"enabled: 1"*"file: present (3 hosts)"*"engine argv: --hostlist included"*) ;;
+	*) fail "whitelist-status: wrong state in whitelist mode: $out" ;;
+esac
+# enabled + EMPTY strategy -> nothing to constrain, default golden untouched
+uci delete wanguard-antidpi.engine.nfqws2_opt
+uci commit wanguard-antidpi
+[ "$(printf '%s\n' "$("$CLI" engine-cmdline)" | grep -c -- '--hostlist=')" = "0" ] \
+	|| fail "engine-cmdline: --hostlist leaked with an empty strategy"
+# validation negatives: garbage domains die loudly at render time, file intact
+for bad in 'bad,comma' '*.wildcard.example' 'localhost' 'bad space.example' '.leadingdot.example'; do
+	uci delete wanguard-antidpi.whitelist.domains
+	uci add_list wanguard-antidpi.whitelist.domains="$bad"
+	uci commit wanguard-antidpi
+	"$CLI" whitelist-refresh >/dev/null 2>&1 \
+		&& fail "whitelist-refresh accepted a garbage domain: $bad"
+	"$CLI" engine-cmdline >/dev/null 2>&1 \
+		&& fail "engine-cmdline accepted a garbage domain: $bad"
+done
+cmp -s "$PKGDIR/whitelist.hosts" /tmp/smoke-wl-1 \
+	|| fail "garbage domains damaged the rendered file"
+# disabled mode removes the file (blanket mode), argv loses the hostlist
+uci set wanguard-antidpi.whitelist.enabled='0'
+uci add_list wanguard-antidpi.engine.nfqws2_opt='--filter-tcp=443'
+uci commit wanguard-antidpi
+"$CLI" whitelist-refresh >/dev/null || fail "whitelist-refresh (disable) failed"
+[ ! -f "$PKGDIR/whitelist.hosts" ] || fail "whitelist-refresh (disable) left the hostlist file"
+[ "$(printf '%s\n' "$("$CLI" engine-cmdline)" | grep -c -- '--hostlist=')" = "0" ] \
+	|| fail "engine-cmdline: --hostlist leaked with whitelist disabled"
+# pristine state for the rest of the smoke
+uci delete wanguard-antidpi.whitelist
+uci delete wanguard-antidpi.engine.nfqws2_opt
+uci commit wanguard-antidpi
+[ ! -f "$PKGDIR/whitelist.hosts" ] || fail "pristine: hostlist file left behind"
+[ "$(printf '%s\n' "$("$CLI" engine-cmdline)" | grep -c .)" = "6" ] \
+	|| fail "engine-cmdline: default 6-word golden broken after the whitelist tests"
+rm -f /tmp/smoke-wl-expected /tmp/smoke-wl-1 /tmp/smoke-wl-tail /tmp/smoke-wl-tail-expected
+
 # ---- mihomo routing-mark integration (issue #60; no mihomo binary/process
 # ---- in this container - the graceful paths plus the file mechanics) ----
 out=$("$CLI" mark-status)

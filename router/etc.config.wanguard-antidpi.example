@@ -85,3 +85,27 @@ config tunnel 'tunnel'
 	# entries not yet expired. Do not edit - static pins go to proxy_servers
 	# above. Rendered into the nft set on every apply together with them.
 	#	list proxy_resolved '203.0.113.10'
+
+config whitelist 'whitelist'
+
+	# ---- SNI whitelist (issue #70) ----
+	# 1 = desync is applied ONLY to the domains below (SNI-based, suffix
+	# match: subdomains auto-apply). 0 or a missing section = blanket mode
+	# (desync for every queued target - the classic behavior).
+	#
+	# While enabled, the rendered hostlist file
+	# (/usr/share/wanguard-antidpi/whitelist.hosts, machine-managed by
+	# `wanguard-antidpi whitelist-refresh`) is a HARD engine dependency:
+	# nfqws2 refuses to start without it, and an empty domain list is
+	# rejected at render time - keep at least one valid domain here.
+	# Strict DNS names only: no wildcards (suffix matching already covers
+	# subdomains), no commas/spaces (rejected loudly at render time).
+	#
+	# Apply changes without dropping connections:
+	#   wanguard-antidpi whitelist-reload
+	# (renders the file and signals the running engine to re-read its lists;
+	# a service restart works too).
+	#
+	#	option enabled '0'
+	#	list domains 'example.org'
+	#	list domains 'example.net'

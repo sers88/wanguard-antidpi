@@ -76,7 +76,10 @@ details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), section 5):
 
 - **owned by this add-on**: fwmark `0x10000000` (the mihomo `routing-mark`
   scope mark), fwmark `0x40000000` (nfqws2 strategy mark, `engine.fwmark`),
-  NFQUEUE `300` (`engine.qnum`), the own nft table `inet wanguard_antidpi`;
+  NFQUEUE `300` (`engine.qnum`), the own nft table `inet wanguard_antidpi`,
+  and the machine-managed engine hostlist
+  `/usr/share/wanguard-antidpi/whitelist.hosts` (rendered from UCI, removed
+  when whitelist mode is off);
   fwmark `0x20000000` stays reserved for blockcheck2 staging runs (its
   hardwired `DESYNC_MARK` must be patched away from `0x10000000` - see
   Tuning)
@@ -262,10 +265,67 @@ notes from tuning this add-on:
   asked for them), and prefer strategies that survive on **all** your paths
   and leave the controls working.
 
+## Whitelist mode (issue #70)
+
+By default the add-on desyncs **every** queued target (blanket mode). The
+whitelist flips the model: desync is applied **only to the listed hosts** -
+SNI-based, subdomains auto-apply, so CDN address rotation is irrelevant:
+
+```sh
+uci set wanguard-antidpi.whitelist=whitelist
+uci set wanguard-antidpi.whitelist.enabled='1'
+uci add_list wanguard-antidpi.whitelist.domains='example.org'
+uci add_list wanguard-antidpi.whitelist.domains='example.net'
+uci commit wanguard-antidpi
+/etc/init.d/wanguard-antidpi restart
+```
+
+List changes afterwards do not need a restart:
+
+```sh
+uci add_list wanguard-antidpi.whitelist.domains='example.com'
+uci commit wanguard-antidpi
+wanguard-antidpi whitelist-reload
+```
+
+`whitelist-reload` re-renders the hostlist file and signals the running
+engine (SIGHUP) to re-read its lists - the queue and live connections are
+untouched (verified against the pinned binary; there is no automatic mtime
+reload).
+
+Semantics and guardrails:
+
+- `enabled=0` or a missing `whitelist` section = blanket mode (the classic
+  behavior); the hostlist file is removed.
+- Strict DNS names only - no wildcards (suffix matching already covers
+  subdomains), no commas/spaces. Garbage entries are rejected loudly at
+  render time: both `whitelist-refresh` and `engine-cmdline` fail.
+- While enabled, the rendered hostlist is a **hard engine dependency**:
+  nfqws2 refuses to start without the file, and `enabled=1` with an empty
+  domain list is rejected at render time - a half-enabled config fails
+  loudly instead of silently falling back to blanket desync.
+- The hostlist binds per engine profile: `--hostlist` is re-emitted after
+  every `--new` strategy separator, so the whitelist constrains all profiles
+  of a multi-profile strategy.
+- Whitelist mode constrains the DESYNC only. The nft scope (scope mark, tcp/
+  udp 443, connbytes, tunnel/local exclusions) is unchanged - the queue still
+  sees the same packets, the engine passes non-whitelisted ones through
+  unmodified.
+
+Status: `wanguard-antidpi whitelist-status` (enabled / domains / file /
+engine argv / engine pid).
+
+Rollback to blanket mode: `uci set wanguard-antidpi.whitelist.enabled='0';
+uci commit wanguard-antidpi; /etc/init.d/wanguard-antidpi restart` - the
+restart re-renders the argv without `--hostlist` and removes the file.
+`whitelist-reload` alone cannot switch modes: it updates list content while
+whitelist mode stays enabled.
+
 ## Operations
 
 - **status / diagnostics**: `wanguard-antidpi mark-status` (mihomo
-  integration facts), `tunnel-status` (exclusion set + cron), `engine-cmdline`
+  integration facts), `tunnel-status` (exclusion set + cron),
+  `whitelist-status` (SNI whitelist state), `engine-cmdline`
   (the exact nfqws2 argv), `version` / `engine-version`. Any state-changing
   command accepts `WANGUARD_ANTIDPI_DRYRUN=1` to print actions without
   touching live state.

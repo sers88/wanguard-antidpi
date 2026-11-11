@@ -36,6 +36,13 @@
 //   cron-install    ensure the periodic tunnel-update line in /etc/crontabs/
 //                   root (busybox crond reloads changed files itself)
 //   cron-remove     drop the cron line (service stop)
+//   whitelist-refresh  render whitelist.domains into the engine hostlist file
+//                   (issue #70); whitelist mode off -> removes the file
+//                   (blanket mode); DRYRUN-aware
+//   whitelist-reload   whitelist-refresh + SIGHUP to a running engine (nfqws2
+//                   re-reads its lists on HUP - no restart, no dropped
+//                   connections; verified against the pinned binary)
+//   whitelist-status   machine-readable whitelist state
 //
 // DRYRUN contract: WANGUARD_ANTIDPI_DRYRUN=1 makes every state-changing
 // command print what it would do, touch nothing, exit 0. This is how the
@@ -76,6 +83,13 @@ const AUTH_TMP = '/tmp/wanguard-antidpi.auth';
 const STATE = BASE + '/tunnel-resolved.state';
 const CRONTAB = '/etc/crontabs/root';
 const CRON_TAG = 'wanguard-antidpi-tunnel-update';
+
+// SNI whitelist (issue #70): the engine refuses to start when the hostlist
+// file is missing, and re-reads its lists on SIGHUP only (no mtime auto-
+// reload) - both verified in the container against the pinned binary. The
+// file must stay world-readable: the HUP-time reload happens under the
+// dropped engine user.
+const HOSTLIST = BASE + '/whitelist.hosts';
 
 function die(msg) {
 	warn('wanguard-antidpi: ' + msg + '\n');
@@ -131,6 +145,23 @@ function load_tunnel() {
 	};
 }
 
+function load_whitelist() {
+	// soft section (issue #70, same contract as tunnel): a missing section is
+	// the blanket mode (desync for every queued target). Only the literal '1'
+	// enables whitelist mode - anything else is off, loudly when it is not
+	// '0' either
+	let s = uci.cursor().get_all(CONF, 'whitelist');
+	let enabled = (s == null) ? null : s.enabled;
+	if (enabled != null && enabled != '0' && enabled != '1') {
+		warn('wanguard-antidpi: whitelist.enabled is not 0/1 ("' + enabled + '") - treating as disabled\n');
+		enabled = '0';
+	}
+	return {
+		enabled: enabled,
+		domains: (s == null || type(s.domains) != 'array') ? [] : s.domains
+	};
+}
+
 function valid_hostname(h) {
 	// strict DNS hostname for shell exec via nslookup: letters/digits/hyphen
 	// labels, at least two labels (single labels cannot resolve via DNS
@@ -138,6 +169,15 @@ function valid_hostname(h) {
 	if (h == null || length(h) == 0 || length(h) > 253)
 		return false;
 	return match(h, /^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/) != null;
+}
+
+function validate_whitelist_domains(domains) {
+	// strict DNS names only (render-injection safety: the entries land in a
+	// file the engine parses, one host per line; hostlist matching is a
+	// suffix match, so wildcards are unnecessary and rejected)
+	for (let i = 0; i < length(domains); i++)
+		if (!valid_hostname(domains[i]))
+			die('whitelist.domains entry is not a valid DNS hostname: "' + domains[i] + '"');
 }
 
 function valid_addr_entry(e) {
@@ -209,6 +249,16 @@ function cmd_engine_version() {
 
 function cmd_engine_cmdline() {
 	let c = load_config();
+	// whitelist mode (issue #70): strict validation at render time - the
+	// hostlist file is a hard engine dependency (nfqws2 refuses to start
+	// without it), and a half-enabled config must fail loudly here instead
+	// of silently falling back to the blanket desync
+	let w = load_whitelist();
+	if (w.enabled == '1') {
+		if (length(w.domains) == 0)
+			die('whitelist.enabled=1 but whitelist.domains is empty - add domains or set whitelist.enabled to 0');
+		validate_whitelist_domains(w.domains);
+	}
 	print(ENGINE + '\n');
 	print('--qnum=' + c.qnum + '\n');
 	print('--fwmark=' + c.fwmark + '\n');
@@ -232,10 +282,22 @@ function cmd_engine_cmdline() {
 			csv = csv + ',' + els[i];
 		print('--ipset-exclude-ip=' + csv + '\n');
 	}
+	// whitelist mode emission (issue #70): --hostlist constrains desync to
+	// the listed hosts (suffix match, subdomains auto apply). Needs strategy
+	// words to make sense (nothing to constrain otherwise) - with an empty
+	// strategy the default golden stays untouched. The hostlist binds PER
+	// PROFILE (verified in the container: "profile N include hostlist"), so
+	// it is re-emitted after every --new profile separator.
+	let wl_emit = (w.enabled == '1' && length(c.opt) > 0);
+	if (wl_emit)
+		print('--hostlist=' + HOSTLIST + '\n');
 	// strategy words verbatim: one UCI list item = one argv word (the shell
 	// word-split contract is gone with the ucode base)
-	for (let i = 0; i < length(c.opt); i++)
+	for (let i = 0; i < length(c.opt); i++) {
 		print(c.opt[i] + '\n');
+		if (wl_emit && c.opt[i] == '--new' && i + 1 < length(c.opt))
+			print('--hostlist=' + HOSTLIST + '\n');
+	}
 }
 
 function render_nft() {
@@ -1012,6 +1074,131 @@ function cmd_tunnel_status() {
 }
 
 
+// ---------------------------------------------------------------------------
+// SNI whitelist (issue #70)
+//
+// Desync is applied ONLY to the listed hosts (SNI-based, suffix match with
+// subdomains auto apply) instead of every queued target. Config is UCI
+// `whitelist` (soft section, same contract as tunnel); the rendered file
+// /usr/share/wanguard-antidpi/whitelist.hosts is the engine's --hostlist.
+// Facts verified in the container against the pinned binary:
+//   - a MISSING hostlist file keeps the engine from starting (the init shim
+//     therefore refreshes the file before the engine start; a failed refresh
+//     keeps the previous file, and a truly absent file fails the start
+//     loudly instead of silently desyncing everything)
+//   - there is no mtime auto-reload: list changes reach a running engine via
+//     SIGHUP ("Lists will be reloaded", queue and connections untouched);
+//     the reload happens under the dropped engine user, so the file must
+//     stay world-readable
+//   - an empty hostlist file starts fine but matches nothing (never produced
+//     here: enabled+empty is rejected at render time, disabled removes the
+//     file)
+// ---------------------------------------------------------------------------
+
+function whitelist_refresh_run() {
+	let w = load_whitelist();
+	if (w.enabled != '1' || length(w.domains) == 0) {
+		if (dryrun()) {
+			print('DRYRUN: whitelist mode off (enabled=' + ((w.enabled == null) ? '0' : w.enabled) +
+				') - would remove ' + HOSTLIST + ' if present (blanket mode)\n');
+			return;
+		}
+		if (access(HOSTLIST, 'r')) {
+			unlink(HOSTLIST);
+			log('whitelist mode off - removed ' + HOSTLIST + ' (blanket mode)');
+		} else {
+			print('wanguard-antidpi: whitelist mode off - no hostlist file\n');
+		}
+		return;
+	}
+	validate_whitelist_domains(w.domains);
+	// dedupe + canonical order: the file content is deterministic
+	let seen = {};
+	let doms = [];
+	for (let i = 0; i < length(w.domains); i++)
+		if (seen[w.domains[i]] == null) {
+			seen[w.domains[i]] = true;
+			push(doms, w.domains[i]);
+		}
+	sort(doms);
+	let txt = join_lines(doms) + '\n';
+	if (dryrun()) {
+		print('DRYRUN: would write ' + HOSTLIST + ' (' + length(doms) + ' hosts):\n');
+		for (let i = 0; i < length(doms); i++)
+			print('DRYRUN:   ' + doms[i] + '\n');
+		return;
+	}
+	system('mkdir -p ' + sh_quote(BASE));
+	check_write(HOSTLIST, writefile(HOSTLIST, txt));
+	// verify-after-write (ucode failures are silent) and keep the file
+	// world-readable: the SIGHUP-time reload runs as the dropped engine user
+	if (readfile(HOSTLIST) != txt)
+		die('hostlist write verification failed: ' + HOSTLIST);
+	if (system('chmod 644 ' + sh_quote(HOSTLIST)) != 0)
+		die('chmod 644 failed on ' + HOSTLIST + ' (the engine user must be able to re-read it on SIGHUP)');
+	log('whitelist.hosts written (' + length(doms) + ' hosts)');
+}
+
+function cmd_whitelist_refresh() {
+	whitelist_refresh_run();
+	exit(0);
+}
+
+function engine_pid() {
+	let fp = popen('pidof nfqws2 2>/dev/null', 'r');
+	let out = trim((fp != null) ? fp.read('all') : '');
+	if (fp != null)
+		fp.close();
+	return out;
+}
+
+function cmd_whitelist_reload() {
+	whitelist_refresh_run();
+	if (dryrun()) {
+		print('DRYRUN: would signal a running engine (kill -HUP) to reload its lists\n');
+		exit(0);
+	}
+	let pid = engine_pid();
+	if (length(pid) == 0) {
+		log('whitelist list updated - engine not running, applies on next start');
+		exit(0);
+	}
+	// SIGHUP: nfqws2 re-reads its hostlist/ipset files without dropping the
+	// queue or live connections (verified against the pinned binary)
+	if (system('kill -HUP ' + pid) != 0)
+		die('failed to signal the engine (' + pid + ')');
+	log('whitelist list updated - SIGHUP sent to the engine (pid ' + pid + ') to reload lists');
+	exit(0);
+}
+
+function cmd_whitelist_status() {
+	let w = load_whitelist();
+	let j = function(list) {
+		let out = '';
+		for (let i = 0; i < length(list); i++)
+			out += ((i > 0) ? ', ' : '') + list[i];
+		return (length(list) > 0) ? out : 'none';
+	};
+	print('enabled: ' + ((w.enabled == '1') ? '1' : '0') + '\n');
+	print('domains: ' + j(w.domains) + '\n');
+	if (access(HOSTLIST, 'r')) {
+		let lines = split(readfile(HOSTLIST), '\n');
+		let n = 0;
+		for (let i = 0; i < length(lines); i++)
+			if (length(trim(lines[i])) > 0)
+				n++;
+		print('file: present (' + n + ' hosts)\n');
+	} else {
+		print('file: absent\n');
+	}
+	let c = load_config();
+	let wl_argv = (w.enabled == '1' && length(w.domains) > 0 && length(c.opt) > 0);
+	print('engine argv: ' + (wl_argv ? '--hostlist included' : 'not included') + '\n');
+	let pid = engine_pid();
+	print('engine: ' + ((length(pid) > 0) ? 'running (pid ' + pid + ')' : 'not running') + '\n');
+}
+
+
 let cmd = (length(ARGV) > 0) ? ARGV[0] : 'version';
 switch (cmd) {
 case 'version':
@@ -1070,7 +1257,19 @@ case 'cron-remove':
 	cmd_cron_remove();
 	break;
 
+case 'whitelist-refresh':
+	cmd_whitelist_refresh();
+	break;
+
+case 'whitelist-reload':
+	cmd_whitelist_reload();
+	break;
+
+case 'whitelist-status':
+	cmd_whitelist_status();
+	break;
+
 default:
-	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove]\n');
+	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status]\n');
 	exit(2);
 }
