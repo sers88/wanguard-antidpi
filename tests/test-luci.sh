@@ -171,7 +171,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold + overview + domains tab (issues #80/#81/#82)"
+echo "== [8] page scaffold + overview + domains + tunnel tabs (issues #80-#83)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -223,6 +223,16 @@ grep -qF "'domainlist'" "$CORE" \
 	|| fail "the domains tab lost the domainlist section type"
 grep -qF "domainsModel" "$CORE" \
 	|| fail "the domains tab lost its view model (legacy + named lists)"
+# the #83 Tunnel protection tab: the strict address validator (the exact
+# valid_addr_entry mirror), the view model and the render entry point are
+# pinned structurally - the editor stages client-side and applies through
+# the shared save -> apply(5) -> CLI apply pipeline
+grep -qF "validAddrEntry" "$CORE" \
+	|| fail "the tunnel tab lost the strict IPv4/CIDR validator (#83)"
+grep -qF "tunnelModel" "$CORE" \
+	|| fail "the tunnel tab lost its view model (pins/hosts/status)"
+grep -qF "renderTunnel" "$CORE" \
+	|| fail "the tunnel tab lost its render entry point"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

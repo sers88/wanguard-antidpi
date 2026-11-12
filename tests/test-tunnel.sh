@@ -25,6 +25,8 @@
 #   [9] update while the table lives -> fresh answer lands in the live set
 #  [10] no-table guard: flushed table -> list saved, table not recreated
 #  [11] render/apply refuse garbage in proxy_resolved (injection safety)
+#  [12] UI pin edits (plain UCI deltas) -> set elements == merged contract
+#       exactly (dedupe + sort, byte-parity with the #62 render path)
 set -eu
 
 CLI=/usr/bin/wanguard-antidpi
@@ -234,6 +236,54 @@ uci commit wanguard-antidpi
 uci del_list wanguard-antidpi.tunnel.proxy_resolved='999.999.1.1'
 uci commit wanguard-antidpi
 echo "RENDER-GUARD-OK"
+
+# ---- [12] UI pin edits -> byte-parity with the #62 render path (#83) ----
+# the LuCI editor stages plain UCI deltas (add_list/del_list on
+# tunnel.proxy_servers); the rendered set must be EXACTLY the merged
+# pins+resolved list (dedupe, canonical order) after every edit - the same
+# contract tunnel-update uses.
+set_elements() { # dump the set's element list, one address per line, sorted
+	# (nft -j prints bare addresses as strings; CIDR elements would be
+	# {"prefix":...,"len":...} objects - [12] pins bare addresses only)
+	nft -j list set inet "$TABLE" proxy_servers \
+		| grep -o '"elem": \[[^]]*\]' \
+		| sed 's/"elem": \[//;s/\]//;s/"//g' \
+		| tr ',' '\n' | sed 's/ //g' | sort
+}
+echo "== [12] pin edits render byte-parity with the merged contract"
+expect_set() { # expect_set <newline-separated addresses>
+	got=$(set_elements)
+	want=$(printf '%s' "$1" | sort)
+	[ "$got" = "$want" ] || fail "set mismatch: got [$got] want [$want]"
+}
+# baseline: the [7] manual pin + resolver answers (the table is flushed by
+# [10] - apply re-creates it from the render)
+"$CLI" nft-apply >/dev/null
+expect_set "192.0.2.11
+192.0.2.13
+192.0.2.14
+198.51.100.7
+203.0.113.1"
+# UI edit: add a pin (staged as a plain list item, exactly what the editor sends)
+uci add_list wanguard-antidpi.tunnel.proxy_servers='203.0.113.99'
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+expect_set "192.0.2.11
+192.0.2.13
+192.0.2.14
+198.51.100.7
+203.0.113.1
+203.0.113.99"
+# UI edit: remove the pin
+uci del_list wanguard-antidpi.tunnel.proxy_servers='203.0.113.99'
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+expect_set "192.0.2.11
+192.0.2.13
+192.0.2.14
+198.51.100.7
+203.0.113.1"
+echo "UI-PARITY-OK (pin add/remove reproduce the merged render exactly)"
 
 # ---- cleanup ----
 "$CLI" nft-flush >/dev/null

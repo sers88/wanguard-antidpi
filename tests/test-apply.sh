@@ -29,6 +29,7 @@
 #   [5]  strategy edit -> restart, pid changed
 #   [5b] whitelist mode flip off -> restart (SIGHUP cannot rebind --hostlist)
 #   [5c] whitelist mode flip on -> restart again, hostlist back
+#   [5d] tunnel pin add/remove -> set + --ipset-exclude-ip rebuilt (#83)
 #   [6]  --check all green (+ --json ok:true, engine pid present)
 #   [7]  --check catches a missing hostlist file
 #   [8]  --check catches a foreign routing-mark
@@ -250,6 +251,36 @@ D=$(epid)
 [ -f "$HOSTLIST" ] || fail "mode-on apply did not render the hostlist"
 grep -q 'delta.example' "$HOSTLIST" || fail "the merged set lost a domain at the mode-on restart"
 echo "MODEFLIP-ON-OK (mode on restarted the engine, pid $C -> $D, hostlist back)"
+
+# ---- [5d] pin edit -> apply re-renders the set AND the engine argv ----
+# the exclusion set rides in the engine argv (--ipset-exclude-ip, #64 r9):
+# adding a pin drifts the live argv -> restart; removing it must rebuild both
+# the nft set and the engine CSV (the #83 criterion).
+echo "== [5d] pin add/remove -> exclude-ip rebuilt via apply"
+uci add_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.99'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "pin-add apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+E=$(epid)
+[ -n "$E" ] || fail "pin-add apply did not restart the engine"
+tr '\0' '\n' < "/proc/$E/cmdline" | grep -qx -- '--ipset-exclude-ip=192.0.2.99' \
+	|| fail "live engine argv lost the pin after the pin-add restart: $(tr '\0' ' ' < /proc/$E/cmdline)"
+nft list set inet wanguard_antidpi proxy_servers 2>/dev/null | grep -qF '192.0.2.99' \
+	|| fail "nft set lost the pin after the pin-add apply"
+uci del_list wanguard-antidpi.tunnel.proxy_servers='192.0.2.99'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "pin-del apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+F=$(epid)
+[ -n "$F" ] || fail "pin-del apply did not restart the engine"
+[ "$F" != "$E" ] || fail "pin removal did not restart the engine (same pid)"
+tr '\0' '\n' < "/proc/$F/cmdline" | grep -qF '192.0.2.99' \
+	&& fail "live engine argv still carries the removed pin" || :
+nft list set inet wanguard_antidpi proxy_servers 2>/dev/null | grep -qF '192.0.2.99' \
+	&& fail "nft set still carries the removed pin" || :
+echo "PINDEL-OK (pin add/remove restarted the engine, set + --ipset-exclude-ip rebuilt, pid $E -> $F)"
 
 # ---- [6] --check all green ----
 echo "== [6] --check all green"

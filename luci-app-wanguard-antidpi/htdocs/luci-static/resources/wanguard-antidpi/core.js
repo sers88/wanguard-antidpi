@@ -1,13 +1,13 @@
 /* luci-app-wanguard-antidpi core — the shared engine behind the Anti-DPI
- * page (view/wanguard/antidpi.js, issues #80/#81/#82). Thin client over the
+ * page (view/wanguard/antidpi.js, issues #80/#81/#82/#83). Thin client over the
  * `wanguard-antidpi` CLI surfaces (#76 status, #77 apply): ONE status exec
  * per refresh plus the strategy-words exec (engine-cmdline), with the
  * heavier probes (apply --check, apply) strictly on-demand behind their
  * buttons. The browser never touches nft/logread directly; its only direct
- * UCI verbs are the Domain lists editor's staging (#82 - client-side via
- * the uci client, applied through the same save -> apply(5) -> CLI apply
- * pipeline as the pending bar) and the bar's Discard (uci revert,
- * config-scoped).
+ * UCI verbs are the Domain lists editor's staging (#82) and the Tunnel
+ * protection editor's staging (#83 - both client-side via the uci client,
+ * applied through the same save -> apply(5) -> CLI apply pipeline as the
+ * pending bar) and the bar's Discard (uci revert, config-scoped).
  *
  * Degradation contract (#76/#81): nothing throws on missing surfaces. An
  * old or missing CLI (the pre-status packages, a denied ACL) resolves to
@@ -69,6 +69,13 @@ var state = {
 		errors: {},       /* inline validation errors, per-list (and '__new') */
 		inputs: {},       /* per-list add-domain input text (survives re-renders) */
 		newName: ''       /* new-list label input text */
+	},
+	tunnel: {           /* Tunnel protection tab (#83): client-side staged editor */
+		loaded: false,    /* the uci config has been read at least once */
+		dirty: false,     /* staged edits awaiting the apply pipeline */
+		origPins: null,   /* committed proxy_servers at load time (restart-badge detect) */
+		errors: {},       /* inline validation errors, per option */
+		inputs: {}        /* add-pin / add-host / number input texts (survive re-renders) */
 	},
 	busy: false
 };
@@ -646,6 +653,7 @@ function discardPending() {
 		state.busy = false;
 		uci.unload('wanguard-antidpi');
 		domainsAfterConfigChange();
+		tunnelAfterConfigChange();
 		ui.changes.init();
 		return refresh().then(update);
 	}).catch(function(e) {
@@ -675,6 +683,7 @@ function reviewApply() {
 		ui.addNotification(null, E('p', {}, [ applyNotice(res) ]), applySeverity(res));
 		ui.changes.init();
 		domainsAfterConfigChange();
+		tunnelAfterConfigChange();
 		return refresh().then(update);
 	}).catch(function(e) {
 		state.applyBusy = false;
@@ -1130,6 +1139,424 @@ function renderDomains() {
 	});
 }
 
+/* ---------- tunnel protection tab (#83) ---------- */
+
+/* strict 'a.b.c.d' or 'a.b.c.d/nn' - the exact mirror of the CLI's
+ * valid_addr_entry (ucode): four decimal octets 0-255, no leading zeros
+ * (keeps the nft render canonical), optional /0-32 mask. Pins land inside a
+ * generated nft file and in the engine's --ipset-exclude-ip CSV, so
+ * anything unusual must be rejected, not escaped. Invalid input NEVER
+ * reaches the staged config (the #61 render contract stays unreachable
+ * from the UI). */
+function validAddrEntry(e) {
+	if (typeof e != 'string' || e.length == 0)
+		return false;
+	var host = e;
+	var sl = e.indexOf('/');
+	if (sl >= 0) {
+		var mask = e.slice(sl + 1);
+		if (!/^[0-9]+$/.test(mask) || parseInt(mask, 10) > 32)
+			return false;
+		host = e.slice(0, sl);
+	}
+	var parts = host.split('.');
+	if (parts.length != 4)
+		return false;
+	for (var i = 0; i < 4; i++) {
+		var p = parts[i];
+		if (!/^[0-9]+$/.test(p) || p.length > 3 || parseInt(p, 10) > 255)
+			return false;
+		if (p.length > 1 && p.charAt(0) == '0')
+			return false;
+	}
+	return true;
+}
+
+function tunnelList(opt) {
+	var v = uci.get('wanguard-antidpi', 'tunnel', opt);
+	return (Array.isArray(v) ? v : []).slice();
+}
+
+/* the tab's view model: the staged UCI editor values (client-side) plus the
+ * committed state document (#76 status) for the resolved-entries table */
+function tunnelModel() {
+	var t = (state.status != null) ? state.status.tunnel : null;
+	var pins = tunnelList('proxy_servers');
+	return {
+		status: t,
+		sectionExists: (uci.get('wanguard-antidpi', 'tunnel') != null),
+		pins: pins,
+		hosts: tunnelList('tunnel_hosts'),
+		interval: uci.get('wanguard-antidpi', 'tunnel', 'update_interval'),
+		expire: uci.get('wanguard-antidpi', 'tunnel', 'expire_hours'),
+		pinsChanged: (state.tunnel.origPins != null &&
+			pins.join(',') != state.tunnel.origPins.join(','))
+	};
+}
+
+/* the tunnel section is soft (missing = no protection configured); stage a
+ * named create before mutating options on it (the #82 rule: uci.set silently
+ * no-ops on a section that is neither committed nor client-created) */
+function tunnelEnsureSection() {
+	if (!uci.get('wanguard-antidpi', 'tunnel'))
+		uci.add('wanguard-antidpi', 'tunnel', 'tunnel');
+}
+
+function tunnelMarkDirty() {
+	state.tunnel.dirty = true;
+}
+
+function tunnelAddPin() {
+	var v = (state.tunnel.inputs.pin || '').trim();
+	var err = null;
+	if (v.length == 0)
+		err = _('Enter an address or CIDR.');
+	else if (!validAddrEntry(v))
+		err = _('Not a valid IPv4 address or CIDR (four octets 0-255, no leading zeros, mask /0-32).');
+	else if (tunnelList('proxy_servers').indexOf(v) >= 0)
+		err = _('"%s" is already pinned.'.format(v));
+	if (err != null) {
+		state.tunnel.errors.pin = err;
+		renderTunnel();
+		return;
+	}
+	delete state.tunnel.errors.pin;
+	tunnelEnsureSection();
+	var next = tunnelList('proxy_servers');
+	next.push(v);
+	uci.set('wanguard-antidpi', 'tunnel', 'proxy_servers', next);
+	state.tunnel.inputs.pin = '';
+	tunnelMarkDirty();
+	renderTunnel();
+}
+
+function tunnelRemovePin(idx) {
+	var next = tunnelList('proxy_servers');
+	if (idx < 0 || idx >= next.length)
+		return;
+	next.splice(idx, 1);
+	tunnelEnsureSection();
+	uci.set('wanguard-antidpi', 'tunnel', 'proxy_servers', next);
+	tunnelMarkDirty();
+	renderTunnel();
+}
+
+function tunnelAddHost() {
+	var v = (state.tunnel.inputs.host || '').trim();
+	var err = null;
+	if (v.length == 0)
+		err = _('Enter a hostname.');
+	else if (!domainIsValid(v))
+		err = _('Not a valid DNS hostname (labels of letters/digits/hyphens, at least two labels).');
+	else if (tunnelList('tunnel_hosts').indexOf(v) >= 0)
+		err = _('"%s" is already configured.'.format(v));
+	if (err != null) {
+		state.tunnel.errors.host = err;
+		renderTunnel();
+		return;
+	}
+	delete state.tunnel.errors.host;
+	tunnelEnsureSection();
+	var next = tunnelList('tunnel_hosts');
+	next.push(v);
+	uci.set('wanguard-antidpi', 'tunnel', 'tunnel_hosts', next);
+	state.tunnel.inputs.host = '';
+	tunnelMarkDirty();
+	renderTunnel();
+}
+
+function tunnelRemoveHost(idx) {
+	var next = tunnelList('tunnel_hosts');
+	if (idx < 0 || idx >= next.length)
+		return;
+	next.splice(idx, 1);
+	tunnelEnsureSection();
+	uci.set('wanguard-antidpi', 'tunnel', 'tunnel_hosts', next);
+	tunnelMarkDirty();
+	renderTunnel();
+}
+
+/* numeric options with published defaults: update_interval >= 1 h (the cron
+ * cadence), expire_hours >= 0 (0 = resolved entries never expire) */
+function tunnelSetNum(opt, min) {
+	var v = (state.tunnel.inputs[opt] || '').trim();
+	var err = null;
+	if (v.length == 0)
+		err = _('Enter a number of hours.');
+	else if (!/^[0-9]+$/.test(v) || parseInt(v, 10) < min)
+		err = _('Whole hours, at least %d.'.format(min));
+	if (err != null) {
+		state.tunnel.errors[opt] = err;
+		renderTunnel();
+		return;
+	}
+	delete state.tunnel.errors[opt];
+	tunnelEnsureSection();
+	uci.set('wanguard-antidpi', 'tunnel', opt, v);
+	tunnelMarkDirty();
+	renderTunnel();
+}
+
+/* drop the client-side staged edits (committed truth untouched); the shared
+ * pending-bar Discard covers the router-side deltas */
+function tunnelDiscardEdits() {
+	state.tunnel.dirty = false;
+	state.tunnel.origPins = null;
+	state.tunnel.errors = {};
+	state.tunnel.inputs = {};
+	uci.unload('wanguard-antidpi');
+	renderTunnel();
+}
+
+/* after the shared pipeline committed (or the router deltas were reverted),
+ * the editor starts clean from the committed truth */
+function tunnelAfterConfigChange() {
+	state.tunnel.dirty = false;
+	state.tunnel.origPins = null;
+	state.tunnel.errors = {};
+	state.tunnel.inputs = {};
+	if (state.activeTab == 'tunnel')
+		renderTunnel();
+}
+
+function tunnelApply() {
+	reviewApply();
+}
+
+function tunnelStatusCard(m) {
+	var t = m.status;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Protection status') ])
+	]);
+	if (t == null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The tunnel protection surface is unavailable.') ])
+		]));
+		return card;
+	}
+	var hosts = (t.hosts && t.hosts.length) ? t.hosts.join(', ') : null;
+	var entries = (t.entries || []).length;
+	var cronOk = (t.cron != null && t.cron.ok);
+	var badge;
+	if (!hosts && !entries)
+		badge = chipEl({ cls: 'wg-ad-chip-muted', label: _('Not configured') });
+	else if (entries > 0 && cronOk)
+		badge = chipEl({ cls: 'wg-ad-chip-ok', label: _('Protected'),
+			title: (hosts && hosts.length > 60) ? hosts : '' });
+	else
+		badge = chipEl({ cls: 'wg-ad-chip-warn', label: _('Unprotected') });
+	card.appendChild(badge);
+	card.appendChild(kvRow(_('Hostname(s)'), [ hosts || _('—') ]));
+	card.appendChild(kvRow(_('Mode'), [ _('Static pins + auto-resolved addresses') ]));
+	var refreshTxt = (t.update_interval_h != null)
+		? _('every %d h').format(t.update_interval_h) : _('unknown');
+	refreshTxt += (cronOk) ? ' · ' + _('cron active') : ' · ' + _('cron MISSING');
+	card.appendChild(kvRow(_('Refresh'), [ refreshTxt ]));
+	card.appendChild(kvRow(_('Expire entries after'), [
+		(t.expire_hours != null)
+			? ((t.expire_hours > 0) ? _('%d h').format(t.expire_hours) : _('never'))
+			: _('unknown')
+	]));
+	return card;
+}
+
+function tunnelSetCard(m) {
+	var t = m.status;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Exclusion set') ]),
+		E('p', { 'class': 'wg-ad-hint' }, [
+			_('Committed state: pins and resolved addresses the engine and the nft table actually use. Staged edits appear here after Apply.')
+		])
+	]);
+	if (t == null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The tunnel protection surface is unavailable.') ])
+		]));
+		return card;
+	}
+	card.appendChild(chipEl({ cls: 'wg-ad-chip-muted',
+		label: '%d exclusion(s)'.format((t.entries || []).length) }));
+	card.appendChild(buildExclusionsPanel(t));
+	return card;
+}
+
+function tunnelEditorCard(m) {
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Configuration') ])
+	]);
+
+	/* static pins */
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Static pins stay in the exclusion set permanently; resolved addresses are managed by the updater.')
+	]));
+	if (m.pins.length == 0)
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No pins configured.') ]));
+	m.pins.forEach(function(p, idx) {
+		card.appendChild(E('div', { 'class': 'wg-ad-domrow' }, [
+			E('span', {}, [ p ]),
+			E('button', {
+				'class': 'wg-ad-domremove',
+				'title': _('Remove pin'),
+				'click': ui.createHandlerFn(null, function() { tunnelRemovePin(idx); })
+			}, [ '✕' ])
+		]));
+	});
+	if (state.tunnel.errors.pin != null)
+		card.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.tunnel.errors.pin ]));
+	var pinInput = E('input', {
+		'type': 'text',
+		'placeholder': _('203.0.113.0/24'),
+		'input': function(ev) { state.tunnel.inputs.pin = ev.target.value; }
+	});
+	pinInput.value = state.tunnel.inputs.pin || '';
+	card.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		pinInput,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, tunnelAddPin)
+		}, [ _('Add pin') ])
+	]));
+
+	/* tunnel hosts */
+	var hostsTitle = E('h3', {}, [ _('Updater hosts') ]);
+	card.appendChild(hostsTitle);
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('The updater resolves these hostnames on a schedule and keeps every observed address in the exclusion set.')
+	]));
+	if (m.hosts.length == 0)
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No hosts configured.') ]));
+	m.hosts.forEach(function(h, idx) {
+		card.appendChild(E('div', { 'class': 'wg-ad-domrow' }, [
+			E('span', {}, [ h ]),
+			E('button', {
+				'class': 'wg-ad-domremove',
+				'title': _('Remove host'),
+				'click': ui.createHandlerFn(null, function() { tunnelRemoveHost(idx); })
+			}, [ '✕' ])
+		]));
+	});
+	if (state.tunnel.errors.host != null)
+		card.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.tunnel.errors.host ]));
+	var hostInput = E('input', {
+		'type': 'text',
+		'placeholder': _('cdn.example.net'),
+		'input': function(ev) { state.tunnel.inputs.host = ev.target.value; }
+	});
+	hostInput.value = state.tunnel.inputs.host || '';
+	card.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		hostInput,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, tunnelAddHost)
+		}, [ _('Add host') ])
+	]));
+
+	/* the two numeric options */
+	var numErr = function(key) {
+		return (state.tunnel.errors[key] != null)
+			? E('div', { 'class': 'wg-ad-error' }, [ state.tunnel.errors[key] ]) : null;
+	};
+	var intervalInput = E('input', {
+		'type': 'text',
+		'placeholder': _('6'),
+		'input': function(ev) { state.tunnel.inputs.update_interval = ev.target.value; }
+	});
+	intervalInput.value = state.tunnel.inputs.update_interval || '';
+	var expireInput = E('input', {
+		'type': 'text',
+		'placeholder': _('24'),
+		'input': function(ev) { state.tunnel.inputs.expire_hours = ev.target.value; }
+	});
+	expireInput.value = state.tunnel.inputs.expire_hours || '';
+	card.appendChild(E('table', { 'class': 'wg-ad-table' }, [
+		E('tr', {}, [
+			E('td', {}, [ _('Refresh interval (h)'), intervalInput,
+				numErr('update_interval') ]),
+			E('td', {}, [ E('button', {
+				'class': 'btn cbi-button',
+				'click': ui.createHandlerFn(null, function() { tunnelSetNum('update_interval', 1); })
+			}, [ _('Set') ]) ]),
+			E('td', {}, [ _('Expire entries after (h, 0 = never)'), expireInput,
+				numErr('expire_hours') ]),
+			E('td', {}, [ E('button', {
+				'class': 'btn cbi-button',
+				'click': ui.createHandlerFn(null, function() { tunnelSetNum('expire_hours', 0); })
+			}, [ _('Set') ]) ])
+		])
+	]));
+	return card;
+}
+
+function buildTunnelView() {
+	var m = tunnelModel();
+	var frag = E([]);
+
+	frag.appendChild(tunnelStatusCard(m));
+	frag.appendChild(tunnelSetCard(m));
+	frag.appendChild(tunnelEditorCard(m));
+
+	/* apply block: the shared pipeline + the honest application badges */
+	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Apply') ])
+	]);
+	if (state.tunnel.dirty) {
+		if (m.pinsChanged)
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+				label: _('Exclusion set changed - apply re-renders the table and restarts the engine'),
+				title: _('The pin set rides in the engine argv (--ipset-exclude-ip): any pin change needs a restart to take effect') }));
+		else
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+				label: _('Applies via tunnel-update + nft reload - the engine restarts only if the set changes'),
+				title: _('The updater refreshes the resolved addresses first; a hostname-only edit usually re-resolves into the same table') }));
+	}
+	else {
+		applyCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No unsaved edits.') ]));
+	}
+	applyCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, tunnelApply),
+			'disabled': (!state.tunnel.dirty || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, tunnelDiscardEdits),
+			'disabled': (!state.tunnel.dirty) ? '' : null
+		}, [ _('Discard edits') ])
+	]));
+	frag.appendChild(applyCard);
+	return frag;
+}
+
+/* the tab body renders once per switch (and after applies) - NOT per poll
+ * tick: a rebuild would blow away in-progress edits (the #82 rule). The
+ * LuCI uci client is read through a lazy load; a failure renders the honest
+ * warn card. */
+function renderTunnel() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.setAttribute('data-unavail', 'false');
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'tunnel' || !state.bodyNode)
+			return;
+		if (state.tunnel.origPins == null)
+			state.tunnel.origPins = tunnelList('proxy_servers');
+		state.tunnel.loaded = true;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(buildTunnelView());
+	}).catch(function(e) {
+		if (state.activeTab != 'tunnel' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).').format((e && e.message) || 'error') ])
+		]));
+	});
+}
+
 /* ---------- tab frame (issue #80) ---------- */
 
 function buildTabbar() {
@@ -1181,6 +1608,10 @@ function renderBody() {
 	}
 	if (state.activeTab == 'domains') {
 		renderDomains();
+		return;
+	}
+	if (state.activeTab == 'tunnel') {
+		renderTunnel();
 		return;
 	}
 
@@ -1237,5 +1668,13 @@ return L.Class.extend({
 	buildDomainsView: buildDomainsView,
 	domainsAddDomain: domainsAddDomain,
 	domainsSetMode: domainsSetMode,
-	domainsAfterConfigChange: domainsAfterConfigChange
+	domainsAfterConfigChange: domainsAfterConfigChange,
+	validAddrEntry: validAddrEntry,
+	tunnelModel: tunnelModel,
+	renderTunnel: renderTunnel,
+	buildTunnelView: buildTunnelView,
+	tunnelAddPin: tunnelAddPin,
+	tunnelAddHost: tunnelAddHost,
+	tunnelSetNum: tunnelSetNum,
+	tunnelAfterConfigChange: tunnelAfterConfigChange
 });
