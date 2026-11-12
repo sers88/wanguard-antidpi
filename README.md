@@ -343,6 +343,78 @@ restart re-renders the argv without `--hostlist` and removes the file.
 `whitelist-reload` alone cannot switch modes: it updates list content while
 whitelist mode stays enabled.
 
+## Policies (issue #86)
+
+Policies are ordered **match -> action** rules rendered as the FIRST engine
+profile blocks, ahead of the global strategy (the first match wins - nfqws2
+profile semantics). Each rule scopes a domainlist to a protocol and routes
+the matched traffic to a strategy profile, a pass-through, or nothing:
+
+```sh
+# the match scope: a named domain list (section name = the stable id)
+uci set wanguard-antidpi.list_media=domainlist
+uci set wanguard-antidpi.list_media.name='Video domains'
+uci add_list wanguard-antidpi.list_media.domains='example.org'
+uci add_list wanguard-antidpi.list_media.domains='example.net'
+
+# a strategy profile (desync words; see "Tuning desync strategies")
+uci set wanguard-antidpi.prof_balanced=profile
+uci set wanguard-antidpi.prof_balanced.name='Balanced'
+uci add_list wanguard-antidpi.prof_balanced.strategy_words='--filter-tcp=443'
+uci add_list wanguard-antidpi.prof_balanced.strategy_words='--payload=tls_client_hello'
+uci add_list wanguard-antidpi.prof_balanced.strategy_words='--lua-desync=multisplit:pos=midsld'
+
+# the policy: media traffic passes UNMODIFIED, everything else keeps the
+# global strategy (the engine.nfqws2_opt list or the other profiles)
+uci set wanguard-antidpi.pol_video=policy
+uci set wanguard-antidpi.pol_video.name='Video traffic'
+uci set wanguard-antidpi.pol_video.priority='10'
+uci set wanguard-antidpi.pol_video.domainlist='list_media'
+uci set wanguard-antidpi.pol_video.proto='tcp quic'
+uci set wanguard-antidpi.pol_video.action='bypass'
+uci commit wanguard-antidpi
+/etc/init.d/wanguard-antidpi restart
+```
+
+Actions: `strategy` (the referenced profile's desync words ride in the
+policy block - refs go by the profile SECTION name), `bypass` (filters plus
+the list, no desync functions: the engine passes the matched traffic
+unmodified), `none` (no block; the traffic falls through to the global
+strategy, the policy stays validated loudly).
+
+Semantics and guardrails:
+
+- Order = `option priority` ascending (step 10 is the convention; ties keep
+  the section file order). The FIRST matching block wins, so a bypass
+  policy ahead of the catch-all effectively exempts its traffic.
+- `option proto` drives the block filters: `tcp` -> `--filter-tcp=443`
+  (`tls_client_hello` payload), `udp`/`quic` -> `--filter-udp=443`
+  (`quic_initial` payload). For `strategy` policies the referenced profile's
+  own `--filter-*`/`--payload` words are excluded from the block - one
+  filter source per block.
+- While any policy renders a block, the whitelist binding (#70) is IGNORED
+  (warned on every render): the blocks own their per-list hostlists, and
+  whitelist mode is the single-policy special case of the same idea.
+- `whitelist-refresh` renders one hostlist file per referenced list
+  (`/usr/share/wanguard-antidpi/lists/<list>.hosts`, deduped + sorted,
+  0644). A missing file keeps the engine from starting (#70 contract); the
+  init shim refreshes before every start.
+- Validation is loud and named: unknown action, missing/unknown domainlist
+  or profile ref, empty or unknown proto tokens all fail the render.
+  Disabled policies skip validation entirely (the profiles spare exit).
+- Tunnel/proxy exclusions stay ABOVE every policy: the nft set and the
+  engine `--ipset-exclude-ip` still fire first - only mihomo DIRECT traffic
+  is ever eligible for desync or bypass.
+- `option device_group` is stored for future group targeting and ignored by
+  the current render (no client identity survives in the queue).
+- A policy argv change (add/remove/order/action/filters) needs an engine
+  restart; editing a list's DOMAINS only needs `whitelist-reload` (SIGHUP
+  re-reads the file content).
+
+Status: `wanguard-antidpi status` carries `engine.policies` (rendered block
+count) and `engine.policy_sections` (id/name/priority/domainlist/proto/
+action/profile/enabled) for the LuCI page.
+
 ## Operations
 
 - **status / diagnostics**: `wanguard-antidpi mark-status` (mihomo

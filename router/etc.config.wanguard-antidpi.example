@@ -126,3 +126,32 @@ config whitelist 'whitelist'
 #	option name 'Video domains'
 #	list domains 'example.org'
 #	list domains 'example.net'
+
+# ---- policies (issue #86) ----
+# Ordered match -> action rules rendered as FIRST nfqws2 profile blocks,
+# before the global strategy catch-all (first match wins). Each policy
+# scopes its block to a domainlist and a protocol:
+#   action 'strategy' - desync the matched traffic with the referenced
+#     profile's strategy words (refs go by the profile SECTION name);
+#   action 'bypass'   - pass the matched traffic UNMODIFIED (a profile
+#     with filters and a hostlist but no desync functions);
+#   action 'none'     - render no block (the traffic falls through to the
+#     global strategy; the policy stays validated loudly).
+# Order = `option priority` ascending (step 10 is the convention, the UI
+# renumbers). The per-list hostlist files are machine-managed by
+# `whitelist-refresh` (/usr/share/wanguard-antidpi/lists/<list>.hosts);
+# while any policy renders a block, the whitelist binding is ignored -
+# policies own their hostlists. Tunnel/proxy exclusions (the nft set and
+# --ipset-exclude-ip) stay ABOVE every policy: only mihomo DIRECT traffic
+# is ever eligible. `device_group` is stored for future group targeting
+# and ignored by the current render (no client identity in the queue).
+#
+#config policy 'pol_video'
+#	option name 'Video traffic'
+#	option priority '10'
+#	option domainlist 'list_media'
+#	option proto 'tcp quic'
+#	option device_group ''
+#	option action 'bypass'
+#	option profile ''
+#	option enabled '1'

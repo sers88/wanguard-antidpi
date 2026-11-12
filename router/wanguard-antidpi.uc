@@ -318,6 +318,211 @@ function validate_whitelist_sources(src) {
 				die('domainlist "' + src.lists[li].sid + '" entry is not a valid DNS hostname: "' + src.lists[li].domains[i] + '"');
 }
 
+// ---------------------------------------------------------------------------
+// Policies (issue #86, design §1.2/§2/§3): ordered match -> action rules.
+// `config policy` sections reference a domainlist (match scope) and render
+// as FIRST nfqws2 profile blocks, before the global strategy catch-all;
+// first match wins (nfqws2 profile semantics, verified in spike-75 §1.2).
+//   action=strategy: the block carries the referenced profile's desync
+//     words (the --filter-*/--payload words are EXCLUDED - the policy's own
+//     proto drives the filters of the block, one filter source per block);
+//   action=bypass: filters + hostlist and NO desync words - the engine
+//     passes matching traffic unmodified (spike-75 §1.2 verdict);
+//   action=none: the policy renders no block (falls through to the global
+//     strategy like a disabled rule, but stays validated loudly).
+// The order = `option priority` ascending (UCI section order is unstable
+// under editing, design §2), ties keep the section file order. Tunnel/
+// proxy exclusions stay ABOVE any policy: the nft set and the engine
+// --ipset-exclude-ip are independent of the profile blocks ("only mihomo
+// DIRECT eligible" - issue contract).
+// ---------------------------------------------------------------------------
+
+const POLICY_LISTS_DIR = BASE + '/lists';
+
+function policy_hostlist_path(list_sid) {
+	// one hostlist file per referenced domainlist section (design §3):
+	// rendered by whitelist-refresh, consumed by the engine argv. The path
+	// rides in argv, so the sid must be a safe argv word - section names
+	// are UCI identifiers (letters/digits/underscore), but validate anyway:
+	// anything unusual dies the render loudly instead of reaching argv.
+	if (!match(list_sid, /^[A-Za-z0-9_]+$/))
+		die('policy domainlist ref is not a safe section name: "' + list_sid + '"');
+	return POLICY_LISTS_DIR + '/' + list_sid + '.hosts';
+}
+
+function load_policies() {
+	// raw policy sections (diagnostic-safe: NO validation - status surfaces
+	// display broken configs; validation happens at render time). Missing/
+	// garbage priority falls back to the documented default (design §2:
+	// step 10, UI renumbers; 100 = late) with a loud warn on garbage.
+	let out = [];
+	uci.cursor().foreach(CONF, 'policy', function(s) {
+		let priority = '100';
+		if (s.priority != null) {
+			if (type(s.priority) == 'string' && match(s.priority, /^[0-9]+$/) != null)
+				priority = s.priority;
+			else
+				warn('wanguard-antidpi: policy "' + s['.name'] + '" priority is not numeric ("' +
+					s.priority + '") - using the default 100\n');
+		}
+		let proto = [];
+		if (type(s.proto) == 'string') {
+			let toks = split(s.proto, ' ');
+			if (type(toks) == 'array') {
+				for (let i = 0; i < length(toks); i++)
+					if (length(toks[i]) > 0)
+						push(proto, toks[i]);
+			}
+		}
+		push(out, {
+			id: s['.name'],
+			name: (type(s.name) == 'string' && length(s.name) > 0) ? s.name : s['.name'],
+			priority: priority,
+			domainlist: (type(s.domainlist) == 'string') ? s.domainlist : '',
+			proto: proto,
+			device_group: (type(s.device_group) == 'string') ? s.device_group : '',
+			action: (type(s.action) == 'string') ? s.action : '',
+			profile: (type(s.profile) == 'string') ? s.profile : '',
+			enabled: (s.enabled == null || s.enabled != '0') ? true : false
+		});
+	});
+	return out;
+}
+
+function policy_proto_filters(proto) {
+	// the proto tokens drive the block filters (design §3.1: one filter
+	// source per block - the profile's own --filter words are excluded from
+	// the strategy embedding). tcp -> the TLS path, udp|quic -> the QUIC
+	// path (both ride UDP/443); the payload declarations follow the #64
+	// canon types so the engine can parse the ClientHello for SNI matching.
+	let words = [];
+	let tcp = false, udp = false;
+	for (let i = 0; i < length(proto); i++) {
+		let t = proto[i];
+		if (t == 'tcp')
+			tcp = true;
+		else if (t == 'udp' || t == 'quic')
+			udp = true;
+		else
+			die('policy proto token must be tcp, udp or quic, got: "' + t + '"');
+	}
+	if (tcp) {
+		push(words, '--filter-tcp=443');
+		push(words, '--payload=tls_client_hello');
+	}
+	if (udp) {
+		push(words, '--filter-udp=443');
+		push(words, '--payload=quic_initial');
+	}
+	return words;
+}
+
+function policy_render() {
+	// the ordered policy blocks for the engine argv (design §3): null when
+	// NO enabled policy section exists (the pure profiles render of #84,
+	// byte-identical contract). Enabled policies are validated loudly even
+	// when they render no block (action=none): a broken ref must fail the
+	// render with the policy named, never silently disappear.
+	let ps = load_policies();
+	let visible = [];
+	for (let i = 0; i < length(ps); i++)
+		if (ps[i].enabled)
+			push(visible, ps[i]);
+	if (length(visible) == 0)
+		return null;
+	// stable priority sort: ascending `priority`, ties keep the section
+	// file order (a tiny insertion sort - ucode sort() is ASCII-only over
+	// strings, no comparator contract to lean on)
+	for (let i = 1; i < length(visible); i++) {
+		let p = visible[i];
+		let j = i - 1;
+		while (j >= 0 && int(visible[j].priority) > int(p.priority)) {
+			visible[j + 1] = visible[j];
+			j--;
+		}
+		visible[j + 1] = p;
+	}
+	let lists = load_domainlists();
+	let profiles = load_profiles();
+	let blocks = [];
+	let refd = {};
+	let refd_order = [];
+	for (let i = 0; i < length(visible); i++) {
+		let p = visible[i];
+		// match scope: the referenced domainlist must exist (refs go by the
+		// SECTION name, design §2) - a policy without a scope would match
+		// every packet of its proto and silently override the global order
+		let dl = null;
+		for (let li = 0; li < length(lists); li++)
+			if (lists[li].sid == p.domainlist)
+				dl = lists[li];
+		if (dl == null)
+			die('policy "' + p.id + '": domainlist ref "' + p.domainlist +
+				'" does not exist (refs go by the section name)');
+		if (refd[dl.sid] == null) {
+			refd[dl.sid] = true;
+			push(refd_order, dl);
+		}
+		// action: strategy | bypass | none; anything else is a broken
+		// config that must fail the render loudly (issue contract)
+		if (p.action != 'strategy' && p.action != 'bypass' && p.action != 'none')
+			die('policy "' + p.id + '": action must be strategy, bypass or none, got: "' +
+				((p.action == '') ? '(empty)' : p.action) + '"');
+		let prof = null;
+		if (p.action == 'strategy') {
+			for (let pi = 0; pi < length(profiles); pi++)
+				if (profiles[pi].id == p.profile)
+					prof = profiles[pi];
+			if (prof == null)
+				die('policy "' + p.id + '": action=strategy but profile ref "' + p.profile +
+					'" does not exist (refs go by the section name)');
+		}
+		if (p.action == 'none')
+			continue; // validated above; renders no block (falls through)
+		if (length(p.proto) == 0)
+			die('policy "' + p.id + '": proto is empty - at least one of tcp/udp/quic is required');
+		// the block: proto filters + payload, then the hostlist (block
+		// start, the same position the whitelist binding uses), then the
+		// desync part for strategy actions
+		let words = policy_proto_filters(p.proto);
+		push(words, '--hostlist=' + policy_hostlist_path(dl.sid));
+		if (p.action == 'strategy') {
+			for (let wi = 0; wi < length(prof.words); wi++) {
+				let w = prof.words[wi];
+				// the profile's own --filter-*/--payload words are excluded:
+				// the block's filters come from the policy proto (one filter
+				// source per block, design §3.1); every other word (desync
+				// functions, wssize, ...) rides verbatim and stays a single
+				// argv word (the #84 contract)
+				if (index(w, '--filter-tcp=') == 0 || index(w, '--filter-udp=') == 0 ||
+				    index(w, '--payload=') == 0)
+					continue;
+				if (type(w) != 'string' || length(w) == 0 ||
+				    index(w, ' ') >= 0 || index(w, '\t') >= 0)
+					die('policy "' + p.id + '" (profile "' + prof.id + '"): strategy word "' + w +
+						'" must be a single argv word (no whitespace)');
+				push(words, w);
+			}
+		}
+		push(blocks, { policy: p.id, list: dl.sid, words: words });
+	}
+	return { blocks: blocks, lists: refd_order };
+}
+
+function policy_list_canonical(raw) {
+	// the canonical file content source for one list: dedupe + ASCII sort
+	// (the whitelist_merged convention, per-list instead of merged)
+	let seen = {};
+	let doms = [];
+	for (let i = 0; i < length(raw); i++)
+		if (seen[raw[i]] == null) {
+			seen[raw[i]] = true;
+			push(doms, raw[i]);
+		}
+	sort(doms);
+	return doms;
+}
+
 function valid_addr_entry(e) {
 	// strict 'a.b.c.d' or 'a.b.c.d/nn' - entries land inside a generated nft
 	// file, so anything unusual must be rejected, not escaped
@@ -444,12 +649,42 @@ function engine_argv() {
 		warn('wanguard-antidpi: profile sections present - engine.nfqws2_opt (' +
 			length(c.opt) + ' words) is IGNORED\n');
 	}
-	let wl_emit = (src.enabled == '1' && length(strategy) > 0);
+	// Policies (issue #86): ordered match -> action blocks BEFORE the global
+	// strategy catch-all (design §3; first match wins per nfqws2 profile
+	// semantics). Each block scopes itself with its own --hostlist, so the
+	// whitelist binding must NOT also constrain every block (whitelist mode
+	// IS the single-policy special case - design §3): with rendered policy
+	// blocks the whitelist binding is skipped loudly. A null render (no
+	// enabled policies) keeps the #70/#82 binding byte-identical.
+	let pol = policy_render();
+	if (pol != null && length(pol.blocks) > 0 && src.enabled == '1')
+		warn('wanguard-antidpi: policy blocks render their own hostlists - the whitelist binding (' +
+			HOSTLIST + ') is IGNORED\n');
+	let wl_emit = (src.enabled == '1' && length(strategy) > 0 &&
+		(pol == null || length(pol.blocks) == 0));
 	if (wl_emit)
 		push(a, '--hostlist=' + HOSTLIST);
+	// the policy blocks, then the catch-all, joined with --new separators.
+	// The FIRST block continues the base segment (base words carry no
+	// desync/filter words of their own - the spike-75 §1.2 and the #70
+	// whitelist render both start the first profile right after the base
+	// words): an empty leading segment would count as a filterless profile
+	// that matches everything and wins first-match over every policy.
+	// A separator is only emitted BETWEEN segments (no dangling --new).
+	if (pol != null) {
+		for (let bi = 0; bi < length(pol.blocks); bi++) {
+			if (bi > 0)
+				push(a, '--new');
+			let bw = pol.blocks[bi].words;
+			for (let wi = 0; wi < length(bw); wi++)
+				push(a, bw[wi]);
+		}
+	}
 	// strategy words verbatim: one word = one argv word (the shell word-split
 	// contract is gone with the ucode base)
 	for (let i = 0; i < length(strategy); i++) {
+		if (i == 0 && (pol != null && length(pol.blocks) > 0))
+			push(a, '--new');
 		push(a, strategy[i]);
 		if (wl_emit && strategy[i] == '--new' && i + 1 < length(strategy))
 			push(a, '--hostlist=' + HOSTLIST);
@@ -1261,7 +1496,7 @@ function cmd_tunnel_status() {
 //     file)
 // ---------------------------------------------------------------------------
 
-function whitelist_refresh_run() {
+function whitelist_file_refresh() {
 	let src = whitelist_sources();
 	if (src.enabled != '1') {
 		if (dryrun()) {
@@ -1316,6 +1551,100 @@ function whitelist_refresh_run() {
 	if (system('chmod 644 ' + sh_quote(HOSTLIST)) != 0)
 		die('chmod 644 failed on ' + HOSTLIST + ' (the engine user must be able to re-read it on SIGHUP)');
 	log('whitelist.hosts written (' + length(doms) + ' hosts)');
+}
+
+function policy_lists_wouldbe_state() {
+	// the snapshot policy_lists_refresh would leave on disk right now
+	// (canonical content per referenced list) - the DRYRUN counterpart of
+	// policy_lists_disk_state
+	let pol = policy_render();
+	if (pol == null || length(pol.lists) == 0)
+		return '';
+	let parts = [];
+	for (let i = 0; i < length(pol.lists); i++) {
+		let doms = policy_list_canonical(pol.lists[i].domains);
+		let txt = join_lines(doms) + '\n';
+		push(parts, policy_hostlist_path(pol.lists[i].sid) + '\x00' + txt);
+	}
+	// manual join: ucode join() returns null (2026.01.16)
+	let out = '';
+	for (let i = 0; i < length(parts); i++) {
+		if (i > 0)
+			out += '\x01';
+		out += parts[i];
+	}
+	return out;
+}
+
+function policy_lists_disk_state() {
+	// a change-detection snapshot of every referenced policy list file
+	// (apply compares before/after the refresh to pick reload vs restart);
+	// an absent file carries an explicit marker so a created/deleted file
+	// registers as a change
+	let pol = policy_render();
+	if (pol == null || length(pol.lists) == 0)
+		return '';
+	let parts = [];
+	for (let i = 0; i < length(pol.lists); i++) {
+		let path = policy_hostlist_path(pol.lists[i].sid);
+		let content = access(path, 'r') ? readfile(path) : '<absent>';
+		push(parts, path + '\x00' + content);
+	}
+	// manual join: ucode join() returns null (2026.01.16)
+	let out = '';
+	for (let i = 0; i < length(parts); i++) {
+		if (i > 0)
+			out += '\x01';
+		out += parts[i];
+	}
+	return out;
+}
+
+function policy_lists_refresh() {
+	// per-policy hostlist files (issue #86, design §3): one file per
+	// REFERENCED domainlist section under BASE/lists, content = that list's
+	// domains only (dedupe + canonical order + LF, 0644 + verify-after-
+	// write - the whitelist.hosts conventions). The engine consumes the
+	// paths from the policy argv, so a missing file keeps it from starting
+	// (the #70 loud-fail contract); this refresh runs before every engine
+	// start through the init shim. A broken enabled policy dies HERE loudly
+	// (validation before any write). No enabled policies = silent no-op
+	// (the no-policy config keeps its byte-identical behavior surface).
+	let pol = policy_render();
+	if (pol == null || length(pol.lists) == 0)
+		return;
+	for (let li = 0; li < length(pol.lists); li++) {
+		let list = pol.lists[li];
+		let doms = (type(list.domains) == 'array') ? list.domains : [];
+		for (let i = 0; i < length(doms); i++)
+			if (!valid_hostname(doms[i]))
+				die('policy list "' + list.sid + '" entry is not a valid DNS hostname: "' + doms[i] + '"');
+	}
+	if (dryrun()) {
+		for (let li = 0; li < length(pol.lists); li++) {
+			let doms = policy_list_canonical(pol.lists[li].domains);
+			print('DRYRUN: would write ' + policy_hostlist_path(pol.lists[li].sid) +
+				' (' + length(doms) + ' hosts)\n');
+		}
+		return;
+	}
+	system('mkdir -p ' + sh_quote(POLICY_LISTS_DIR));
+	for (let li = 0; li < length(pol.lists); li++) {
+		let doms = policy_list_canonical(pol.lists[li].domains);
+		let path = policy_hostlist_path(pol.lists[li].sid);
+		let txt = join_lines(doms) + '\n';
+		check_write(path, writefile(path, txt));
+		if (readfile(path) != txt)
+			die('policy list write verification failed: ' + path);
+		if (system('chmod 644 ' + sh_quote(path)) != 0)
+			die('chmod 644 failed on ' + path + ' (the engine user must be able to re-read it on SIGHUP)');
+		log('policy list ' + pol.lists[li].sid + '.hosts written (' + length(doms) + ' hosts)');
+	}
+}
+
+function whitelist_refresh_run() {
+	whitelist_file_refresh();
+	policy_lists_refresh();
 }
 
 function cmd_whitelist_refresh() {
@@ -1510,11 +1839,32 @@ function status_engine_info() {
 			enabled: psecs[i].enabled,
 			words: length(psecs[i].words)
 		});
+	// policy surfaces (issue #86): the raw sections (UI table) + the count
+	// of RENDERED policy blocks (first-match blocks ahead of the catch-all).
+	// The render validates loudly (a broken policy dies like a broken
+	// profile word does) - status stays consistent with the argv it reports.
+	let polsecs = load_policies();
+	let pol = policy_render();
+	let psections = [];
+	for (let i = 0; i < length(polsecs); i++)
+		push(psections, {
+			id: polsecs[i].id,
+			name: polsecs[i].name,
+			priority: polsecs[i].priority,
+			domainlist: polsecs[i].domainlist,
+			proto: polsecs[i].proto,
+			action: polsecs[i].action,
+			profile: polsecs[i].profile,
+			device_group: polsecs[i].device_group,
+			enabled: polsecs[i].enabled
+		});
 	return {
 		pid: pid,
 		version: ver,
 		profiles: profiles,
 		profile_sections: sections,
+		policies: (pol == null) ? 0 : length(pol.blocks),
+		policy_sections: psections,
 		hostlists: lists,
 		running_argv: (pid != null) ? status_proc_cmdline(pid) : null
 	};
@@ -1704,6 +2054,8 @@ function cmd_status() {
 			version: en.version,
 			profiles: en.profiles,
 			profile_sections: en.profile_sections,
+			policies: en.policies,
+			policy_sections: en.policy_sections,
 			hostlists: en.hostlists,
 			running_argv: en.running_argv
 		},
@@ -1728,6 +2080,8 @@ function cmd_status() {
 	print('engine: ' + ((s.engine.version != null) ? s.engine.version : 'unknown') +
 		', profiles ' + s.engine.profiles +
 		', sections ' + length(s.engine.profile_sections) +
+		', policies ' + s.engine.policies +
+		', policy sections ' + length(s.engine.policy_sections) +
 		', hostlists ' + length(s.engine.hostlists) +
 		((s.engine.running_argv != null) ? ', running argv captured' : '') + '\n');
 	print('nft: ' + (s.nft.table_present ?
@@ -1829,20 +2183,24 @@ function apply_engine_decision(file_changed) {
 	let c = load_config();
 	let new_argv = engine_argv();
 	let old_argv = apply_running_argv();
-	// the "worth starting" check counts the STRATEGY SOURCE (profiles
-	// replace the legacy opt, issue #84), not c.opt alone
+	// the "worth starting" check counts the STRATEGY SOURCES (profiles
+	// replace the legacy opt, issue #84; policy blocks are their own blocks,
+	// issue #86), not c.opt alone
 	let strategy = profile_strategy_words();
 	if (strategy == null)
 		strategy = c.opt;
+	let pol = policy_render();
+	let worth = (length(strategy) > 0) || (pol != null && length(pol.blocks) > 0);
 	if (old_argv == null)
-		return (length(strategy) > 0)
+		return worth
 			? { action: 'restart', reason: 'engine not running - starting with ' + length(strategy) + ' strategy words' }
 			: { action: 'noop', reason: 'engine not running, no strategy words - nothing to start' };
 	if (!apply_argv_equal(old_argv, new_argv)) {
 		if (apply_argv_equal(apply_argv_without_hostlist(old_argv), apply_argv_without_hostlist(new_argv))) {
 			// ONLY the --hostlist words differ. With the fixed per-profile
 			// emission (a mode emits the word on every profile or on none)
-			// this is exactly the whitelist mode flip (#82): SIGHUP re-reads
+			// this is exactly the whitelist mode flip (#82) or a policy
+			// rebinding to a different list (#86): SIGHUP re-reads
 			// list file CONTENT but cannot add/drop the --hostlist binding
 			// of a live process (the argv is exec-time), so a flip MUST go
 			// through a restart (the AGENTS #70 memo contract).
@@ -1923,22 +2281,41 @@ function apply_check_run(want_json) {
 	if (length(pid) == 0)
 		ok = false;
 
-	// hostlist: present when the engine consumes it (whitelist on + a
-	// non-empty merged source set + strategy words); blanket mode and
-	// wordless whitelists never read the file
+	// hostlist: present when the engine consumes it - the whitelist binding
+	// (whitelist on + a non-empty merged source set + strategy words from
+	// EITHER source, profiles included: the #84 contract) or a rendered
+	// policy block (each carries its own per-list file, issue #86). Blanket
+	// mode and wordless whitelists never read the whitelist file.
 	let src = whitelist_sources();
 	let c = load_config();
-	let needed = (src.enabled == '1' && length(whitelist_merged(src)) > 0 && length(c.opt) > 0);
+	let strategy_words = profile_strategy_words();
+	if (strategy_words == null)
+		strategy_words = c.opt;
+	let pol = policy_render();
+	let needed = (pol != null && length(pol.blocks) > 0) ||
+		(src.enabled == '1' && length(whitelist_merged(src)) > 0 && length(strategy_words) > 0);
 	let exists = access(HOSTLIST, 'r');
+	let pol_files_ok = true;
+	let pol_files_detail = null;
+	if (pol != null) {
+		for (let li = 0; li < length(pol.lists); li++) {
+			let path = policy_hostlist_path(pol.lists[li].sid);
+			if (!access(path, 'r')) {
+				pol_files_ok = false;
+				pol_files_detail = 'policy list file missing: ' + path + ' (run whitelist-refresh)';
+				break;
+			}
+		}
+	}
 	checks.hostlist = {
-		ok: (!needed || exists),
+		ok: (!needed || (exists && pol_files_ok)),
 		needed: needed,
 		exists: exists,
 		detail: (needed && !exists)
 			? ('whitelist mode consumes ' + HOSTLIST + ' but the file is missing (run whitelist-refresh)')
-			: null
+			: ((needed && !pol_files_ok) ? pol_files_detail : null)
 	};
-	if (needed && !exists)
+	if (needed && !(exists && pol_files_ok))
 		ok = false;
 
 	if (want_json) {
@@ -1979,11 +2356,15 @@ function cmd_apply() {
 	if (dryrun()) {
 		let cur = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
 		let wouldbe = apply_hostlist_wouldbe();
-		let d = apply_engine_decision(cur != wouldbe);
+		let polchanged = (policy_lists_disk_state() != policy_lists_wouldbe_state());
+		let d = apply_engine_decision((cur != wouldbe) || polchanged);
 		print('DRYRUN: would ensure the routing-mark integration\n');
 		print('DRYRUN: would update the tunnel exclusion set (' + length(load_tunnel().tunnel_hosts) + ' host(s) configured)\n');
 		print('DRYRUN: would apply nft table inet ' + TABLE + '\n');
 		print('DRYRUN: would ' + ((wouldbe == null) ? ('remove ' + HOSTLIST + ' (blanket mode)') : ('render ' + HOSTLIST)) + '\n');
+		let dpol = policy_render();
+		if (dpol != null && length(dpol.lists) > 0)
+			print('DRYRUN: would render ' + length(dpol.lists) + ' policy list file(s) under ' + POLICY_LISTS_DIR + '\n');
 		print('DRYRUN: engine: would ' + d.action + ' (' + d.reason + ')\n');
 		print('DRYRUN: apply plan printed - no changes made\n');
 		exit(0);
@@ -2019,8 +2400,11 @@ function cmd_apply() {
 	else if (!want_json)
 		print('apply: nft: applied\n');
 
-	// [4] hostlist render + change detection for the engine step
+	// [4] hostlist render + change detection for the engine step (the
+	// whitelist file AND every referenced policy list file - a list content
+	// change reloads via SIGHUP, an argv change restarts)
 	let file_before = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
+	let polstate_before = policy_lists_disk_state();
 	if (apply_child('whitelist-refresh', want_json) != 0) {
 		steps.whitelist = 'failed';
 		fatal = true;
@@ -2030,7 +2414,8 @@ function cmd_apply() {
 			print('apply: whitelist: refreshed\n');
 	}
 	let file_after = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
-	let file_changed = (file_before != file_after);
+	let polstate_after = policy_lists_disk_state();
+	let file_changed = (file_before != file_after) || (polstate_before != polstate_after);
 
 	// [5] engine: restart-vs-SIGHUP per the #70 evidence
 	let d = apply_engine_decision(file_changed);

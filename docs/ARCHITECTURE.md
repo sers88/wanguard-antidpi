@@ -300,6 +300,46 @@ end-to-end workflow (engine started via the exact shim recipe, then
 `whitelist-reload` refreshing + reloading the list under the dropped user)
 was verified in the container against the pinned engine.
 
+## 3.5 Policies (#86)
+
+Ordered **match -> action** rules (UCI `config policy`) rendered as the
+FIRST engine profile blocks, ahead of the global strategy catch-all; the
+first match wins (nfqws2 profile semantics, spike-75 §1.2):
+
+- input: `policy` sections - `priority` (render order, ascending, ties keep
+  the section file order), `domainlist` (ref by section name), `proto`
+  (tcp/udp/quic tokens -> the block's `--filter-*` + canonical `--payload`),
+  `action` (`strategy` | `bypass` | `none`), `profile` (ref for strategy),
+  `enabled`; `device_group` is stored and ignored (no client identity in
+  the queue)
+- render: first block continues the BASE segment (the base words carry no
+  filter/desync words - an empty leading segment would count as a
+  filterless match-everything profile and win first-match over every
+  policy); subsequent blocks and the catch-all join with `--new`
+- bypass = filters + hostlist with NO desync words -> the engine passes the
+  matched traffic unmodified (verified live: the ClientHello leaves in one
+  segment); strategy = proto filters + the referenced profile's desync
+  words (the profile's own `--filter-*`/`--payload` words excluded - one
+  filter source per block)
+- while any block renders, the whitelist binding (#70) is IGNORED (warned):
+  the blocks own their per-list hostlists
+- files: `/usr/share/wanguard-antidpi/lists/<list>.hosts` per REFERENCED
+  list (whitelist-refresh, same dedupe/sort/LF/0644/verify conventions); a
+  missing file keeps the engine from starting (#70 contract)
+- validation is loud and named (unknown action, missing refs, empty/unknown
+  proto); disabled policies skip validation (the profiles spare exit)
+- tunnel/proxy exclusions stay above every policy (the nft set and the
+  engine `--ipset-exclude-ip` fire first - only mihomo DIRECT eligible)
+- no policy sections or all disabled = the pure profiles render (#84)
+  byte-identical
+
+Verification contract: `tests/test-policies.sh` - structural render matrix
+(block shapes, priority order, none/validation/whitelist-ignored, status
+surfaces) plus live NFQUEUE scenarios: the engine starts and serves traffic
+on a 2-policy argv, and the send inventory (tcpdump against a local sink)
+proves the bypass path passes the ClientHello unmodified while the
+catch-all splits it.
+
 ## 4. Scope discipline
 
 The add-on owns the lifecycle of its own table and engine; it never edits
