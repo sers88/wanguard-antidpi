@@ -52,5 +52,16 @@
 		"depends": {
 			"acl": [ "luci-app-wanguard" ]
 		}
+	},
+	"admin/network/wanguard/antidpi": {
+		"title": "Anti-DPI placeholder",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "wanguard/antidpi-placeholder"
+		},
+		"depends": {
+			"acl": [ "luci-app-wanguard" ]
+		}
 	}
 }

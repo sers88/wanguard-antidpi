@@ -18,8 +18,9 @@
 #       - which is why the shipped parent carries OUR group (deviation from
 #       the issue's literal byte-identity, documented in the issue comment)
 #   [7] live menu.d shape with a simulated luci-app-wanguard installed
-#   [8] apk del removes the tab, keeps the simulated luci-app-wanguard file
-#       and the core package
+#   [8] apk del removes the real tab, keeps the simulated luci-app-wanguard
+#       file and the core package - the Anti-DPI tab falls back to the
+#       luci-app-wanguard placeholder (#79 fixture sync)
 #
 # Usage: test-luci.sh <version>
 set -eu
@@ -47,12 +48,6 @@ printf '%s\n' '{ "access-group": { "luci-app-wanguard": { "read": {}, "write": {
 printf '%s\n' '{ "access-group": { "luci-app-wanguard-antidpi": { "read": {}, "write": {} } } }' > /tmp/luci/acl-ours.json
 printf '%s\n' '{ "access-group": { "luci-app-wanguard-antidpi": { "read": {} } } }' > /tmp/luci/acl-ours-ro.json
 printf '%s\n' '{ "access-group": {} }' > /tmp/luci/acl-none.json
-# reduced stand-in for the #79 placeholder (parent + inactive-tab child)
-printf '%s\n' \
-	'{' \
-	'	"admin/network/wanguard": { "title": "WAN Guard", "order": 60, "action": { "type": "firstchild" }, "depends": { "acl": [ "luci-app-wanguard" ] } },' \
-	'	"admin/network/wanguard/antidpi": { "title": "Anti-DPI placeholder", "order": 10, "action": { "type": "view", "path": "wanguard/antidpi-placeholder" }, "depends": { "acl": [ "luci-app-wanguard" ] } }' \
-	'}' > /tmp/luci/stub-luci-app-wanguard.json
 
 echo "== [1] install core + luci packages (luci-base resolves from the image feed)"
 apk update >/dev/null
@@ -87,8 +82,10 @@ echo "GUARDS-OK"
 
 echo "== [4] sort-order probes (#75 A_fixed / A_default, executable)"
 mkdir -p /tmp/luci/sort-ok /tmp/luci/sort-bad
-# correct name: ours sorts after luci-app-wanguard.json -> the real node wins
-cp /tmp/luci/stub-luci-app-wanguard.json /tmp/luci/sort-ok/luci-app-wanguard.json
+# the fixture IS the shipped luci-app-wanguard.json (synced at #79, carries
+# the placeholder child); correct name: ours sorts after luci-app-wanguard.json
+# -> the real node wins
+cp "$FIXT" /tmp/luci/sort-ok/luci-app-wanguard.json
 cp "$MENU" /tmp/luci/sort-ok/wanguard-antidpi.json
 out=$(ucode "$UC" tree /tmp/luci/sort-ok /tmp/luci/acl-both.json)
 expect 'sort-order: wanguard-antidpi.json wins' \
@@ -97,7 +94,7 @@ expect 'sort-order: wanguard-antidpi.json wins' \
 # the default name (luci-app-wanguard-antidpi.json) sorts BEFORE
 # luci-app-wanguard.json ('-' < '.'), the placeholder wins - the filename is
 # part of the contract
-cp /tmp/luci/stub-luci-app-wanguard.json /tmp/luci/sort-bad/luci-app-wanguard.json
+cp "$FIXT" /tmp/luci/sort-bad/luci-app-wanguard.json
 cp "$MENU" /tmp/luci/sort-bad/luci-app-wanguard-antidpi.json
 out=$(ucode "$UC" tree /tmp/luci/sort-bad /tmp/luci/acl-both.json)
 expect 'sort-order: default filename loses to the placeholder' \
@@ -170,7 +167,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] apk del removes the tab, keeps the simulated luci-app-wanguard + core"
+echo "== [8] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"
 apk del luci-app-wanguard-antidpi >/dev/null
 [ ! -f "$MENU" ] || fail "apk del left the menu file"
 [ ! -f "$ACL" ] || fail "apk del left the acl file"
@@ -178,12 +175,15 @@ apk del luci-app-wanguard-antidpi >/dev/null
 	|| fail "apk del touched the simulated luci-app-wanguard menu file"
 apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \
 	|| fail "apk del removed the core package (must stay)"
+# #79: the fixture now carries the placeholder child, so the Anti-DPI tab
+# FALLS BACK to the luci-app-wanguard stub instead of disappearing - the
+# uninstall criterion of the placeholder issue
 out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-both.json)
-expect 'uninstall: luci tabs remain' \
-	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard children=devices,diagnostics,groups,overview' \
+expect 'uninstall: luci tabs remain (placeholder child included)' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard children=antidpi,devices,diagnostics,groups,overview' \
 	"$out"
-expect 'uninstall: antidpi node gone' \
-	'wanguard.antidpi: absent' \
+expect 'uninstall: antidpi tab = the #79 placeholder' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=10 path=wanguard/antidpi-placeholder' \
 	"$out"
 echo "UNINSTALL-OK"
 
