@@ -51,7 +51,8 @@ options live in this section, issue #62):
 | mihomo | proxy core; with `routing-mark 0x10000000` its own DIRECT egress is the add-on's scope (the CLI installs the mark idempotently, #60) |
 | nftables (`table inet wanguard_antidpi`) | own table: output `predefrag` @ -401 (engine mark `notrack`, #68) + postrouting @ 101, `meta mark 0x10000000 queue flags bypass to <qnum>`; never touches wanguard / fw4 tables (final rule set: #61, notrack: #68) |
 | nfqws2 (zapret2) | desync engine, single instance, `--qnum=<qnum>`, gzipped lua strategies loaded via `--lua-init=@`; graceful no-op when the strategy is empty |
-| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status, tunnel-update/status, cron-install/remove, status/events (read-only state + syslog tail for the LuCI page); DRYRUN-aware |
+| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status, tunnel-update/status, cron-install/remove, whitelist-refresh/reload, profile/domainlist/policy rendering, status/events/apply (the LuCI page's surfaces); DRYRUN-aware |
+| LuCI page (#75-#88) | `luci-app-wanguard-antidpi`: one view (six sub-tabs) over the CLI surfaces and staged UCI; menu.d + rpcd ACL + /www resources (section 7) |
 | resolver updater (#62) | `tunnel-update`: nslookup per `tunnel_hosts` entry, maintains `tunnel.proxy_resolved` in UCI with per-IP expiry (state file), re-applies the table only when the set changed and the table lives |
 | procd init | ensure the mihomo mark (non-fatal) -> refresh the tunnel set (non-fatal) -> apply table -> ensure cron line -> engine instance (respawn 3600 5 0, stdout/stderr to syslog); stop = kill -> drop cron line -> flush table |
 | apk feed | signed index on the `feed` branch; package built by CI from the sha256-pinned upstream artifact |
@@ -365,6 +366,10 @@ above):
 | `/etc/crontabs/root` | system | one tagged cron line; foreign lines preserved; dropped on service stop (3.3) |
 | `/usr/share/mihomo/config.yaml` | mihomo workdir | kept in sync as the SAFE_PATHS reload copy (3.1); restored in sync on remove |
 | `/usr/share/wanguard-antidpi/whitelist.hosts` | wanguard-antidpi | machine-managed engine hostlist (3.4): rendered from UCI, removed when whitelist mode is off |
+| `/usr/share/wanguard-antidpi/lists/<sid>.hosts` | wanguard-antidpi | per-policy hostlists (3.5): rendered for every referenced domainlist, same conventions as whitelist.hosts |
+| `/usr/share/luci/menu.d/wanguard-antidpi.json` | wanguard-antidpi | own menu nodes (7.1); the file NAME carries the merge-order contract; `luci-app-wanguard.json` (foreign) is never edited - coexistence is by glob-order merge |
+| `/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json` | wanguard-antidpi | own ACL group `luci-app-wanguard-antidpi` (7.1) |
+| `/www/luci-static/resources/{view/wanguard/antidpi.js,wanguard-antidpi/core.js}` | wanguard-antidpi | the page resources (7); the view path differs from the placeholder's on purpose - two apk packages cannot claim one file |
 
 Conflict-safety notes: wanguard core policy marks live in `0x64..0x258` and
 match by exact value, so the add-on's marks cannot disturb policy routing;
@@ -376,9 +381,176 @@ one-sided by design: the wanguard core needs no knowledge of this add-on.
 
 Every frozen contract above is verified by `tests/*.sh` scripts that run
 byte-identically on the local dev stand (`scripts/dev-test.sh`, Docker) and
-in CI; the CI `publish` job (sign + push the `feed` branch) needs all four
-matrix jobs green, so a red matrix means the release is never published.
+in CI; the CI `publish` job (sign + push the `feed` branch) needs every
+matrix job green (smoke, mark, nft, tunnel, status, apply, profiles,
+policies, events, luci, view-test), so a red matrix means the release is
+never published.
 Live NFQUEUE scenarios self-gate on the host kernel (`NFT-LIVE-SKIP` /
 `TUNNEL-LIVE-SKIP`); on such hosts they are covered by router acceptance
 only. Slice map and the known-limitation note: README, "Test matrix =
 release gate".
+
+## 7. LuCI web interface (#75-#88)
+
+One LuCI view (`view/wanguard/antidpi.js`) over one shared core module
+(`wanguard-antidpi/core.js`; the luci-app-wanguard pattern: the module
+factory yields a CLASS, the loader instantiates it, and the instance is a
+stateless facade over a module-closure `state`). The page has six
+sub-tabs - Overview / Profiles / Policies / Domain lists / Tunnel
+protection / Tests & Logs. The browser never touches nft, logread or the
+engine process: every router fact comes from the CLI surfaces, and the
+core's only innerHTML payloads are static strings from its own tables
+(CLI-derived fields ride `E()` text nodes).
+
+### 7.1 Package surface and the menu merge contract (#78/#79)
+
+| File | Content |
+|---|---|
+| `/usr/share/luci/menu.d/wanguard-antidpi.json` | the `admin/network/wanguard` parent (title/order/action byte-identical to luci-app-wanguard's node, `depends.acl` switched to THIS package's group) + the `admin/network/wanguard/antidpi` child (`action: view wanguard/antidpi`, order 35) |
+| `/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json` | ACL group `luci-app-wanguard-antidpi`: exec `/usr/bin/wanguard-antidpi`, uci read/write the `wanguard-antidpi` config (read: get/changes; write: add/set/delete/order/apply/confirm/revert), ubus `file` read/exec |
+| `/www/luci-static/resources/view/wanguard/antidpi.js` | the view: header, tab bar, chips holder, poll wiring |
+| `/www/luci-static/resources/wanguard-antidpi/core.js` | the core module (all logic) |
+
+The menu.d FILE NAME is part of the contract. LuCI merges menu.d files in
+glob order, per node and KEY-LEVEL (`node[k] = spec[k]`, no deep merge):
+`wanguard-antidpi.json` sorts after `luci-app-wanguard.json`, so with both
+packages installed our parent node wins every key it carries and our
+child node (the real page) replaces the placeholder's child wholesale.
+The placeholder package keeps a DISTINCT view path on purpose - two apk
+packages cannot claim the same /www file. Standalone (core + this
+package, no luci-app-wanguard): the replicated parent provides the WAN
+Guard menu, and the ACL switch is not cosmetic - the dispatcher gates
+EVERY node carrying `depends.acl` in a separate `apply_tree_acls()` pass
+by the session's access groups (`check_depends()` during tree building
+only evaluates fs/uci depends). A parent pinned to the foreign
+`luci-app-wanguard` group would hide the whole subtree in standalone
+mode, because that ACL group only exists when luci-app-wanguard is
+installed - hence the own group on both nodes.
+
+Guards (`tests/test-luci.sh`, harness `tests/luci-menu-test.uc`): the
+harness replicates `build_pagetree` / `check_acl_depends` /
+`apply_tree_acls` of the INSTALLED dispatcher verbatim, with pinned
+dispatcher lines (`tests/luci-dispatcher-lines.txt`) guarding against
+dispatcher drift; the parent node is compared against a byte-snapshot
+fixture of luci-app-wanguard's menu (`tests/fixtures/`), child
+completeness and sort order are probed for BOTH the winning name and the
+losing default package-derived name, and the merged / standalone /
+read-only / ACL-negative trees plus the live 3-combination install
+matrix (antidpi-only -> both -> wanguard-only after `apk del`) are
+exercised. `tests/luci/run-tests.js` covers the view code itself
+(below).
+
+### 7.2 UI <-> CLI contract (#76/#77)
+
+Per poll tick (and on load) the page issues exactly ONE
+`wanguard-antidpi status --json` exec, plus `engine-cmdline` for the
+strategy words. The heavier surfaces run strictly on demand behind
+buttons: `apply --check --json` (validation card), `apply --json`
+(Review & Apply), `events --json` (log fetch). Router-side rules:
+
+- the status document has stable keys - service, engine (pid, version,
+  profiles, hostlists, policies, `profile_sections`, `policy_sections`),
+  nft (table_present + counters), tunnel, whitelist, mihomo, pending
+  (count + sections), events, degraded. Every unavailable surface
+  degrades explicitly (null data + a `degraded` map entry) instead of
+  failing, and the page renders its unavailable states from the same
+  keys;
+- an exec failure or a non-status document = the page's
+  "unavailable - update the package" state with muted chips; recovery
+  happens in the poll loop without a reload;
+- the page never restarts or signals services itself: Review & Apply
+  calls the idempotent `apply`, whose engine step decides
+  restart-vs-SIGHUP from evidence - hostlist CONTENT changes re-read on
+  SIGHUP (queue and live connections untouched, #70), argv drift
+  (strategy words, policy blocks, filters, the debug flag) restarts
+  through the init script. Exit codes 0 ok / 1 validation failure /
+  2 partial (a non-fatal step kept a fallback) map to the ok / FAILED /
+  PARTIAL notifications.
+
+### 7.3 Staged-UCI editing model (#81-#85)
+
+Editors never write committed config directly. Each tab stages changes
+client-side through the uci client (add/set/delete/move scoped to the
+`wanguard-antidpi` config); nothing reaches the router until the pending
+bar (or a tab's Apply card) runs the pipeline
+
+    uci.save()  ->  uci.apply(5)  ->  wanguard-antidpi apply --json
+
+`uci.save()` is REQUIRED before the CLI call: the CLI renders committed
+config only - a staged `/tmp/.uci` delta is invisible to the ucode
+cursor (container-verified). `uci.apply(5)` is the luci-app-wanguard
+idiom (rollback window + client-driven confirm). Discard = rpcd
+`uci revert` scoped to THIS config (the ACL grants it; the LuCI uci
+client has no revert wrapper). Inline validation mirrors the CLI render
+rules (strict DNS hostnames, strict IPv4/CIDR pins, one strategy word
+per line, whitespace never stages) - invalid input is rejected before
+staging, so the render-loud-fail contracts (#61/#70) are unreachable
+from the UI. A busy tick skips the poll rebuild entirely (an in-flight
+apply must not race its own rebuild); after a config-change cycle the
+next update() rebuilds the open editor tab once (its after-config render
+would otherwise run on the stale status document).
+
+Apply badges are honest per field: edits that change the engine argv
+(strategy words, enabled flips, order, policy refs/actions/protocols,
+the debug flag) are labelled "apply restarts the engine"; metadata-only
+edits (profile name/color, policy name/device_group) say so;
+domain-list content edits say "applies via reload - live connections
+stay up".
+
+### 7.4 UCI schema (#82/#84/#86)
+
+Named sections in `/etc/config/wanguard-antidpi`; the section name is
+the stable id referenced by the render and by other sections:
+
+    config profile              # one engine --new block (#84)
+        option name             # display name
+        option proto            # tcp/udp/quic tokens (UI metadata)
+        option enabled          # '0' skips the section on the render
+        option color            # UI identity only
+        list strategy_words     # ONE nfqws2 argv word per item
+
+    config domainlist           # SNI list (#82)
+        option name             # display name
+        list domains            # strict DNS names; feeds the hostlist
+                                # pipeline (merged with the legacy
+                                # whitelist.domains; a policy-referenced
+                                # list renders to lists/<sid>.hosts)
+
+    config policy               # match -> action rule (#86)
+        option priority         # ascending, step-10 convention (UI-owned)
+        option domainlist       # ref by section name
+        option proto            # the block's --filter-*/--payload source
+        option action           # strategy | bypass | none
+        option profile          # ref for strategy (by section name)
+        option enabled
+        option device_group     # STAGED-FUTURE (7.5): stored, ignored
+
+Legacy coexistence: while NO profile section exists, the engine argv
+renders verbatim from `engine.nfqws2_opt` (the pre-#84 golden); once
+profile sections exist, the legacy list is IGNORED (warned on every
+render) and the UI offers a one-click adopt. Whitelist (#70) merges into
+the same hostlist pipeline as the named domainlists; while any policy
+block renders, the whitelist binding is IGNORED (warned) - the blocks
+carry their own per-list hostlists (3.5). Render algorithms and
+validation contracts in 3.4/3.5 apply unchanged; profiles add the
+`--new` block grammar (the FIRST block continues the base argv segment -
+a leading empty segment would render a filterless match-everything
+profile and win first-match over every policy).
+
+### 7.5 device_group is staged-future
+
+`policy.device_group` round-trips through the UI (badged "staged
+future") but is ignored by the render: the NFQUEUE path carries no
+client identity, so per-device desync targeting has no enforcement
+point. Nothing in the pipeline depends on it, and per-device desync
+should not be expected until the queue path learns client identity.
+
+Verification contract: `tests/luci/run-tests.js` - the real view + core
+evaluated in node with stubbed LuCI globals (`view` / `poll` / `rpc` /
+`uci` / `ui` / `E` / `L` / `_`), covering every sub-tab (staging never
+happens on invalid input, honest badges, poll ticks never rebuild editor
+tabs, degraded surfaces stay alive; CI `view-test` = the same command in
+the same node:24 container as dev-test step 13), plus the structural
+pins in `tests/test-luci.sh` (menu/ACL blocks above) and the CLI-side
+matrices for the surfaces the page consumes (status-test, apply-test,
+profiles-test, policies-test, events-test).

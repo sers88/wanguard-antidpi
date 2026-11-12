@@ -13,7 +13,10 @@ matrix as the release gate (#63), desync strategy tuning with the
 engine-level tunnel exclusion (#64), and router acceptance including a
 full uninstall / restore cycle (#65). The engine ships in a **graceful
 no-op** state; desync strategies are provider-specific by nature and are
-configured per router (see Tuning below).
+configured per router (see Tuning below). The same feed ships a **LuCI
+web interface** (issues #75-#88) - strategy profiles, processing
+policies, domain lists, tunnel protection and diagnostics, all over the
+CLI surfaces (see the section below).
 
 **Language policy: ucode-first** (issue #67) - all router-side logic lives in
 a ucode CLI over a UCI config (`/etc/config/wanguard-antidpi`); POSIX sh
@@ -140,6 +143,79 @@ repository URL with package names, which corrupts the fetch). `apk
 upgrade` never downgrades, so a stale index cannot roll a newer install
 back.
 
+## LuCI web interface (issues #75-#88)
+
+The feed ships `luci-app-wanguard-antidpi`, a single page under
+**Network -> WAN Guard -> Anti-DPI** with six sub-tabs:
+
+| Tab | What it manages |
+|---|---|
+| Overview | the live strategy (profile blocks derived from the rendered engine argv), tunnel-protection status, validation checks, the pending-changes bar |
+| Profiles | named strategy profiles (desync words, one engine `--new` block each), order/color metadata, generic presets |
+| Policies | ordered match -> action rules: a domain list + protocols route to a strategy profile, pass unmodified, or nothing (first match wins) |
+| Domain lists | the SNI lists policies match on, and the desync mode (blanket / whitelist) |
+| Tunnel protection | the exclusion set - static pins, updater hosts, refresh/expiry intervals: what the nft table and the engine never desynchronize |
+| Tests & Logs | queue counters with a per-tick delta, `apply --check` validation, the engine verbose-logging toggle, a filtered syslog tail |
+
+Everything on the page reads from ONE `wanguard-antidpi status --json`
+call per refresh; the heavier probes (`apply --check`, `apply`, the log
+fetch) run strictly on demand behind their buttons. Editors stage changes
+client-side - nothing reaches the router until you apply. The pending
+bar's **Review & Apply** commits the staged UCI and then runs the
+idempotent `apply` orchestration, whose engine step restarts the service
+only when the engine argv actually drifts: domain-list content edits
+apply via SIGHUP without dropping live connections, strategy/profile/
+policy structure edits restart the engine. The badges say so up front:
+"apply restarts the engine", "metadata only", "applies via reload -
+live connections stay up".
+
+A missing or pre-`status` CLI (old package, denied ACL) renders an
+"unavailable - update the package" section with muted chips instead of
+breaking the page; it recovers in the poll loop without a reload, and
+partial degradations surface from the status document's `degraded` map.
+Install combinations (core only / with `luci-app-wanguard` / standalone)
+are in the Installation section; the menu merge contract and the full
+UI<->CLI contract live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
+section 7.
+
+![Anti-DPI Overview tab](docs/screenshots/overview.png)
+
+![Profiles tab - generic preset applied to a new profile](docs/screenshots/profiles-drawer.png)
+
+The Profiles drawer ships two **generic presets** - starting points, not
+tuned strategies (see the provider-specificity note in Tuning): **TLS
+over TCP** (`--filter-tcp=443 --payload=tls_client_hello
+--lua-desync=multisplit:pos=midsld`) and **QUIC over UDP**
+(`--filter-udp=443 --payload=quic_initial --lua-desync=fake:repeats=2`).
+Both follow the mandatory-word rules from Tuning, start the pinned engine
+byte-exactly in `tests/test-profiles.sh`, and are pinned in
+`tests/test-luci.sh` so the presets, the README and the tests stay in
+sync. Applying a preset onto a profile that already has words is a
+two-step confirmation - no silent overwrite. Policies can exempt
+incompatible origins from desync entirely (a `pass unmodified` policy
+outranks the catch-all strategy):
+
+![Policies tab - a bypass policy scoping the strategy](docs/screenshots/policies.png)
+
+The remaining tabs:
+
+- [Domain lists](docs/screenshots/domain-lists.png) - desync mode card,
+  per-list editors with inline validation, two-step deletes;
+- [Tunnel protection](docs/screenshots/tunnel-protection.png) -
+  protection status, the committed exclusion set (pins + resolver
+  answers with expiry), the staged editor;
+- [Profiles](docs/screenshots/profiles.png) - the profile list with
+  protocol badges derived from the words and the policy-ref delete
+  guard;
+- [Tests & Logs](docs/screenshots/tests-and-logs.png) - queue counters
+  (the same delta the header chip reads), validation, verbose logging,
+  the syslog tail.
+
+The screenshots are rendered by the actual package view code (the same
+code the CI view tests execute) in a headless browser with documentation
+example data (RFC 2606 hostnames, RFC 5737 addresses) - not captured
+from a production router.
+
 ## Package contents
 
 | Path | What |
@@ -158,7 +234,9 @@ back.
 | Path | What |
 |---|---|
 | `/usr/share/luci/menu.d/wanguard-antidpi.json` | menu nodes: the `admin/network/wanguard` parent (replicating luci-app-wanguard's node so the menu works standalone, ACL switched to this package's group) + the `admin/network/wanguard/antidpi` child. The FILE NAME is part of the contract: `wanguard-antidpi.json` sorts after `luci-app-wanguard.json` in menu.d glob order, so the real node wins the per-field merge against the placeholder (#75); the default package-derived name sorts before it and would lose |
-| `/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json` | ACL group `luci-app-wanguard-antidpi`: exec `/usr/bin/wanguard-antidpi`, read/write the `wanguard-antidpi` UCI config, ubus `file` read/exec |
+| `/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json` | ACL group `luci-app-wanguard-antidpi`: exec `/usr/bin/wanguard-antidpi`, read/write the `wanguard-antidpi` UCI config, ubus `file` read/exec and the staged-UCI verbs (`uci` add/set/delete/order + apply/confirm/revert/get/changes) |
+| `/www/luci-static/resources/view/wanguard/antidpi.js` | the page view (thin: header, tab bar, poll wiring) |
+| `/www/luci-static/resources/wanguard-antidpi/core.js` | the shared core module behind all six sub-tabs (the luci-app-wanguard pattern: a LuCI class facade over the page state) |
 
 Upstream pinning (issue #57): the engine payload comes from the
 `bol-van/zapret2` `openwrt-embedded` release artifact, downloaded at build
