@@ -171,7 +171,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold + overview + domains + tunnel tabs (issues #80-#83)"
+echo "== [8] page scaffold + overview + domains + tunnel + policies tabs (issues #80-#87)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -275,6 +275,39 @@ grep -qF -- "--lua-desync=fake:repeats=2" "$CORE" \
 	|| fail "the QUIC preset words drifted from the engine-tested set (test-profiles [10])"
 grep -qF "Open profiles" "$CORE" \
 	|| fail "the Overview strategy card lost the Open profiles affordance (#85)"
+# the #87 policies page: table (priority/match/strategy/state/menu), the
+# drawer with ref validation, the honest restart/reload badges, the drag
+# reorder with the up/down fallback - all pinned structurally
+grep -qF "policiesModel" "$CORE" \
+	|| fail "the policies tab lost its model"
+grep -qF "policiesArgvKey" "$CORE" \
+	|| fail "the policies apply badge lost the argv-key mirror (restart detect)"
+grep -qF "renderPolicies" "$CORE" \
+	|| fail "the policies tab lost its render path"
+grep -qF "policiesOpenEditor" "$CORE" \
+	|| fail "the policies drawer lost its open path"
+grep -qF "policiesValidateDraft" "$CORE" \
+	|| fail "the policies drawer lost the pre-staging ref validation (issue criterion)"
+grep -qF "POLICY_ACTIONS" "$CORE" \
+	|| fail "the policy action enum is gone"
+grep -qF "'policy'" "$CORE" \
+	|| fail "the policies tab must read config policy sections"
+grep -qF "engine.policies" "$CORE" \
+	|| fail "the policies table must surface the committed render count from status"
+grep -qF "'draggable'" "$CORE" \
+	|| fail "the policies table lost the drag-priority rows"
+grep -qF "wg-ad-rowmenu" "$CORE" \
+	|| fail "the policies row menu lost its style hook"
+grep -qF "Only mihomo DIRECT traffic is eligible" "$CORE" \
+	|| fail "the policies tab lost the standing notice"
+grep -qF "Device groups are identifiers for future group targeting" "$CORE" \
+	|| fail "the policies tab lost the device-group foot-note (concept text)"
+grep -qF "stored, ignored by the current render" "$CORE" \
+	|| fail "the drawer lost the device-group staged-future badge"
+grep -qF "Domain list edits apply via reload - live connections stay up" "$CORE" \
+	|| fail "the apply card lost the honest reload chip"
+grep -qF "Referenced by %d policy(s) - unlink them first." "$CORE" \
+	|| fail "the domains tab lost the policy-ref delete guard (#87)"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

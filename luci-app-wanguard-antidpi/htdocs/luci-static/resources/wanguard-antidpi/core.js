@@ -4,10 +4,12 @@
  * per refresh plus the strategy-words exec (engine-cmdline), with the
  * heavier probes (apply --check, apply) strictly on-demand behind their
  * buttons. The browser never touches nft/logread directly; its only direct
- * UCI verbs are the Domain lists editor's staging (#82) and the Tunnel
- * protection editor's staging (#83 - both client-side via the uci client,
- * applied through the same save -> apply(5) -> CLI apply pipeline as the
- * pending bar) and the bar's Discard (uci revert, config-scoped).
+ * UCI verbs are the Domain lists editor's staging (#82), the Tunnel
+ * protection editor's staging (#83), the Profiles editor's staging
+ * (#84/#85) and the Policies editor's staging (#87 - all client-side via
+ * the uci client, applied through the same save -> apply(5) -> CLI apply
+ * pipeline as the pending bar) and the bar's Discard (uci revert,
+ * config-scoped).
  *
  * Degradation contract (#76/#81): nothing throws on missing surfaces. An
  * old or missing CLI (the pre-status packages, a denied ACL) resolves to
@@ -61,6 +63,9 @@ var state = {
 	checkBusy: false,
 	applyBusy: false,
 	discardBusy: false,
+	configChanged: false, /* a config-change cycle just committed/reverted - the
+	                           next update() rebuilds the editor tabs too (their
+	                           after-config renders used the stale status) */
 	domains: {          /* Domain lists tab (#82): client-side staged editor */
 		loaded: false,    /* the uci config has been read at least once */
 		dirty: false,     /* staged edits awaiting the apply pipeline */
@@ -86,6 +91,20 @@ var state = {
 		draft: null,      /* new-profile drawer draft: { name, proto, wordsText, color } */
 		errors: {},       /* inline validation errors, per profile (and 'editor') */
 		inputs: {}        /* per-profile words textarea + name input texts */
+	},
+	policies: {         /* Policies tab (#87): table + drawer staged editor */
+		loaded: false,    /* the uci config has been read at least once */
+		dirty: false,     /* staged edits awaiting the apply pipeline */
+		origArgvKey: null,  /* committed policy argv key at load (restart-badge detect) */
+		deleteArm: null,  /* sid armed for the two-step policy delete */
+		menuOpen: null,   /* sid of the open row actions menu (the «…» column) */
+		search: '',       /* table search text (client-side filter) */
+		editor: null,     /* drawer: { sid: 'new'|<sid>, advanced: bool } or null */
+		draft: null,      /* new-policy drawer draft: { name, device_group, domainlist,
+		                       proto[], action, profile, enabled } */
+		dragSid: null,    /* row sid held by the HTML5 drag (reorder on drop) */
+		errors: {},       /* inline validation errors, per policy (and 'editor') */
+		inputs: {}        /* per-policy name/device_group/priority input texts */
 	},
 	busy: false
 };
@@ -157,7 +176,10 @@ var CSS = [
 	".wg-ad-dot-gray { background:#6B7280; }",
 	".wg-ad-editor { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-left:4px solid rgba(128,128,128,.45); border-radius:6px; padding:1em; margin:0 0 .9em; }",
 	".wg-ad-presetrow { display:flex; gap:.5em; align-items:center; flex-wrap:wrap; margin:.4em 0; }",
-	".wg-ad-words { width:100%; min-height:7em; font-family:monospace; font-size:.85em; white-space:pre; }"
+	".wg-ad-words { width:100%; min-height:7em; font-family:monospace; font-size:.85em; white-space:pre; }",
+	".wg-ad-rowmenu { display:flex; gap:.5em; align-items:center; flex-wrap:wrap; padding:.3em 0 .45em .7em; margin-left:.4em; border-left:2px solid rgba(128,128,128,.35); }",
+	".wg-ad-polrow { cursor:grab; }",
+	".wg-ad-search { min-width:16em; }"
 ].join('\n');
 
 /* ---------- status fetching / parsing ---------- */
@@ -694,9 +716,11 @@ function discardPending() {
 		state.discardBusy = false;
 		state.busy = false;
 		uci.unload('wanguard-antidpi');
+		state.configChanged = true;
 		domainsAfterConfigChange();
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
+		policiesAfterConfigChange();
 		ui.changes.init();
 		return refresh().then(update);
 	}).catch(function(e) {
@@ -725,9 +749,11 @@ function reviewApply() {
 		state.busy = false;
 		ui.addNotification(null, E('p', {}, [ applyNotice(res) ]), applySeverity(res));
 		ui.changes.init();
+		state.configChanged = true;
 		domainsAfterConfigChange();
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
+		policiesAfterConfigChange();
 		return refresh().then(update);
 	}).catch(function(e) {
 		state.applyBusy = false;
@@ -953,6 +979,15 @@ function domainsCreateList() {
 }
 
 function domainsDeleteList(sid) {
+	/* policy-ref guard (#87): a delete must never orphan a policy - the
+	 * render would die loudly at apply time (the #86 contract) */
+	var used = domainsPolicyUse(sid);
+	if (used > 0) {
+		state.domains.errors[sid] = _('Referenced by %d policy(s) - unlink them first.').format(used);
+		state.domains.deleteArm = null;
+		renderDomains();
+		return;
+	}
 	if (state.domains.deleteArm != sid) {
 		state.domains.deleteArm = sid;
 		renderDomains();
@@ -1014,9 +1049,7 @@ function domainsListPanel(model, l) {
 		])
 	]);
 	panel.appendChild(kvRow(_('Used by policies'), [
-		(l.policies > 0) ? '%d'.format(l.policies) : _('—'),
-		' ',
-		E('span', { 'class': 'wg-ad-hint' }, [ _('(policy references arrive in a later release)') ])
+		(l.policies > 0) ? '%d'.format(l.policies) : _('—')
 	]));
 
 	if (l.domains.length == 0) {
@@ -2342,6 +2375,889 @@ function renderProfiles() {
 	});
 }
 
+/* ---------- policies tab (#87) ---------- */
+
+/* ordered match -> action policies (config policy, the #86 render
+ * contract): the sections render as the FIRST engine profile blocks,
+ * ordered by `option priority` ascending (ties keep the section file
+ * order), the global strategy catch-all last; first match wins. The
+ * editor stages client-side through the uci client (the #82/#83/#85
+ * lifecycle) and applies through the shared save -> apply(5) -> CLI apply
+ * pipeline. Priority/order/action/protocol/ref/enabled edits drift the
+ * engine argv -> the honest badge is a restart; name and device_group are
+ * metadata (never in the argv). `device_group` is staged-future (#86):
+ * stored and shown, ignored by the render - no client identity survives
+ * in the queue (the foot-note says so). */
+
+var POLICY_ACTIONS = [ 'strategy', 'bypass', 'none' ];
+var POLICY_PROTOS = [ 'tcp', 'udp', 'quic' ];
+
+function policiesMarkDirty() {
+	state.policies.dirty = true;
+}
+
+/* the tab's view model: the staged UCI sections (client-side staging
+ * included - the same staged-first contract as every editor) plus the
+ * reference targets for the drawer (domain lists / profiles) and the
+ * committed render count from the status document */
+function policiesModel() {
+	var lists = (uci.sections('wanguard-antidpi', 'domainlist') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			label: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name']
+		};
+	});
+	var profiles = (uci.sections('wanguard-antidpi', 'profile') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			name: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name']
+		};
+	});
+	var sections = (uci.sections('wanguard-antidpi', 'policy') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			name: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name'],
+			priority: (typeof s.priority == 'string' && /^[0-9]+$/.test(s.priority))
+				? s.priority : '100',
+			domainlist: (typeof s.domainlist == 'string') ? s.domainlist : '',
+			proto: (function(v) {
+				var out = [];
+				(typeof v == 'string' ? v.split(' ') : []).forEach(function(t) {
+					if (t.length && POLICY_PROTOS.indexOf(t) >= 0 && out.indexOf(t) < 0)
+						out.push(t);
+				});
+				return out;
+			})(s.proto),
+			device_group: (typeof s.device_group == 'string') ? s.device_group : '',
+			action: (POLICY_ACTIONS.indexOf(s.action) >= 0) ? s.action : '',
+			profile: (typeof s.profile == 'string') ? s.profile : '',
+			enabled: (s.enabled != null) ? (s.enabled == '1') : true
+		};
+	});
+	/* render order = priority ascending, ties keep the section file order -
+	 * the exact mirror of the CLI's policy_render insertion sort */
+	var ordered = sections.slice();
+	for (var i = 1; i < ordered.length; i++) {
+		var p = ordered[i];
+		var j = i - 1;
+		while (j >= 0 && parseInt(ordered[j].priority, 10) > parseInt(p.priority, 10)) {
+			ordered[j + 1] = ordered[j];
+			j--;
+		}
+		ordered[j + 1] = p;
+	}
+	var rendered = 0;
+	if (state.status != null && state.status.engine != null &&
+	    state.status.engine.policies != null)
+		rendered = state.status.engine.policies;
+	return {
+		lists: lists,
+		profiles: profiles,
+		sections: sections,
+		ordered: ordered,
+		rendered: rendered
+	};
+}
+
+/* the derived argv key: the ENABLED policies in priority order, each block
+ * identified by [action, list-ref, protocol, profile-ref] - the exact
+ * mirror of what engine_argv renders (disabled policies render nothing,
+ * the priority NUMBER itself is not in the argv, only the block ORDER is;
+ * a same-content reorder therefore flips the key exactly like the engine
+ * decision does) */
+function policiesArgvKey(m) {
+	var parts = [];
+	m.ordered.forEach(function(p) {
+		if (!p.enabled)
+			return;
+		parts.push([ p.action, p.domainlist,
+			p.proto.slice().sort().join(','), p.profile ].join('|'));
+	});
+	return parts.join('\u0001');
+}
+
+/* 'pol_media'-style stable section id derived from the label (the #82/#85
+ * slug contract: refs go by section name) */
+function policiesSlug(label) {
+	var base = ('pol_' + label.toLowerCase().replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '')).replace(/^pol_pol/, 'pol').slice(0, 48);
+	var sid = base, n = 2;
+	while (uci.get('wanguard-antidpi', sid) != null) {
+		sid = base + '_' + n;
+		n++;
+	}
+	return sid;
+}
+
+/* the drawer's ref validation - the exact mirror of the CLI's policy_render
+ * checks, run BEFORE anything is staged (the issue criterion: a missing
+ * list/profile is an inline error, never a staged ref) */
+function policiesValidateDraft(d, m) {
+	if (POLICY_ACTIONS.indexOf(d.action) < 0)
+		return _('Choose an action (strategy, bypass or none).');
+	if (!d.domainlist || !m.lists.some(function(l) { return l.sid == d.domainlist; }))
+		return _('The domain list does not exist - pick one from the Domain lists tab.');
+	if (!d.proto.length)
+		return _('Pick at least one protocol (TCP/UDP/QUIC).');
+	if (d.action == 'strategy') {
+		if (!d.profile)
+			return _('Strategy policies need a strategy profile.');
+		if (!m.profiles.some(function(p) { return p.sid == d.profile; }))
+			return _('The strategy profile does not exist - pick one from the Profiles tab.');
+	}
+	return null;
+}
+
+/* one drawer field change on an existing policy: validated BEFORE staging
+ * (refs must exist), otherwise an inline error and nothing staged */
+function policiesSetField(sid, field, value) {
+	var m = policiesModel();
+	var p = m.sections.filter(function(s) { return s.sid == sid; })[0];
+	if (!p)
+		return;
+	var err = null;
+	if (field == 'action') {
+		if (POLICY_ACTIONS.indexOf(value) < 0)
+			err = _('Choose an action (strategy, bypass or none).');
+	}
+	else if (field == 'domainlist') {
+		if (!m.lists.some(function(l) { return l.sid == value; }))
+			err = _('The domain list does not exist - pick one from the Domain lists tab.');
+	}
+	else if (field == 'profile') {
+		if (!m.profiles.some(function(x) { return x.sid == value; }))
+			err = _('The strategy profile does not exist - pick one from the Profiles tab.');
+	}
+	if (err != null) {
+		state.policies.errors[sid] = err;
+		renderPolicies();
+		return;
+	}
+	delete state.policies.errors[sid];
+	uci.set('wanguard-antidpi', sid, field, value);
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+/* protocol toggles ride in one space-separated option (the same staging
+ * contract as the profile proto); the last remaining protocol cannot be
+ * unchecked (the render dies on an empty proto - keep it unreachable) */
+function policiesToggleProto(sid, token) {
+	var cur = uci.get('wanguard-antidpi', sid, 'proto') || '';
+	var has = [];
+	cur.split(' ').forEach(function(t) {
+		if (t.length && POLICY_PROTOS.indexOf(t) >= 0 && has.indexOf(t) < 0)
+			has.push(t);
+	});
+	var next = has.filter(function(t) { return t != token; });
+	if (next.length == has.length)
+		next.push(token);
+	if (!next.length) {
+		state.policies.errors[sid] = _('At least one protocol is required.');
+		renderPolicies();
+		return;
+	}
+	delete state.policies.errors[sid];
+	next.sort();
+	uci.set('wanguard-antidpi', sid, 'proto', next.join(' '));
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+/* metadata fields stage silently (never in the argv); the priority is
+ * numeric with the documented default fallback */
+function policiesSetName(sid, text) {
+	uci.set('wanguard-antidpi', sid, 'name', text);
+	policiesMarkDirty();
+	/* no re-render: the input keeps the focus while typing (the #85 rule) */
+}
+
+function policiesSetDeviceGroup(sid, text) {
+	uci.set('wanguard-antidpi', sid, 'device_group', text);
+	policiesMarkDirty();
+	/* no re-render (typing) */
+}
+
+function policiesSetPriority(sid, text) {
+	if (!/^[0-9]+$/.test(text)) {
+		state.policies.errors[sid] = _('Priority must be a whole number.');
+		renderPolicies();
+		return;
+	}
+	delete state.policies.errors[sid];
+	uci.set('wanguard-antidpi', sid, 'priority', text);
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+/* enable/disable without deletion - a plain staged option flip (a disabled
+ * policy renders no block, so the toggle drifts the argv exactly when the
+ * policy was contributing one) */
+function policiesSetEnabled(sid, on) {
+	uci.set('wanguard-antidpi', sid, 'enabled', on ? '1' : '0');
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+/* reorder plumbing: the ordered-table sequence is rebuilt and the
+ * priorities are RENUMBERED in the step-10 convention (design §2: the
+ * priority value is UI-owned; distinct values keep the render order
+ * unambiguous). Both the up/down fallback buttons and the drag drop land
+ * here. */
+function policiesRenumber(sids) {
+	sids.forEach(function(s, i) {
+		uci.set('wanguard-antidpi', s, 'priority', String((i + 1) * 10));
+	});
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+function policiesReorder(sid, dir) {
+	var sids = policiesModel().ordered.map(function(p) { return p.sid; });
+	var i = sids.indexOf(sid);
+	var j = i + dir;
+	if (i < 0 || j < 0 || j >= sids.length)
+		return;
+	var t = sids[i];
+	sids[i] = sids[j];
+	sids[j] = t;
+	policiesRenumber(sids);
+}
+
+/* HTML5 drag reorder: the dragged row lands BEFORE the drop target (the
+ * same one-direction semantics as the up button) */
+function policiesDrop(sid, targetSid) {
+	var sids = policiesModel().ordered.map(function(p) { return p.sid; });
+	var from = sids.indexOf(sid);
+	var to = sids.indexOf(targetSid);
+	if (from < 0 || to < 0 || from == to)
+		return;
+	sids.splice(from, 1);
+	to = sids.indexOf(targetSid);
+	sids.splice(to, 0, sid);
+	policiesRenumber(sids);
+}
+
+function policiesNextPriority(m) {
+	var max = 0;
+	m.sections.forEach(function(p) {
+		var v = parseInt(p.priority, 10);
+		if (v > max)
+			max = v;
+	});
+	return max + 10;
+}
+
+/* create a policy from the drawer draft (the full validation runs first -
+ * invalid input is never staged, the #86 render contract stays reachable
+ * only through hand-edited UCI) */
+function policiesAddPolicy() {
+	var d = state.policies.draft || {};
+	var m = policiesModel();
+	var label = (d.name || '').trim();
+	if (label.length == 0) {
+		state.policies.errors.editor = _('Enter a policy name.');
+		renderPolicies();
+		return;
+	}
+	var err = policiesValidateDraft(d, m);
+	if (err != null) {
+		state.policies.errors.editor = err;
+		renderPolicies();
+		return;
+	}
+	delete state.policies.errors.editor;
+	var sid = policiesSlug(label);
+	uci.add('wanguard-antidpi', 'policy', sid);
+	uci.set('wanguard-antidpi', sid, 'name', label);
+	uci.set('wanguard-antidpi', sid, 'priority', String(policiesNextPriority(m)));
+	uci.set('wanguard-antidpi', sid, 'domainlist', d.domainlist);
+	uci.set('wanguard-antidpi', sid, 'proto', d.proto.slice().sort().join(' '));
+	uci.set('wanguard-antidpi', sid, 'action', d.action);
+	if (d.action == 'strategy')
+		uci.set('wanguard-antidpi', sid, 'profile', d.profile);
+	if (typeof d.device_group == 'string' && d.device_group.length)
+		uci.set('wanguard-antidpi', sid, 'device_group', d.device_group);
+	uci.set('wanguard-antidpi', sid, 'enabled', (d.enabled === false) ? '0' : '1');
+	state.policies.editor = null;
+	state.policies.draft = null;
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+function policiesDeletePolicy(sid) {
+	if (state.policies.deleteArm != sid) {
+		state.policies.deleteArm = sid;
+		renderPolicies();
+		return;
+	}
+	uci.remove('wanguard-antidpi', sid);
+	state.policies.deleteArm = null;
+	if (state.policies.menuOpen == sid)
+		state.policies.menuOpen = null;
+	if (state.policies.editor && state.policies.editor.sid == sid)
+		state.policies.editor = null;
+	policiesMarkDirty();
+	renderPolicies();
+}
+
+/* ---------- policies drawer (#87) ---------- */
+
+function policiesOpenEditor(sid) {
+	state.policies.deleteArm = null;
+	state.policies.menuOpen = null;
+	if (sid == 'new')
+		state.policies.draft = {
+			name: '', device_group: '', domainlist: '',
+			proto: [ 'tcp' ], action: 'bypass', profile: '', enabled: true
+		};
+	else
+		delete state.policies.inputs[sid + '.priority'];
+	state.policies.editor = { sid: sid, advanced: false };
+	delete state.policies.errors.editor;
+	renderPolicies();
+}
+
+function policiesCloseEditor() {
+	state.policies.editor = null;
+	state.policies.draft = null;
+	delete state.policies.errors.editor;
+	renderPolicies();
+}
+
+function policiesToggleAdvanced() {
+	if (state.policies.editor)
+		state.policies.editor.advanced = !state.policies.editor.advanced;
+	renderPolicies();
+}
+
+/* ---------- policies apply ---------- */
+
+/* the shared pipeline with the editor's one client-side guard: a staged
+ * enabled policy with a broken ref/action/proto would die at render time
+ * (the #86 loud fail) - block it here with a named explanation instead */
+function policiesApply() {
+	var m = policiesModel();
+	var broken = null;
+	m.sections.forEach(function(p) {
+		if (!p.enabled || broken != null)
+			return;
+		if (POLICY_ACTIONS.indexOf(p.action) < 0)
+			broken = _('Policy "%s": the action is not set.').format(p.name);
+		else if (!p.domainlist || !m.lists.some(function(l) { return l.sid == p.domainlist; }))
+			broken = _('Policy "%s": the domain list is missing.').format(p.name);
+		else if (!p.proto.length)
+			broken = _('Policy "%s": pick at least one protocol.').format(p.name);
+		else if (p.action == 'strategy' &&
+		    (!p.profile || !m.profiles.some(function(x) { return x.sid == p.profile; })))
+			broken = _('Policy "%s": the strategy profile is missing.').format(p.name);
+	});
+	if (broken != null) {
+		ui.addNotification(null, E('p', {}, broken), 'error');
+		return;
+	}
+	reviewApply();
+}
+
+/* drop the client-side staged edits (committed truth untouched); the
+ * shared pending-bar Discard covers the router-side deltas */
+function policiesDiscardEdits() {
+	state.policies.dirty = false;
+	state.policies.origArgvKey = null;
+	state.policies.deleteArm = null;
+	state.policies.menuOpen = null;
+	state.policies.editor = null;
+	state.policies.draft = null;
+	state.policies.dragSid = null;
+	state.policies.errors = {};
+	state.policies.inputs = {};
+	state.policies.search = '';
+	uci.unload('wanguard-antidpi');
+	renderPolicies();
+}
+
+/* after the shared pipeline committed (or the router deltas were reverted),
+ * the editor starts clean from the committed truth */
+function policiesAfterConfigChange() {
+	state.policies.dirty = false;
+	state.policies.origArgvKey = null;
+	state.policies.deleteArm = null;
+	state.policies.menuOpen = null;
+	state.policies.editor = null;
+	state.policies.draft = null;
+	state.policies.dragSid = null;
+	state.policies.errors = {};
+	state.policies.inputs = {};
+	if (state.activeTab == 'policies')
+		renderPolicies();
+}
+
+/* ---------- policies view (#87) ---------- */
+
+/* the client-side table filter: name/id/action/refs/protocols against the
+ * search box (case-insensitive substring) */
+function policiesFilter(m) {
+	var q = (state.policies.search || '').trim().toLowerCase();
+	if (!q.length)
+		return m.ordered;
+	return m.ordered.filter(function(p) {
+		return [ p.name, p.sid, p.action, p.domainlist, p.profile,
+			p.proto.join(' ') ].join(' ').toLowerCase().indexOf(q) >= 0;
+	});
+}
+
+function policiesSelectField(label, current, entries, onPick, allowEmpty, emptyLabel) {
+	/* the drawer's select: validated staging happens in onPick; the value
+	 * assignment keeps the rendered selection in sync across re-renders */
+	var sel = E('select', {
+		'change': function(ev) { onPick(ev.target.value); }
+	});
+	if (allowEmpty)
+		sel.appendChild(E('option', { 'value': '' }, [ emptyLabel || _('—') ]));
+	entries.forEach(function(e) {
+		sel.appendChild(E('option', { 'value': e.sid }, [ e.label || e.name ]));
+	});
+	sel.value = current || '';
+	return E('div', { 'class': 'wg-ad-addrow' }, [
+		E('span', { 'class': 'wg-ad-kv-label' }, [ label ]),
+		sel
+	]);
+}
+
+function policiesStrategyCellText(p, m) {
+	if (p.action == 'bypass')
+		return _('pass unmodified');
+	if (p.action == 'none')
+		return _('—');
+	if (p.action == 'strategy') {
+		var prof = m.profiles.filter(function(x) { return x.sid == p.profile; })[0];
+		return (prof != null) ? prof.name : _('missing profile');
+	}
+	return _('not set');
+}
+
+function policiesRow(m, p) {
+	var menuOpen = (state.policies.menuOpen == p.sid);
+	var armed = (state.policies.deleteArm == p.sid);
+	var list = m.lists.filter(function(l) { return l.sid == p.domainlist; })[0];
+	var wrap = E([]);
+	var tr = E('tr', { 'class': 'wg-ad-polrow', 'draggable': 'true' });
+	tr.addEventListener('dragstart', function() { state.policies.dragSid = p.sid; });
+	tr.addEventListener('dragover', function(ev) {
+		if (ev && ev.preventDefault)
+			ev.preventDefault();
+	});
+	tr.addEventListener('drop', function() {
+		if (state.policies.dragSid != null && state.policies.dragSid != p.sid)
+			policiesDrop(state.policies.dragSid, p.sid);
+		state.policies.dragSid = null;
+	});
+	tr.appendChild(E('td', {}, [
+		E('span', { 'class': 'wg-ad-chip wg-ad-chip-muted' }, [ p.priority ])
+	]));
+	/* match: the policy name + the scoped list + the protocol badges (the
+	 * block filters come from the policy proto - one filter source per
+	 * block, #86) */
+	var matchCell = E('td', {}, [
+		E('strong', {}, [ p.name ]),
+		' ',
+		(list != null) ? list.label : _('missing list')
+	]);
+	p.proto.forEach(function(t) {
+		matchCell.appendChild(E('span', { 'class': 'wg-ad-chip wg-ad-chip-muted' },
+			[ t.toUpperCase() ]));
+	});
+	tr.appendChild(matchCell);
+	tr.appendChild(E('td', {}, [ policiesStrategyCellText(p, m) ]));
+	/* state: the honest enabled badge (staged flips show immediately) */
+	tr.appendChild(E('td', {}, [ chipEl(p.enabled
+		? { cls: 'wg-ad-chip-ok', label: _('Enabled') }
+		: { cls: 'wg-ad-chip-muted', label: _('Disabled') }) ]));
+	/* the «…» column: a per-row actions menu */
+	tr.appendChild(E('td', {}, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'title': _('Row actions'),
+			'click': ui.createHandlerFn(null, function() {
+				state.policies.menuOpen = menuOpen ? null : p.sid;
+				renderPolicies();
+			})
+		}, [ '⋯' ])
+	]));
+	wrap.appendChild(tr);
+	if (menuOpen) {
+		var menu = E('div', { 'class': 'wg-ad-rowmenu' });
+		menu.appendChild(E('button', {
+			'class': 'btn cbi-button',
+			'title': _('Move up (drag fallback)'),
+			'disabled': (m.ordered[0] && m.ordered[0].sid == p.sid) ? '' : null,
+			'click': ui.createHandlerFn(null, function() { policiesReorder(p.sid, -1); })
+		}, [ '↑ ' + _('Move up') ]));
+		menu.appendChild(E('button', {
+			'class': 'btn cbi-button',
+			'title': _('Move down (drag fallback)'),
+			'disabled': (m.ordered[m.ordered.length - 1] &&
+				m.ordered[m.ordered.length - 1].sid == p.sid) ? '' : null,
+			'click': ui.createHandlerFn(null, function() { policiesReorder(p.sid, 1); })
+		}, [ '↓ ' + _('Move down') ]));
+		menu.appendChild(E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { policiesOpenEditor(p.sid); })
+		}, [ _('Edit') ]));
+		menu.appendChild(E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() {
+				policiesSetEnabled(p.sid, !p.enabled);
+			})
+		}, [ p.enabled ? _('Disable') : _('Enable') ]));
+		menu.appendChild(E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, function() { policiesDeletePolicy(p.sid); })
+		}, [ armed ? _('Confirm delete?') : _('Delete') ]));
+		wrap.appendChild(menu);
+	}
+	if (state.policies.errors[p.sid] != null) {
+		wrap.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.policies.errors[p.sid] ]));
+		delete state.policies.errors[p.sid];
+	}
+	return wrap;
+}
+
+function policiesEditorPanel(m) {
+	var edv = state.policies.editor;
+	var isNew = (edv.sid == 'new');
+	var p = null;
+	if (!isNew) {
+		m.sections.forEach(function(s) {
+			if (s.sid == edv.sid)
+				p = s;
+		});
+		if (!p) /* the section vanished (deleted from another view) */
+			return null;
+	}
+	var panel = E('div', { 'class': 'wg-ad-editor' }, [
+		E('h3', {}, [ isNew ? _('New policy') : _('Edit policy: %s').format(p.name) ])
+	]);
+
+	/* name */
+	var nameVal = isNew
+		? function() { return state.policies.draft.name; }
+		: function() { return state.policies.inputs[p.sid + '.name'] || p.name; };
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('Policy name'),
+		'input': function(ev) {
+			if (isNew)
+				state.policies.draft.name = ev.target.value;
+			else {
+				state.policies.inputs[p.sid + '.name'] = ev.target.value;
+				policiesSetName(p.sid, ev.target.value);
+			}
+		}
+	});
+	nameInput.value = nameVal();
+	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [ nameInput ]));
+
+	/* device group (staged-future: stored and shown, ignored by the render) */
+	var dgVal = isNew
+		? function() { return state.policies.draft.device_group; }
+		: function() { return state.policies.inputs[p.sid + '.dg'] || p.device_group; };
+	var dgInput = E('input', {
+		'type': 'text',
+		'placeholder': _('Device group (optional)'),
+		'input': function(ev) {
+			if (isNew)
+				state.policies.draft.device_group = ev.target.value;
+			else {
+				state.policies.inputs[p.sid + '.dg'] = ev.target.value;
+				policiesSetDeviceGroup(p.sid, ev.target.value);
+			}
+		}
+	});
+	dgInput.value = dgVal();
+	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		dgInput,
+		chipEl({ cls: 'wg-ad-chip-muted', label: _('stored, ignored by the current render'),
+			title: _('Staged-future: the field is kept in UCI for group targeting when the queue learns client identity') })
+	]));
+
+	/* domain list select (the match scope) */
+	var listPick = isNew
+		? function(v) { state.policies.draft.domainlist = v; renderPolicies(); }
+		: function(v) { policiesSetField(p.sid, 'domainlist', v); };
+	panel.appendChild(policiesSelectField(_('Domain list'),
+		isNew ? state.policies.draft.domainlist : p.domainlist,
+		m.lists, listPick, true, _('Pick a list…')));
+
+	/* protocol toggles */
+	var protoRow = E('div', { 'class': 'wg-ad-chips' }, [
+		E('span', { 'class': 'wg-ad-hint' }, [ _('Protocols (block filters):') ])
+	]);
+	var protoCurrent = isNew ? state.policies.draft.proto : p.proto;
+	POLICY_PROTOS.forEach(function(tok) {
+		protoRow.appendChild(E('button', {
+			'class': 'btn cbi-button' + ((protoCurrent.indexOf(tok) >= 0) ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() {
+				if (isNew) {
+					var a = state.policies.draft.proto;
+					var i = a.indexOf(tok);
+					if (i >= 0) {
+						if (a.length == 1) {
+							state.policies.errors.editor = _('At least one protocol is required.');
+							renderPolicies();
+							return;
+						}
+						a.splice(i, 1);
+					}
+					else
+						a.push(tok);
+					delete state.policies.errors.editor;
+					renderPolicies();
+				}
+				else
+					policiesToggleProto(p.sid, tok);
+			})
+		}, [ tok.toUpperCase() ]));
+	});
+	panel.appendChild(protoRow);
+
+	/* action select */
+	var actionPick = isNew
+		? function(v) { state.policies.draft.action = v; renderPolicies(); }
+		: function(v) { policiesSetField(p.sid, 'action', v); };
+	panel.appendChild(policiesSelectField(_('Action'),
+		isNew ? state.policies.draft.action : p.action,
+		POLICY_ACTIONS.map(function(a) {
+			return { sid: a, label: (a == 'strategy') ? _('strategy - desync with a profile')
+				: (a == 'bypass') ? _('bypass - pass unmodified')
+				: _('none - no block (fall through)') };
+		}), actionPick, false));
+
+	/* strategy profile select (visible for strategy actions only) */
+	var actionCur = isNew ? state.policies.draft.action : p.action;
+	if (actionCur == 'strategy') {
+		var profPick = isNew
+			? function(v) { state.policies.draft.profile = v; renderPolicies(); }
+			: function(v) { policiesSetField(p.sid, 'profile', v); };
+		var profCur = isNew ? state.policies.draft.profile : p.profile;
+		panel.appendChild(policiesSelectField(_('Strategy profile'),
+			profCur, m.profiles, profPick, true, _('Pick a profile…')));
+		if (!profCur)
+			panel.appendChild(E('div', { 'class': 'wg-ad-error' }, [
+				_('Strategy policies need a strategy profile.')
+			]));
+	}
+
+	/* enable policy */
+	var enabledCheck = E('input', { 'type': 'checkbox' });
+	enabledCheck.checked = isNew ? state.policies.draft.enabled : p.enabled;
+	enabledCheck.addEventListener('change', function(ev) {
+		if (isNew)
+			state.policies.draft.enabled = ev.target.checked;
+		else
+			policiesSetEnabled(p.sid, ev.target.checked);
+	});
+	panel.appendChild(E('div', { 'class': 'wg-ad-chips' }, [
+		E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('Enable policy') ])
+	]));
+
+	/* advanced (collapse): the manual priority override - normal
+	 * reordering happens through drag / the up-down fallback */
+	panel.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, policiesToggleAdvanced)
+		}, [ edv.advanced ? _('Hide advanced') : _('Advanced') ])
+	]));
+	if (edv.advanced && !isNew) {
+		var prInput = E('input', {
+			'type': 'text',
+			'placeholder': _('Priority (lower = earlier)'),
+			'input': function(ev) { state.policies.inputs[p.sid + '.priority'] = ev.target.value; }
+		});
+		prInput.value = state.policies.inputs[p.sid + '.priority'] || p.priority;
+		panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+			prInput,
+			E('button', {
+				'class': 'btn cbi-button',
+				'click': ui.createHandlerFn(null, function() {
+					policiesSetPriority(p.sid, (state.policies.inputs[p.sid + '.priority'] != null)
+						? state.policies.inputs[p.sid + '.priority'] : String(p.priority));
+				})
+			}, [ _('Set') ])
+		]));
+		panel.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('Manual priority override - normal reordering happens by dragging rows or with the row menu arrows.')
+		]));
+	}
+
+	if (state.policies.errors.editor != null)
+		panel.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.policies.errors.editor ]));
+
+	/* footer actions */
+	var footer = [];
+	if (isNew) {
+		footer.push(E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, policiesAddPolicy)
+		}, [ _('Create policy') ]));
+	}
+	footer.push(E('button', {
+		'class': 'btn cbi-button',
+		'click': ui.createHandlerFn(null, policiesCloseEditor)
+	}, [ isNew ? _('Cancel') : _('Close') ]));
+	panel.appendChild(E('div', { 'class': 'wg-ad-actions' }, footer));
+	return panel;
+}
+
+function buildPoliciesView() {
+	var m = policiesModel();
+	var frag = E([]);
+
+	/* the concept's standing notice */
+	frag.appendChild(E('div', { 'class': 'alert-message' }, [
+		E('p', {}, [ _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
+	]));
+
+	/* the processing table (concept: Priority / Match / Strategy / State /
+	 * «…»): drag-priority with the up/down fallback in the row menu */
+	var list = E('div', { 'class': 'wg-ad-panel' });
+	var searchInput = E('input', {
+		'type': 'text',
+		'class': 'wg-ad-search',
+		'placeholder': _('Search policies'),
+		'input': function(ev) { state.policies.search = ev.target.value; },
+		'change': function(ev) {
+			state.policies.search = ev.target.value;
+			renderPolicies();
+		}
+	});
+	searchInput.value = state.policies.search || '';
+	list.appendChild(E('div', { 'class': 'wg-ad-head' }, [
+		E('h3', {}, [ _('Processing policies'), ' ',
+			chipEl({ cls: 'wg-ad-chip-muted', label: '%d rendered'.format(m.rendered),
+				title: _('Committed block count from the status document - first match wins, catch-all last') }),
+			(m.rendered > 0) ? chipEl({ cls: 'wg-ad-chip-ok', label: _('Desync scoped by policies') }) : E([]) ]),
+		E('div', { 'class': 'wg-ad-actions' }, [
+			searchInput,
+			E('button', {
+				'class': 'btn cbi-button cbi-button-action',
+				'click': ui.createHandlerFn(null, function() { policiesOpenEditor('new'); })
+			}, [ _('Add policy') ])
+		])
+	]));
+	var filtered = policiesFilter(m);
+	var table = E('table', { 'class': 'wg-ad-table' }, [
+		E('tr', {}, [
+			E('th', {}, [ _('Priority') ]),
+			E('th', {}, [ _('Match') ]),
+			E('th', {}, [ _('Strategy') ]),
+			E('th', {}, [ _('State') ]),
+			E('th', {}, [ '⋯' ])
+		])
+	]);
+	if (filtered.length == 0)
+		table.appendChild(E('tr', {}, [
+			E('td', { 'colspan': '5' }, [
+				(m.sections.length == 0)
+					? _('No policies configured - all eligible traffic follows the global strategy (the catch-all).')
+					: _('No policies match the search.')
+			])
+		]));
+	filtered.forEach(function(p) {
+		table.appendChild(policiesRow(m, p));
+	});
+	list.appendChild(table);
+	list.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Device groups are identifiers for future group targeting; mihomo DIRECT filtering does not preserve client identity.')
+	]));
+	list.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Order = priority (lower first); the first matching policy wins. Drag rows to reorder or use the row menu arrows. Order/action changes need an engine restart; domain list CONTENT edits apply via reload.')
+	]));
+	frag.appendChild(list);
+
+	/* the drawer (New/Edit) */
+	var panel = (state.policies.editor != null) ? policiesEditorPanel(m) : null;
+	if (panel != null)
+		frag.appendChild(panel);
+
+	/* apply block: the honest badges (order/action/proto/ref/enabled edits
+	 * drift the engine argv -> restart; name/device_group are metadata;
+	 * staged domain-list content edits from the Domain lists tab ride the
+	 * same apply via reload) */
+	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Apply') ])
+	]);
+	var argvChanged = (policiesArgvKey(m) != state.policies.origArgvKey);
+	var anyDirty = state.policies.dirty || state.domains.dirty;
+	if (state.policies.dirty) {
+		if (argvChanged)
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+				label: _('Policy order or actions changed - apply restarts the engine'),
+				title: _('Policy blocks ride in the engine argv: order/action/protocol/ref/enabled changes need a restart to take effect') }));
+		else {
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+				label: _('Metadata only - the engine stays untouched'),
+				title: _('Name and device-group edits do not appear in the engine argv') }));
+			if (state.domains.dirty)
+				applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+					label: _('Domain list edits apply via reload - live connections stay up'),
+					title: _('SIGHUP re-reads the hostlist files without dropping the queue or connections') }));
+		}
+	}
+	else if (state.domains.dirty) {
+		applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+			label: _('Domain list edits apply via reload - live connections stay up'),
+			title: _('SIGHUP re-reads the hostlist files without dropping the queue or connections') }));
+	}
+	else {
+		applyCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No unsaved edits.') ]));
+	}
+	applyCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, policiesApply),
+			'disabled': (!anyDirty || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, policiesDiscardEdits),
+			'disabled': (!state.policies.dirty) ? '' : null
+		}, [ _('Discard edits') ])
+	]));
+	frag.appendChild(applyCard);
+	return frag;
+}
+
+/* the tab body renders once per switch (and after applies) - NOT per poll
+ * tick: a rebuild would blow away in-progress edits (the #82 rule). The
+ * LuCI uci client is read through a lazy load; a failure renders the
+ * honest warn card. */
+function renderPolicies() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.setAttribute('data-unavail', 'false');
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'policies' || !state.bodyNode)
+			return;
+		if (state.policies.origArgvKey == null)
+			state.policies.origArgvKey = policiesArgvKey(policiesModel());
+		state.policies.loaded = true;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(buildPoliciesView());
+	}).catch(function(e) {
+		if (state.activeTab != 'policies' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).').format((e && e.message) || 'error') ])
+		]));
+	});
+}
+
 /* ---------- tab frame (issue #80) ---------- */
 
 function buildTabbar() {
@@ -2395,6 +3311,10 @@ function renderBody() {
 		renderProfiles();
 		return;
 	}
+	if (state.activeTab == 'policies') {
+		renderPolicies();
+		return;
+	}
 	if (state.activeTab == 'domains') {
 		renderDomains();
 		return;
@@ -2411,7 +3331,10 @@ function renderBody() {
 }
 
 /* poll tick: refetch the status document, refresh the chips, rebuild the
- * body on an availability flip or while the data-driven Overview is open */
+ * body on an availability flip, while the data-driven Overview is open, or
+ * right after a config-change cycle (the after-config renders of the
+ * editor tabs used the PRE-refresh status - one fresh rebuild is safe
+ * there: the cycle already reset every editor) */
 function update() {
 	var wasUnavailable = (state.bodyNode != null &&
 		state.bodyNode.getAttribute('data-unavail') == 'true');
@@ -2419,7 +3342,9 @@ function update() {
 	if (!state.bodyNode)
 		return;
 	var availChanged = ((!!state.unavailable) != wasUnavailable);
-	if (availChanged || state.activeTab == 'overview')
+	var rebuild = availChanged || state.configChanged;
+	state.configChanged = false;
+	if (rebuild || state.activeTab == 'overview')
 		renderBody();
 }
 
@@ -2482,5 +3407,21 @@ return L.Class.extend({
 	profilesSetWords: profilesSetWords,
 	profilesMove: profilesMove,
 	profilesAdoptLegacy: profilesAdoptLegacy,
-	profilesAfterConfigChange: profilesAfterConfigChange
+	profilesAfterConfigChange: profilesAfterConfigChange,
+	policiesModel: policiesModel,
+	policiesArgvKey: policiesArgvKey,
+	POLICY_ACTIONS: POLICY_ACTIONS,
+	renderPolicies: renderPolicies,
+	buildPoliciesView: buildPoliciesView,
+	policiesOpenEditor: policiesOpenEditor,
+	policiesCloseEditor: policiesCloseEditor,
+	policiesAddPolicy: policiesAddPolicy,
+	policiesSetEnabled: policiesSetEnabled,
+	policiesSetField: policiesSetField,
+	policiesToggleProto: policiesToggleProto,
+	policiesReorder: policiesReorder,
+	policiesDrop: policiesDrop,
+	policiesApply: policiesApply,
+	policiesValidateDraft: policiesValidateDraft,
+	policiesAfterConfigChange: policiesAfterConfigChange
 });

@@ -415,6 +415,19 @@ Status: `wanguard-antidpi status` carries `engine.policies` (rendered block
 count) and `engine.policy_sections` (id/name/priority/domainlist/proto/
 action/profile/enabled) for the LuCI page.
 
+The LuCI page (Network -> WAN Guard -> Anti-DPI -> Policies, issue #87)
+manages the same sections: the Processing policies table (Priority / Match /
+Strategy / State columns, drag-to-reorder with row-menu arrow fallback -
+reorders renumber priorities in the step-10 convention), an Edit-policy
+drawer (name, device group - stored but ignored by the render until the
+queue learns client identity, domain list, protocols, action, strategy
+profile, advanced priority override), inline validation before staging
+(unknown list/profile refs are named errors, never staged), and honest
+apply badges: order/action/protocol/ref/enabled edits restart the engine,
+name/device-group edits are metadata-only, and domain-list content edits
+apply via reload (SIGHUP). Referenced domain lists cannot be deleted from
+the Domain lists tab until the policies referencing them are unlinked.
+
 ## Operations
 
 - **status / diagnostics**: `wanguard-antidpi mark-status` (mihomo
