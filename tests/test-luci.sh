@@ -171,7 +171,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold in the package (issue #80)"
+echo "== [8] page scaffold + overview in the package (issues #80/#81)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -183,6 +183,8 @@ ls -l "$CORE" | grep -q '^-rw-r--r--' || fail "core module must be 0644"
 grep -qF "'require wanguard-antidpi.core as" "$VIEW" \
 	|| fail "view does not require the shared core module"
 grep -qF "'require rpc'" "$CORE" || fail "core module lost the rpc dependency"
+grep -qF "'require uci'" "$CORE" || fail "core module lost the uci dependency (pending bar)"
+grep -qF "'require ui'" "$CORE" || fail "core module lost the ui dependency (notifications)"
 grep -qF "'/usr/bin/wanguard-antidpi'" "$CORE" || fail "core module lost the CLI path"
 grep -qF "'status', '--json'" "$CORE" \
 	|| fail "core module must exec status --json (the #76 surface)"
@@ -191,14 +193,36 @@ grep -qF "L.Class.extend" "$CORE" \
 for tab in overview profiles policies domains tunnel tests; do
 	grep -qF "'$tab'" "$CORE" || fail "tab '$tab' missing from the core tab table"
 done
+# the #81 overview: the on-demand surfaces and the bar's verbs are pinned
+# structurally - the strategy words come from engine-cmdline, validation
+# from apply --check --json, Review & Apply drives the #77 apply, Discard
+# reverts the staged UCI of THIS config only (rpcd uci revert)
+grep -qF "'engine-cmdline'" "$CORE" \
+	|| fail "overview strategy words must come from engine-cmdline"
+grep -qF "'apply', '--check', '--json'" "$CORE" \
+	|| fail "validation must run apply --check --json (the #77 preflight)"
+grep -qF "'apply', '--json'" "$CORE" \
+	|| fail "Review & Apply must run the #77 apply"
+grep -qF "method: 'revert'" "$CORE" \
+	|| fail "Discard must go through rpcd uci revert (config-scoped)"
+grep -qF "'wanguard-antidpi'" "$CORE" \
+	|| fail "uci verbs must target the wanguard-antidpi config only"
+grep -qF "uci.apply(5)" "$CORE" \
+	|| fail "Review & Apply must commit staged UCI (the CLI reads committed only)"
+# the ACL carries the bar's uci verbs (read-side badge re-query + write-side
+# revert/apply/confirm - rpcd checks method AND config against the ACL)
+grep -qF '"uci": [ "get", "changes" ]' /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json \
+	|| fail "ACL read class lost the uci get/changes grant"
+grep -qF '"uci": [ "apply", "confirm", "revert" ]' /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json \
+	|| fail "ACL write class lost the uci apply/confirm/revert grant"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"
 apk del luci-app-wanguard-antidpi >/dev/null
 [ ! -f "$MENU" ] || fail "apk del left the menu file"
 [ ! -f "$ACL" ] || fail "apk del left the acl file"
-[ ! -f "$VIEW" ] || fail "apk del left the view file (#80)"
-[ ! -f "$CORE" ] || fail "apk del left the core module (#80)"
+[ ! -f "$VIEW" ] || fail "apk del left the view file (#80/#81)"
+[ ! -f "$CORE" ] || fail "apk del left the core module (#80/#81)"
 [ -f /usr/share/luci/menu.d/luci-app-wanguard.json ] \
 	|| fail "apk del touched the simulated luci-app-wanguard menu file"
 apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \

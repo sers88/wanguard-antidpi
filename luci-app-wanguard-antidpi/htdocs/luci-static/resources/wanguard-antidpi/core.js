@@ -1,26 +1,29 @@
 /* luci-app-wanguard-antidpi core — the shared engine behind the Anti-DPI
- * page (view/wanguard/antidpi.js, issue #80). Thin client over the
- * `wanguard-antidpi status --json` surface (issue #76): ONE rpc file exec
- * per refresh — the same pattern as the luci-app-wanguard core module.
- * The browser never touches nft/uci/logread directly.
+ * page (view/wanguard/antidpi.js, issues #80/#81). Thin client over the
+ * `wanguard-antidpi` CLI surfaces (#76 status, #77 apply): ONE status exec
+ * per refresh plus the strategy-words exec (engine-cmdline), with the
+ * heavier probes (apply --check, apply) strictly on-demand behind their
+ * buttons. The browser never touches nft/logread directly; its only direct
+ * UCI verbs are the staged-change bar's Discard (uci revert, config-scoped)
+ * and the commit step of Review & Apply (uci save/apply - the luci-app-
+ * wanguard idiom), followed by the CLI apply that renders/loads everything.
  *
- * Degradation contract (#76/#80): nothing throws on missing surfaces. An
+ * Degradation contract (#76/#81): nothing throws on missing surfaces. An
  * old or missing CLI (the pre-status packages, a denied ACL) resolves to
  * the page's "unavailable — update the package" section plus muted chips;
  * a present CLI renders its stable keys. Partial degradations surface as
- * the status document's "degraded" map (a muted hint line under the chips
- * — the per-surface cards belong to their own stages #81–#88).
+ * the status document's "degraded" map or per-card warn lines. Every
+ * overview element shows data from #76/#77 or an explicit unavailable /
+ * not-tested state - never hardcoded example values.
  *
- * This is the SCAFFOLD issue (#80): the header actions, the chips row and
- * the six sub-tab frames (Overview / Profiles / Policies / Domain lists /
- * Tunnel protection / Tests & Logs). The per-tab content lands with its
- * own stage into the same holders. No innerHTML with CLI data: only
- * static strings from THIS file's tables/chips ever reach innerHTML
- * (the status fields go through E() text nodes), same discipline as the
- * luci-app-wanguard core.
+ * No innerHTML with CLI data: only static strings from THIS file's
+ * tables/chips ever reach innerHTML (CLI-derived fields go through E()
+ * text nodes), same discipline as the luci-app-wanguard core.
  */
 'use strict';
 'require rpc';
+'require uci';
+'require ui';
 
 var callCli = rpc.declare({
 	object: 'file',
@@ -29,22 +32,39 @@ var callCli = rpc.declare({
 	expect: { '': {} }
 });
 
+/* Discard of the staged-UCI bar: rpcd's config-scoped revert (our ACL
+ * grants it in the write class; the luCi uci client itself has no revert
+ * wrapper). Only /tmp/.uci deltas for THIS config are cleared. */
+var callUciRevert = rpc.declare({
+	object: 'uci',
+	method: 'revert',
+	params: [ 'config' ],
+	reject: true
+});
+
 var CLI = '/usr/bin/wanguard-antidpi';
 
 /* per-page session state (module closure; one page load = one instance) */
 var state = {
 	status: null,       /* parsed `status --json` document (#76 contract) */
+	strategy: null,     /* { words: [...]|null, error: string|null } from engine-cmdline */
 	unavailable: null,  /* null = loading, false = live, 'exec'/'parse' = degraded */
 	prevPkts: null,     /* queue packets of the previous tick (processing delta) */
 	activeTab: 'overview',
 	tabsNode: null,     /* tab bar holder, set by the view render */
 	chipsNode: null,    /* chips row holder, set by the view render */
 	bodyNode: null,     /* tab body holder, set by the view render */
+	exclusionsOpen: false, /* tunnel exclusions panel toggle (kept across ticks) */
+	checkDoc: null,     /* last `apply --check --json` document (kept across ticks) */
+	checkError: null,   /* rpc failure of the last check run */
+	checkBusy: false,
+	applyBusy: false,
+	discardBusy: false,
 	busy: false
 };
 
 /* sub-tab frame (issue #80): the order of the concept mock; the content of
- * each tab lands with its own stage (#81 overview, #82 domain lists,
+ * each tab lands with its own stage (#81 overview done, #82 domain lists,
  * #83 tunnel protection, #85 profiles, #87 policies, #88 tests & logs) */
 var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'tunnel', 'tests' ];
 
@@ -81,10 +101,20 @@ var CSS = [
 	".wg-ad-chip-warn { background:rgba(234,88,12,.12); color:#c2410c; }",
 	".wg-ad-chip-warn .wg-ad-dot { background:#ea580c; }",
 	".wg-ad-chip-muted { opacity:.6; }",
+	".wg-ad-word { font-family:monospace; font-size:.78em; cursor:default; }",
 	".wg-ad-degraded { font-size:.82em; opacity:.65; margin:0 0 .75em; }",
-	".wg-ad-panel { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-radius:6px; padding:1em; }",
+	".wg-ad-panel { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-radius:6px; padding:1em; margin:0 0 .9em; }",
 	".wg-ad-panel h3 { margin:0 0 .4em; }",
-	".wg-ad-hint { opacity:.55; margin:0; }"
+	".wg-ad-hint { opacity:.55; margin:0; }",
+	".wg-ad-bar { border-left:3px solid #ea580c; }",
+	".wg-ad-kv { display:flex; gap:.6em; margin:.15em 0; font-size:.9em; }",
+	".wg-ad-kv-label { opacity:.6; min-width:9em; }",
+	".wg-ad-table { width:100%; border-collapse:collapse; font-size:.85em; margin:.4em 0; }",
+	".wg-ad-table th { text-align:left; opacity:.6; font-weight:normal; padding:.25em .5em; border-bottom:1px solid rgba(128,128,128,.3); }",
+	".wg-ad-table td { text-align:left; padding:.25em .5em; border-bottom:1px solid rgba(128,128,128,.15); }",
+	".wg-ad-check-ok { color:#15803d; }",
+	".wg-ad-check-fail { color:#c2410c; font-weight:bold; }",
+	".wg-ad-check-muted { opacity:.55; }"
 ].join('\n');
 
 /* ---------- status fetching / parsing ---------- */
@@ -111,18 +141,47 @@ function parseStatus(res) {
 	}
 }
 
+/* engine-cmdline stdout: line 1 is the engine binary path, the rest are the
+ * rendered argv words, one per line (#76 gotcha: the LIVE /proc cmdline of
+ * a running engine carries the binary too - the rendered surface is the
+ * authority). rc != 0 = the config does not render; stderr carries the
+ * human reason and becomes the strategy card's warn line. */
+function parseCmdline(res) {
+	if (res && res.code == 0 && typeof res.stdout == 'string') {
+		var lines = res.stdout.split('\n').map(function(s) { return s.trim(); })
+			.filter(function(s) { return s.length > 0; });
+		lines.shift();
+		state.strategy = { words: lines, error: null };
+		return;
+	}
+	var reason = (res && typeof res.stderr == 'string' && res.stderr.length)
+		? res.stderr.split('\n')[0].trim() : null;
+	state.strategy = { words: null, error: reason };
+}
+
 /* never rejects: every caller can .then() unconditionally (issue #80
- * "без throw") */
+ * "без throw"). The strategy words ride along only when the status surface
+ * is alive (a pre-status CLI cannot render the page anyway). */
 function refresh() {
 	return callCli(CLI, [ 'status', '--json' ]).then(function(res) {
 		parseStatus(res);
 	}).catch(function() {
 		state.status = null;
 		state.unavailable = 'exec';
+	}).then(function() {
+		if (state.unavailable) {
+			state.strategy = null;
+			return;
+		}
+		return callCli(CLI, [ 'engine-cmdline' ]).then(function(res) {
+			parseCmdline(res);
+		}).catch(function() {
+			state.strategy = { words: null, error: _('The strategy surface is unavailable') };
+		});
 	});
 }
 
-/* ---------- chips row (issue #80): Engine / Processing / Scope / Pending ---------- */
+/* ---------- shared render helpers ---------- */
 
 function chipEl(def) {
 	return E('span', { 'class': 'wg-ad-chip ' + def.cls, 'title': def.title || '' }, [
@@ -131,6 +190,40 @@ function chipEl(def) {
 		def.label
 	]);
 }
+
+function kvRow(label, valueNodes) {
+	return E('div', { 'class': 'wg-ad-kv' }, [
+		E('span', { 'class': 'wg-ad-kv-label' }, [ label ]),
+		E('span', {}, valueNodes)
+	]);
+}
+
+/* a validation row: ok == true -> green ok, false -> red FAILED, null ->
+ * muted (not run / not applicable / never tested). The detail text renders
+ * whenever present: failure reasons, mode notes ("not consumed in this
+ * mode") and the muted provider row's standing "Not tested" hint. */
+function checkRow(label, ok, detail) {
+	var mark, cls;
+	if (ok === true) {
+		mark = _('ok');
+		cls = 'wg-ad-check-ok';
+	}
+	else if (ok === false) {
+		mark = _('FAILED');
+		cls = 'wg-ad-check-fail';
+	}
+	else {
+		mark = _('—');
+		cls = 'wg-ad-check-muted';
+	}
+	return E('tr', {}, [
+		E('td', {}, [ label ]),
+		E('td', { 'class': cls, 'title': detail || '' }, [ mark ]),
+		E('td', {}, [ (detail != null) ? detail : '' ])
+	]);
+}
+
+/* ---------- chips row (issue #80): Engine / Processing / Scope / Pending ---------- */
 
 /* Engine Running: the nfqws2 pid from the status document; stopped is an
  * honest state (the service may be disabled), not a degradation */
@@ -222,6 +315,413 @@ function updateChips() {
 	node.appendChild(degradedLine());
 }
 
+/* ---------- overview: strategy card (#81) ---------- */
+
+/* Split the rendered argv into profile blocks: the engine grammar separates
+ * blocks with --new and the LAST block is the default catch-all (design §3,
+ * spike-75). Until the profiles stage (#85) this list is DERIVED from the
+ * active word set - the honest read-only view the issue asks for. */
+function parseStrategy(words) {
+	var groups = [ [] ];
+	words.forEach(function(w) {
+		if (w == '--new')
+			groups.push([]);
+		else
+			groups[groups.length - 1].push(w);
+	});
+	return groups.map(function(g, i) {
+		var proto = [];
+		var desync = 0;
+		g.forEach(function(w) {
+			if (w.indexOf('--filter-tcp=') == 0 && proto.indexOf('TCP') < 0)
+				proto.push('TCP');
+			if (w.indexOf('--filter-udp=') == 0 && proto.indexOf('QUIC') < 0)
+				proto.push('QUIC');
+			if (w.indexOf('--lua-desync=') == 0)
+				desync++;
+		});
+		return {
+			name: (groups.length == 1 || i == groups.length - 1)
+				? _('Default (catch-all)') : _('Profile %d').format(i + 1),
+			words: g,
+			proto: proto,
+			desync: desync
+		};
+	});
+}
+
+function buildStrategyCard() {
+	var st = state.status;
+	var s = state.strategy;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Current strategy') ])
+	]);
+
+	if (s == null) {
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading strategy words…') ]));
+		return card;
+	}
+	if (s.error != null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ (s.error.length > 0)
+				? _('The strategy configuration does not render: %s').format(s.error)
+				: _('The strategy configuration does not render.') ])
+		]));
+		return card;
+	}
+	if (!s.words.length) {
+		card.appendChild(E('p', {}, [ _('No strategy words configured - the engine runs in no-op mode.') ]));
+		return card;
+	}
+
+	var row = E('div', { 'class': 'wg-ad-chips' });
+	s.words.forEach(function(w) {
+		row.appendChild(E('span', { 'class': 'wg-ad-chip wg-ad-word' }, [ w ]));
+	});
+	card.appendChild(row);
+
+	var table = E('table', { 'class': 'wg-ad-table' }, [
+		E('tr', {}, [
+			E('th', {}, [ _('Profile') ]),
+			E('th', {}, [ _('Protocols') ]),
+			E('th', {}, [ _('Words') ]),
+			E('th', {}, [ _('Policies') ])
+		])
+	]);
+	parseStrategy(s.words).forEach(function(p) {
+		table.appendChild(E('tr', {}, [
+			E('td', {}, [ p.name ]),
+			E('td', {}, [ p.proto.join(' ') || _('—') ]),
+			E('td', {}, [ '%d'.format(p.words.length) ]),
+			E('td', {}, [ '%d'.format(p.desync) ])
+		]));
+	});
+	card.appendChild(table);
+
+	var meta = [];
+	if (st.engine && st.engine.version != null)
+		meta.push(st.engine.version);
+	meta.push(_('Read-only: profile management arrives in a later release.'));
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ meta.join(' · ') ]));
+	return card;
+}
+
+/* ---------- overview: tunnel protection card (#81) ---------- */
+
+function buildExclusionsPanel(t) {
+	var table = E('table', { 'class': 'wg-ad-table' }, [
+		E('tr', {}, [
+			E('th', {}, [ _('Address') ]),
+			E('th', {}, [ _('Source') ]),
+			E('th', {}, [ _('Expires') ])
+		])
+	]);
+	(t.entries || []).forEach(function(e) {
+		var src = (e.source == 'pin') ? _('pin') : _('resolved');
+		var exp = (e.source == 'pin' || e.expires_h == null)
+			? _('never') : _('%d h').format(e.expires_h);
+		table.appendChild(E('tr', {}, [
+			E('td', {}, [ e.ip ]),
+			E('td', {}, [ src ]),
+			E('td', {}, [ exp ])
+		]));
+	});
+	if (!(t.entries || []).length)
+		table.appendChild(E('tr', {}, [
+			E('td', { 'colspan': '3' }, [ _('The merged exclusion set is empty.') ])
+		]));
+	return table;
+}
+
+function buildTunnelCard() {
+	var t = state.status.tunnel;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Tunnel protection') ])
+	]);
+
+	if (t == null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The tunnel protection surface is unavailable.') ])
+		]));
+		return card;
+	}
+
+	var hosts = (t.hosts && t.hosts.length) ? t.hosts.join(', ') : null;
+	var entries = (t.entries || []).length;
+	var cronOk = (t.cron != null && t.cron.ok);
+
+	/* badge: the honest protection state of the configured tunnel */
+	var badge;
+	if (!hosts)
+		badge = chipEl({ cls: 'wg-ad-chip-muted', label: _('Not configured') });
+	else if (entries > 0 && cronOk)
+		badge = chipEl({ cls: 'wg-ad-chip-ok', label: _('Protected'),
+			title: (hosts.length > 60) ? hosts : '' });
+	else
+		badge = chipEl({ cls: 'wg-ad-chip-warn', label: _('Unprotected') });
+
+	card.appendChild(badge);
+	card.appendChild(kvRow(_('Hostname(s)'), [ hosts || _('—') ]));
+	card.appendChild(kvRow(_('Mode'), [ _('Static pins + auto-resolved addresses') ]));
+
+	var refreshTxt = (t.update_interval_h != null)
+		? _('every %d h').format(t.update_interval_h) : _('unknown');
+	refreshTxt += (cronOk) ? ' · ' + _('cron active') : ' · ' + _('cron MISSING');
+	card.appendChild(kvRow(_('Refresh'), [ refreshTxt ]));
+	card.appendChild(kvRow(_('Exclusions'), [ '%d'.format(entries) ]));
+
+	card.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() {
+				state.exclusionsOpen = !state.exclusionsOpen;
+				renderBody();
+			})
+		}, [ state.exclusionsOpen ? _('Hide exclusions') : _('Review exclusions') ])
+	]));
+
+	if (state.exclusionsOpen)
+		card.appendChild(buildExclusionsPanel(t));
+	return card;
+}
+
+/* ---------- overview: validation card (#81) ---------- */
+
+/* tunnel exclusions row: derived from the status document (#76) - the CLI
+ * check (#77) probes config/nft/mark/engine/hostlist and has no tunnel
+ * probe of its own */
+function tunnelCheck() {
+	var t = state.status.tunnel;
+	if (t == null)
+		return { ok: null, detail: _('surface unavailable') };
+	var hosts = (t.hosts && t.hosts.length) ? t.hosts.length : 0;
+	if (!hosts)
+		return { ok: null, detail: _('no tunnel hosts configured') };
+	var entries = (t.entries || []).length;
+	var cronOk = (t.cron != null && t.cron.ok);
+	if (entries > 0 && cronOk)
+		return { ok: true, detail: null };
+	return {
+		ok: false,
+		detail: _('%d host(s) configured, %d resolved entries, cron %s')
+			.format(hosts, entries, cronOk ? 'ok' : _('missing'))
+	};
+}
+
+function hostlistDetail(h) {
+	if (h == null)
+		return null;
+	if (!h.needed)
+		return _('not consumed in this mode');
+	return (h.exists) ? null : _('the hostlist file is missing');
+}
+
+/* The full row set ALWAYS renders: check rows stay muted (— / Not run yet)
+ * until the first Run checks, the tunnel row is live from the status
+ * document, and the provider row is a standing muted "Not tested" (active
+ * probing is its own backlog stage, #92). */
+function buildValidationCard() {
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Validation') ])
+	]);
+
+	if (state.checkError != null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The check run failed: %s').format(state.checkError) ])
+		]));
+	}
+
+	var c = (state.checkDoc != null) ? (state.checkDoc.checks || {}) : null;
+	function ck(key) { return (c != null && c[key] != null) ? c[key].ok : null; }
+	function det(key) { return (c != null && c[key] != null) ? c[key].detail : null; }
+
+	var table = E('table', { 'class': 'wg-ad-table' });
+	table.appendChild(checkRow(_('Configuration syntax'), ck('config'), det('config')));
+	table.appendChild(checkRow(_('Scope table (nft)'), ck('nft'), det('nft')));
+	table.appendChild(checkRow(_('routing-mark'), ck('mark'), det('mark')));
+	table.appendChild(checkRow(_('Engine running'), ck('engine'), det('engine')));
+	table.appendChild(checkRow(_('Hostlist'), ck('hostlist'), hostlistDetail(c != null ? c.hostlist : null)));
+	var tc = tunnelCheck();
+	table.appendChild(checkRow(_('Tunnel exclusions'), tc.ok, tc.detail));
+	table.appendChild(checkRow(_('Provider effectiveness'), null,
+		_('Not tested - active probing arrives in a later release')));
+	card.appendChild(table);
+
+	if (state.checkDoc == null && state.checkError == null)
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Not run yet.') ]));
+
+	card.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, runChecks),
+			'disabled': state.checkBusy ? '' : null
+		}, [ _('Run checks') ])
+	]));
+	return card;
+}
+
+function runChecks() {
+	state.busy = true;
+	state.checkBusy = true;
+	renderBody();
+	return callCli(CLI, [ 'apply', '--check', '--json' ]).then(function(res) {
+		var doc = null;
+		if (res && typeof res.stdout == 'string' && res.stdout.length) {
+			try {
+				doc = JSON.parse(res.stdout);
+			}
+			catch (e) {}
+		}
+		if (doc != null && doc.checks != null) {
+			state.checkDoc = doc;
+			state.checkError = null;
+		}
+		else {
+			/* keep a previous document visible; surface the failure */
+			state.checkError = (res && typeof res.stderr == 'string' && res.stderr.length)
+				? res.stderr.split('\n')[0].trim()
+				: _('the output is not a check report');
+		}
+		state.checkBusy = false;
+		state.busy = false;
+		renderBody();
+	}).catch(function() {
+		state.checkBusy = false;
+		state.busy = false;
+		state.checkError = _('the check could not be executed');
+		renderBody();
+	});
+}
+
+/* ---------- overview: pending-change bar (#81) ---------- */
+
+function buildPendingBar(p) {
+	var sections = (p.sections && p.sections.length) ? p.sections.join(', ') : null;
+	return E('div', { 'class': 'wg-ad-panel wg-ad-bar' }, [
+		E('strong', {}, [ _('Review configuration before applying') ]),
+		E('p', {}, [ (sections != null)
+			? _('%d staged change(s) in: %s').format(p.count, sections)
+			: _('%d staged change(s)').format(p.count) ]),
+		E('div', { 'class': 'wg-ad-actions' }, [
+			E('button', {
+				'class': 'btn cbi-button cbi-button-negative',
+				'click': ui.createHandlerFn(null, discardPending),
+				'disabled': state.discardBusy ? '' : null
+			}, [ _('Discard') ]),
+			E('button', {
+				'class': 'btn cbi-button cbi-button-action',
+				'click': ui.createHandlerFn(null, reviewApply),
+				'disabled': state.applyBusy ? '' : null
+			}, [ _('Review & Apply') ])
+		])
+	]);
+}
+
+/* Discard: clear the staged UCI deltas of THIS config only (rpcd uci revert,
+ * config-scoped). Idempotent by construction (nothing staged = no-op). */
+function discardPending() {
+	state.busy = true;
+	state.discardBusy = true;
+	renderBody();
+	return callUciRevert('wanguard-antidpi').then(function() {
+		state.discardBusy = false;
+		state.busy = false;
+		ui.changes.init();
+		return refresh().then(update);
+	}).catch(function(e) {
+		state.discardBusy = false;
+		state.busy = false;
+		ui.addNotification(null, E('p', {}, _('Discarding the staged changes failed (%s).')
+			.format((e && e.message) || 'error')), 'error');
+		renderBody();
+	});
+}
+
+/* Review & Apply: commit the staged UCI first (the ucode CLI reads COMMITTED
+ * config only - proven in the container: a staged delta is invisible to the
+ * render), then run the idempotent #77 apply. uci.apply(5) is the luci-app-
+ * wanguard idiom (rollback window + client-driven confirm). */
+function reviewApply() {
+	state.busy = true;
+	state.applyBusy = true;
+	renderBody();
+	return uci.save().then(function() {
+		return uci.apply(5);
+	}).then(function() {
+		return callCli(CLI, [ 'apply', '--json' ]);
+	}).then(function(res) {
+		state.applyBusy = false;
+		state.busy = false;
+		ui.addNotification(null, E('p', {}, [ applyNotice(res) ]), applySeverity(res));
+		ui.changes.init();
+		return refresh().then(update);
+	}).catch(function(e) {
+		state.applyBusy = false;
+		state.busy = false;
+		ui.addNotification(null, E('p', {}, _('Applying the configuration failed (%s).')
+			.format((e && e.message) || 'error')), 'error');
+		return refresh().then(update);
+	});
+}
+
+/* { ok, partial, steps } on exit 0/1/2; anything else = the output could
+ * not be parsed (the honest error line) */
+function applyNotice(res) {
+	var doc = null;
+	if (res && typeof res.stdout == 'string' && res.stdout.length) {
+		try {
+			doc = JSON.parse(res.stdout);
+		}
+		catch (e) {}
+	}
+	if (doc == null || doc.steps == null)
+		return _('The apply output could not be parsed - check the system log.');
+	var steps = [];
+	for (var k in doc.steps)
+		steps.push('%s:%s'.format(k, doc.steps[k]));
+	if (doc.ok != true)
+		return _('Apply FAILED (steps: %s).').format(steps.join(', '));
+	if (doc.partial)
+		return _('Apply PARTIAL (steps: %s).').format(steps.join(', '));
+	return _('Configuration applied: %s.').format(steps.join(', '));
+}
+
+function applySeverity(res) {
+	var doc = null;
+	if (res && typeof res.stdout == 'string' && res.stdout.length) {
+		try {
+			doc = JSON.parse(res.stdout);
+		}
+		catch (e) {}
+	}
+	if (doc == null || doc.ok != true)
+		return 'error';
+	if (doc.partial)
+		return 'warning';
+	return 'info';
+}
+
+/* ---------- overview assembly (#81) ---------- */
+
+function renderOverview() {
+	var frag = E([]);
+
+	/* the concept's standing notice */
+	frag.appendChild(E('div', { 'class': 'alert-message' }, [
+		E('p', {}, [ _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
+	]));
+
+	var p = state.status.pending;
+	if (p != null && p.count != null && p.count > 0)
+		frag.appendChild(buildPendingBar(p));
+
+	frag.appendChild(buildStrategyCard());
+	frag.appendChild(buildTunnelCard());
+	frag.appendChild(buildValidationCard());
+
+	return frag;
+}
+
 /* ---------- tab frame (issue #80) ---------- */
 
 function buildTabbar() {
@@ -249,8 +749,8 @@ function switchTab(id) {
 }
 
 /* the tab body: the unavailable section (missing/pre-status CLI) or the
- * stage placeholder of the active tab. Availability flips are the only
- * rebuild trigger for the poll loop (the scaffold bodies are static). */
+ * active tab's content. Overview rebuilds per tick (data-driven); the not
+ * yet staged tabs stay placeholder panels. */
 function renderBody() {
 	var node = state.bodyNode;
 	if (!node)
@@ -267,6 +767,11 @@ function renderBody() {
 		return;
 	}
 
+	if (state.activeTab == 'overview') {
+		node.appendChild(renderOverview());
+		return;
+	}
+
 	node.appendChild(E('div', { 'class': 'wg-ad-panel' }, [
 		E('h3', {}, [ tabLabel(state.activeTab) ]),
 		E('p', { 'class': 'wg-ad-hint' }, [ _('This section arrives in a later package update.') ])
@@ -274,12 +779,15 @@ function renderBody() {
 }
 
 /* poll tick: refetch the status document, refresh the chips, rebuild the
- * body only when availability flipped */
+ * body on an availability flip or while the data-driven Overview is open */
 function update() {
 	var wasUnavailable = (state.bodyNode != null &&
 		state.bodyNode.getAttribute('data-unavail') == 'true');
 	updateChips();
-	if (state.bodyNode && (!!state.unavailable) != wasUnavailable)
+	if (!state.bodyNode)
+		return;
+	var availChanged = ((!!state.unavailable) != wasUnavailable);
+	if (availChanged || state.activeTab == 'overview')
 		renderBody();
 }
 
@@ -303,5 +811,12 @@ return L.Class.extend({
 	buildTabbar: buildTabbar,
 	switchTab: switchTab,
 	renderBody: renderBody,
-	updateChips: updateChips
+	updateChips: updateChips,
+	renderOverview: renderOverview,
+	parseStrategy: parseStrategy,
+	runChecks: runChecks,
+	reviewApply: reviewApply,
+	discardPending: discardPending,
+	applyNotice: applyNotice,
+	applySeverity: applySeverity
 });

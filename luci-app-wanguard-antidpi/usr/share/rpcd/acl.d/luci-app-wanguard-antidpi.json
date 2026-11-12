@@ -3,7 +3,8 @@
 		"description": "Grant access to WAN Guard anti-DPI strategies",
 		"read": {
 			"ubus": {
-				"file": [ "read", "exec" ]
+				"file": [ "read", "exec" ],
+				"uci": [ "get", "changes" ]
 			},
 			"file": {
 				"/usr/bin/wanguard-antidpi": [ "exec" ]
@@ -12,7 +13,8 @@
 		},
 		"write": {
 			"ubus": {
-				"file": [ "exec" ]
+				"file": [ "exec" ],
+				"uci": [ "apply", "confirm", "revert" ]
 			},
 			"file": {
 				"/usr/bin/wanguard-antidpi": [ "exec" ]

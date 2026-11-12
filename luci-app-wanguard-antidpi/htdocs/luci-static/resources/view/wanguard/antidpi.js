@@ -62,9 +62,13 @@ return view.extend({
 		]);
 
 		/* the chips follow the status document (the Processing chip reads
-		 * the queue-counter delta between ticks); the body rebuilds only
-		 * when availability flips — static scaffold bodies stay put */
+		 * the queue-counter delta between ticks); the body rebuilds on
+		 * availability flips and while the data-driven Overview is open.
+		 * A busy tick is skipped: an in-flight Discard/Apply/Check must
+		 * not race its own rebuild (the luci-app-wanguard pattern). */
 		poll.add(function() {
+			if (ad.state.busy)
+				return;
 			return ad.refresh().then(function() {
 				ad.update();
 			});
