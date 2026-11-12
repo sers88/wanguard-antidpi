@@ -36,7 +36,8 @@
 //   cron-install    ensure the periodic tunnel-update line in /etc/crontabs/
 //                   root (busybox crond reloads changed files itself)
 //   cron-remove     drop the cron line (service stop)
-//   whitelist-refresh  render whitelist.domains into the engine hostlist file
+//   whitelist-refresh  render the merged domain set (whitelist.domains +
+//                      domainlist sections, #82) into the engine hostlist file
 //                   (issue #70); whitelist mode off -> removes the file
 //                   (blanket mode); DRYRUN-aware
 //   whitelist-reload   whitelist-refresh + SIGHUP to a running engine (nfqws2
@@ -188,13 +189,65 @@ function valid_hostname(h) {
 	return match(h, /^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/) != null;
 }
 
-function validate_whitelist_domains(domains) {
-	// strict DNS names only (render-injection safety: the entries land in a
-	// file the engine parses, one host per line; hostlist matching is a
-	// suffix match, so wildcards are unnecessary and rejected)
-	for (let i = 0; i < length(domains); i++)
-		if (!valid_hostname(domains[i]))
-			die('whitelist.domains entry is not a valid DNS hostname: "' + domains[i] + '"');
+function load_domainlists() {
+	// named domainlist sections (issue #82, design §2): `config domainlist`
+	// with an editable `name` label + a `domains` list. Soft: no sections =
+	// the legacy-only whitelist of #70 (byte-identical render). The section
+	// NAME is the stable id (policies reference it per design §2), `name` is
+	// just the label.
+	let lists = [];
+	uci.cursor().foreach(CONF, 'domainlist', function(s) {
+		push(lists, {
+			sid: s['.name'],
+			name: (s.name == null) ? '' : '' + s.name,
+			domains: (type(s.domains) == 'array') ? s.domains : []
+		});
+	});
+	return lists;
+}
+
+function whitelist_sources() {
+	// the unmerged hostlist source set (diagnostic-safe: NO validation here,
+	// so status surfaces can display broken configs without dying)
+	let w = load_whitelist();
+	return { enabled: w.enabled, legacy: w.domains, lists: load_domainlists() };
+}
+
+function whitelist_merged(src) {
+	// legacy whitelist.domains UNION every domainlist section (#82), deduped,
+	// canonical order - one pipeline shared by the render (engine_argv), the
+	// hostlist file render (whitelist_refresh_run / apply_hostlist_wouldbe)
+	// and the human whitelist-status surface
+	let seen = {};
+	let doms = [];
+	let sets = [src.legacy];
+	for (let li = 0; li < length(src.lists); li++)
+		push(sets, src.lists[li].domains);
+	for (let si = 0; si < length(sets); si++) {
+		let list = sets[si];
+		for (let i = 0; i < length(list); i++) {
+			let d = list[i];
+			if (seen[d] == null) {
+				seen[d] = true;
+				push(doms, d);
+			}
+		}
+	}
+	sort(doms);
+	return doms;
+}
+
+function validate_whitelist_sources(src) {
+	// loud per-source validation for the whitelist mode (render-injection
+	// safety net behind the UI's inline checks); the die message carries the
+	// source so a broken config names its list
+	for (let i = 0; i < length(src.legacy); i++)
+		if (!valid_hostname(src.legacy[i]))
+			die('whitelist.domains entry is not a valid DNS hostname: "' + src.legacy[i] + '"');
+	for (let li = 0; li < length(src.lists); li++)
+		for (let i = 0; i < length(src.lists[li].domains); i++)
+			if (!valid_hostname(src.lists[li].domains[i]))
+				die('domainlist "' + src.lists[li].sid + '" entry is not a valid DNS hostname: "' + src.lists[li].domains[i] + '"');
 }
 
 function valid_addr_entry(e) {
@@ -269,15 +322,17 @@ function engine_argv() {
 	// cmd_engine_cmdline prints it one word per line (frozen contract), the
 	// status surface re-reads it (issue #76)
 	let c = load_config();
-	// whitelist mode (issue #70): strict validation at render time - the
+	// whitelist mode (issue #70/#82): strict validation at render time - the
 	// hostlist file is a hard engine dependency (nfqws2 refuses to start
 	// without it), and a half-enabled config must fail loudly here instead
 	// of silently falling back to the blanket desync
-	let w = load_whitelist();
-	if (w.enabled == '1') {
-		if (length(w.domains) == 0)
-			die('whitelist.enabled=1 but whitelist.domains is empty - add domains or set whitelist.enabled to 0');
-		validate_whitelist_domains(w.domains);
+	let src = whitelist_sources();
+	let merged = [];
+	if (src.enabled == '1') {
+		validate_whitelist_sources(src);
+		merged = whitelist_merged(src);
+		if (length(merged) == 0)
+			die('whitelist.enabled=1 but no domains are configured (whitelist.domains and every domainlist section are empty) - add domains or set whitelist.enabled to 0');
 	}
 	// gzipped lua is supported natively by nfqws2 (--lua-init=@<file>)
 	let a = [
@@ -308,8 +363,9 @@ function engine_argv() {
 	// words to make sense (nothing to constrain otherwise) - with an empty
 	// strategy the default golden stays untouched. The hostlist binds PER
 	// PROFILE (verified in the container: "profile N include hostlist"), so
-	// it is re-emitted after every --new profile separator.
-	let wl_emit = (w.enabled == '1' && length(c.opt) > 0);
+	// it is re-emitted after every --new profile separator. The FILE content
+	// is the merged source set (#82); the binding rides on the mode alone.
+	let wl_emit = (src.enabled == '1' && length(c.opt) > 0);
 	if (wl_emit)
 		push(a, '--hostlist=' + HOSTLIST);
 	// strategy words verbatim: one UCI list item = one argv word (the shell
@@ -1108,8 +1164,10 @@ function cmd_tunnel_status() {
 //
 // Desync is applied ONLY to the listed hosts (SNI-based, suffix match with
 // subdomains auto apply) instead of every queued target. Config is UCI
-// `whitelist` (soft section, same contract as tunnel); the rendered file
-// /usr/share/wanguard-antidpi/whitelist.hosts is the engine's --hostlist.
+// `whitelist` (soft section, same contract as tunnel) PLUS named
+// `domainlist` sections (issue #82, design §2) - the rendered file
+// /usr/share/wanguard-antidpi/whitelist.hosts (the engine's --hostlist)
+// holds the merged set: legacy whitelist.domains UNION every domainlist.
 // Facts verified in the container against the pinned binary:
 //   - a MISSING hostlist file keeps the engine from starting (the init shim
 //     therefore refreshes the file before the engine start; a failed refresh
@@ -1125,10 +1183,10 @@ function cmd_tunnel_status() {
 // ---------------------------------------------------------------------------
 
 function whitelist_refresh_run() {
-	let w = load_whitelist();
-	if (w.enabled != '1' || length(w.domains) == 0) {
+	let src = whitelist_sources();
+	if (src.enabled != '1') {
 		if (dryrun()) {
-			print('DRYRUN: whitelist mode off (enabled=' + ((w.enabled == null) ? '0' : w.enabled) +
+			print('DRYRUN: whitelist mode off (enabled=' + ((src.enabled == null) ? '0' : src.enabled) +
 				') - would remove ' + HOSTLIST + ' if present (blanket mode)\n');
 			return;
 		}
@@ -1140,16 +1198,29 @@ function whitelist_refresh_run() {
 		}
 		return;
 	}
-	validate_whitelist_domains(w.domains);
-	// dedupe + canonical order: the file content is deterministic
-	let seen = {};
-	let doms = [];
-	for (let i = 0; i < length(w.domains); i++)
-		if (seen[w.domains[i]] == null) {
-			seen[w.domains[i]] = true;
-			push(doms, w.domains[i]);
+	// whitelist mode (#82): validate every source loudly, then render the
+	// merged set (legacy whitelist.domains UNION domainlist sections)
+	validate_whitelist_sources(src);
+	let doms = whitelist_merged(src);
+	if (length(doms) == 0) {
+		// enabled with an empty source set: the rendered argv still carries
+		// --hostlist (engine_argv dies on this config, so a restart fails
+		// loudly); removing the file keeps that failure honest instead of
+		// desyncing with a stale list
+		if (dryrun()) {
+			print('DRYRUN: whitelist mode on but no domains configured - would remove ' + HOSTLIST + '\n');
+			return;
 		}
-	sort(doms);
+		if (access(HOSTLIST, 'r')) {
+			unlink(HOSTLIST);
+			log('no domains configured - removed ' + HOSTLIST + ' (the engine refuses to start until domains are added or the mode is set to 0)');
+		} else {
+			print('wanguard-antidpi: no domains configured - no hostlist file\n');
+		}
+		return;
+	}
+	// dedupe + canonical order: the file content is deterministic (already
+	// merged by whitelist_merged)
 	let txt = join_lines(doms) + '\n';
 	if (dryrun()) {
 		print('DRYRUN: would write ' + HOSTLIST + ' (' + length(doms) + ' hosts):\n');
@@ -1201,15 +1272,22 @@ function cmd_whitelist_reload() {
 }
 
 function cmd_whitelist_status() {
-	let w = load_whitelist();
+	let src = whitelist_sources();
+	let merged = whitelist_merged(src);
 	let j = function(list) {
 		let out = '';
 		for (let i = 0; i < length(list); i++)
 			out += ((i > 0) ? ', ' : '') + list[i];
 		return (length(list) > 0) ? out : 'none';
 	};
-	print('enabled: ' + ((w.enabled == '1') ? '1' : '0') + '\n');
-	print('domains: ' + j(w.domains) + '\n');
+	print('enabled: ' + ((src.enabled == '1') ? '1' : '0') + '\n');
+	print('domains: ' + j(src.legacy) + '\n');
+	// named domainlist sections (issue #82): the rest of the merged set
+	let list_total = 0;
+	for (let li = 0; li < length(src.lists); li++)
+		list_total += length(src.lists[li].domains);
+	print('domainlists: ' + length(src.lists) + ' section(s), ' + list_total + ' entr(ies)\n');
+	print('merged: ' + length(merged) + ' unique host(s)\n');
 	if (access(HOSTLIST, 'r')) {
 		let lines = split(readfile(HOSTLIST), '\n');
 		let n = 0;
@@ -1221,7 +1299,7 @@ function cmd_whitelist_status() {
 		print('file: absent\n');
 	}
 	let c = load_config();
-	let wl_argv = (w.enabled == '1' && length(w.domains) > 0 && length(c.opt) > 0);
+	let wl_argv = (src.enabled == '1' && length(merged) > 0 && length(c.opt) > 0);
 	print('engine argv: ' + (wl_argv ? '--hostlist included' : 'not included') + '\n');
 	let pid = engine_pid();
 	print('engine: ' + ((length(pid) > 0) ? 'running (pid ' + pid + ')' : 'not running') + '\n');
@@ -1636,18 +1714,14 @@ function apply_hostlist_wouldbe() {
 	// the canonical text whitelist-refresh would write right now, or null for
 	// blanket mode (mirror of whitelist_refresh_run's content pipeline; the
 	// caller has rendered engine_argv() first, so the domains are already
-	// validated and this cannot die)
-	let w = load_whitelist();
-	if (w.enabled != '1' || length(w.domains) == 0)
+	// validated and this cannot die). The content is the merged source set
+	// (#82): legacy whitelist.domains UNION domainlist sections.
+	let src = whitelist_sources();
+	if (src.enabled != '1')
 		return null;
-	let seen = {};
-	let doms = [];
-	for (let i = 0; i < length(w.domains); i++)
-		if (seen[w.domains[i]] == null) {
-			seen[w.domains[i]] = true;
-			push(doms, w.domains[i]);
-		}
-	sort(doms);
+	let doms = whitelist_merged(src);
+	if (length(doms) == 0)
+		return null;
 	return join_lines(doms) + '\n';
 }
 
@@ -1662,8 +1736,15 @@ function apply_engine_decision(file_changed) {
 			? { action: 'restart', reason: 'engine not running - starting with ' + length(c.opt) + ' strategy words' }
 			: { action: 'noop', reason: 'engine not running, no strategy words - nothing to start' };
 	if (!apply_argv_equal(old_argv, new_argv)) {
-		if (apply_argv_equal(apply_argv_without_hostlist(old_argv), apply_argv_without_hostlist(new_argv)))
-			return { action: 'reload', reason: 'hostlist words changed - SIGHUP keeps the live connections' };
+		if (apply_argv_equal(apply_argv_without_hostlist(old_argv), apply_argv_without_hostlist(new_argv))) {
+			// ONLY the --hostlist words differ. With the fixed per-profile
+			// emission (a mode emits the word on every profile or on none)
+			// this is exactly the whitelist mode flip (#82): SIGHUP re-reads
+			// list file CONTENT but cannot add/drop the --hostlist binding
+			// of a live process (the argv is exec-time), so a flip MUST go
+			// through a restart (the AGENTS #70 memo contract).
+			return { action: 'restart', reason: 'whitelist mode flipped - restart rebinds --hostlist (SIGHUP reloads file content only)' };
+		}
 		return { action: 'restart', reason: 'engine argv drifted (strategy/filters) - restart required' };
 	}
 	if (file_changed)
@@ -1739,11 +1820,12 @@ function apply_check_run(want_json) {
 	if (length(pid) == 0)
 		ok = false;
 
-	// hostlist: present when the engine consumes it (whitelist on + strategy
-	// words); blanket mode and wordless whitelists never read the file
-	let w = load_whitelist();
+	// hostlist: present when the engine consumes it (whitelist on + a
+	// non-empty merged source set + strategy words); blanket mode and
+	// wordless whitelists never read the file
+	let src = whitelist_sources();
 	let c = load_config();
-	let needed = (w.enabled == '1' && length(w.domains) > 0 && length(c.opt) > 0);
+	let needed = (src.enabled == '1' && length(whitelist_merged(src)) > 0 && length(c.opt) > 0);
 	let exists = access(HOSTLIST, 'r');
 	checks.hostlist = {
 		ok: (!needed || exists),

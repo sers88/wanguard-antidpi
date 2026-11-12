@@ -1,12 +1,13 @@
 /* luci-app-wanguard-antidpi core — the shared engine behind the Anti-DPI
- * page (view/wanguard/antidpi.js, issues #80/#81). Thin client over the
+ * page (view/wanguard/antidpi.js, issues #80/#81/#82). Thin client over the
  * `wanguard-antidpi` CLI surfaces (#76 status, #77 apply): ONE status exec
  * per refresh plus the strategy-words exec (engine-cmdline), with the
  * heavier probes (apply --check, apply) strictly on-demand behind their
  * buttons. The browser never touches nft/logread directly; its only direct
- * UCI verbs are the staged-change bar's Discard (uci revert, config-scoped)
- * and the commit step of Review & Apply (uci save/apply - the luci-app-
- * wanguard idiom), followed by the CLI apply that renders/loads everything.
+ * UCI verbs are the Domain lists editor's staging (#82 - client-side via
+ * the uci client, applied through the same save -> apply(5) -> CLI apply
+ * pipeline as the pending bar) and the bar's Discard (uci revert,
+ * config-scoped).
  *
  * Degradation contract (#76/#81): nothing throws on missing surfaces. An
  * old or missing CLI (the pre-status packages, a denied ACL) resolves to
@@ -60,6 +61,15 @@ var state = {
 	checkBusy: false,
 	applyBusy: false,
 	discardBusy: false,
+	domains: {          /* Domain lists tab (#82): client-side staged editor */
+		loaded: false,    /* the uci config has been read at least once */
+		dirty: false,     /* staged edits awaiting the apply pipeline */
+		origEnabled: null,  /* committed enabled at load time (mode-flip detect) */
+		deleteArm: null,  /* sid armed for the two-step list delete */
+		errors: {},       /* inline validation errors, per-list (and '__new') */
+		inputs: {},       /* per-list add-domain input text (survives re-renders) */
+		newName: ''       /* new-list label input text */
+	},
 	busy: false
 };
 
@@ -114,7 +124,13 @@ var CSS = [
 	".wg-ad-table td { text-align:left; padding:.25em .5em; border-bottom:1px solid rgba(128,128,128,.15); }",
 	".wg-ad-check-ok { color:#15803d; }",
 	".wg-ad-check-fail { color:#c2410c; font-weight:bold; }",
-	".wg-ad-check-muted { opacity:.55; }"
+	".wg-ad-check-muted { opacity:.55; }",
+	".wg-ad-error { color:#c2410c; font-size:.85em; margin:.2em 0; }",
+	".wg-ad-modebtn-active { font-weight:bold; border-bottom:2px solid #2563eb; }",
+	".wg-ad-domrow { display:flex; align-items:center; gap:.5em; padding:.15em 0; border-bottom:1px dotted rgba(128,128,128,.2); font-family:monospace; font-size:.85em; }",
+	".wg-ad-domremove { background:none; border:none; cursor:pointer; color:#c2410c; padding:0 .3em; font-size:1em; }",
+	".wg-ad-addrow { display:flex; gap:.4em; margin:.5em 0 0; }",
+	".wg-ad-addrow input { flex:1; min-width:14em; }"
 ].join('\n');
 
 /* ---------- status fetching / parsing ---------- */
@@ -618,7 +634,9 @@ function buildPendingBar(p) {
 }
 
 /* Discard: clear the staged UCI deltas of THIS config only (rpcd uci revert,
- * config-scoped). Idempotent by construction (nothing staged = no-op). */
+ * config-scoped). Idempotent by construction (nothing staged = no-op). The
+ * editor's client-side staged edits are dropped with the same intent - the
+ * uci client's unload+reload re-reads the committed truth. */
 function discardPending() {
 	state.busy = true;
 	state.discardBusy = true;
@@ -626,6 +644,8 @@ function discardPending() {
 	return callUciRevert('wanguard-antidpi').then(function() {
 		state.discardBusy = false;
 		state.busy = false;
+		uci.unload('wanguard-antidpi');
+		domainsAfterConfigChange();
 		ui.changes.init();
 		return refresh().then(update);
 	}).catch(function(e) {
@@ -654,6 +674,7 @@ function reviewApply() {
 		state.busy = false;
 		ui.addNotification(null, E('p', {}, [ applyNotice(res) ]), applySeverity(res));
 		ui.changes.init();
+		domainsAfterConfigChange();
 		return refresh().then(update);
 	}).catch(function(e) {
 		state.applyBusy = false;
@@ -706,6 +727,13 @@ function applySeverity(res) {
 function renderOverview() {
 	var frag = E([]);
 
+	/* defensive: LuCI always calls load() (the refresh) before render(), but
+	 * a direct renderBody() before the first tick must not throw (#80 rule) */
+	if (!state.status) {
+		frag.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading status…') ]));
+		return frag;
+	}
+
 	/* the concept's standing notice */
 	frag.appendChild(E('div', { 'class': 'alert-message' }, [
 		E('p', {}, [ _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
@@ -720,6 +748,386 @@ function renderOverview() {
 	frag.appendChild(buildValidationCard());
 
 	return frag;
+}
+
+/* ---------- domain lists tab (#82) ---------- */
+
+/* strict-DNS validation - the exact mirror of the CLI's valid_hostname
+ * (ucode): labels of letters/digits/hyphens, at least two labels, 253-octet
+ * presentation limit. Invalid input NEVER reaches the staged config, so the
+ * render-time loud fail of #70 stays unreachable from the UI. */
+function domainIsValid(d) {
+	if (typeof d != 'string' || d.length == 0 || d.length > 253)
+		return false;
+	return /^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/.test(d);
+}
+
+/* how many policies reference this list by section name (design §2). The
+ * policy schema ships with its own stage (#87) - today this is always 0. */
+function domainsPolicyUse(sid) {
+	return (uci.sections('wanguard-antidpi', 'policy') || [])
+		.filter(function(p) { return p.domainlist == sid; }).length;
+}
+
+/* the tab's view model: legacy whitelist.domains + every domainlist section
+ * (the LuCI uci client merges committed values, router-staged deltas and
+ * the client's own staged edits - the same staged-first contract the
+ * pending bar applies) plus the merged effective count the CLI renders. */
+function domainsModel() {
+	var lists = (uci.sections('wanguard-antidpi', 'domainlist') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			label: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name'],
+			domains: (Array.isArray(s.domains) ? s.domains : []).slice(),
+			legacy: false,
+			policies: domainsPolicyUse(s['.name'])
+		};
+	});
+	var legacy = {
+		sid: 'whitelist',
+		label: _('Legacy list'),
+		domains: (function(v) { return (Array.isArray(v) ? v : []).slice(); })(uci.get('wanguard-antidpi', 'whitelist', 'domains')),
+		legacy: true,
+		policies: 0
+	};
+	var seen = {}, mergedCount = 0;
+	[ legacy ].concat(lists).forEach(function(l) {
+		l.domains.forEach(function(d) {
+			if (!seen[d]) { seen[d] = 1; mergedCount++; }
+		});
+	});
+	var enabled = (uci.get('wanguard-antidpi', 'whitelist', 'enabled') == '1');
+	return {
+		enabled: enabled,
+		enabledStaged: (state.domains.origEnabled != null && enabled != state.domains.origEnabled),
+		legacy: legacy,
+		lists: lists,
+		mergedCount: mergedCount
+	};
+}
+
+/* the whitelist section is soft (blanket = section absent); stage a named
+ * create before mutating options on it (uci.set silently no-ops on a
+ * section that is neither committed nor client-created) */
+function domainsEnsureSection() {
+	if (!uci.get('wanguard-antidpi', 'whitelist'))
+		uci.add('wanguard-antidpi', 'whitelist', 'whitelist');
+}
+
+function domainsMarkDirty() {
+	state.domains.dirty = true;
+}
+
+/* 'list_video_domains'-style stable section id derived from the label (the
+ * design contract: refs go by section name, the label is editable) */
+function domainsSlug(label) {
+	var base = ('list_' + label.toLowerCase().replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '')).replace(/^list_list/, 'list').slice(0, 48);
+	var sid = base, n = 2;
+	while (uci.get('wanguard-antidpi', sid) != null) {
+		sid = base + '_' + n;
+		n++;
+	}
+	return sid;
+}
+
+function domainsFindList(model, sid) {
+	if (sid == 'whitelist')
+		return model.legacy;
+	return model.lists.filter(function(l) { return l.sid == sid; })[0] || null;
+}
+
+function domainsSetMode(on) {
+	domainsEnsureSection();
+	uci.set('wanguard-antidpi', 'whitelist', 'enabled', on ? '1' : '0');
+	domainsMarkDirty();
+	renderDomains();
+}
+
+function domainsAddDomain(sid) {
+	var d = (state.domains.inputs[sid] || '').trim();
+	var err = null;
+	if (d.length == 0)
+		err = _('Enter a domain name.');
+	else if (!domainIsValid(d))
+		err = _('Not a valid DNS hostname (no wildcards, commas or spaces; at least two labels).');
+	else if (domainsFindList(domainsModel(), sid).domains.indexOf(d) >= 0)
+		err = _('"%s" is already in this list.'.format(d));
+	if (err != null) {
+		state.domains.errors[sid] = err;
+		renderDomains();
+		return;
+	}
+	delete state.domains.errors[sid];
+	if (sid == 'whitelist')
+		domainsEnsureSection();
+	var next = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(uci.get('wanguard-antidpi', sid, 'domains'));
+	next.push(d);
+	uci.set('wanguard-antidpi', sid, 'domains', next);
+	state.domains.inputs[sid] = '';
+	domainsMarkDirty();
+	renderDomains();
+}
+
+function domainsRemoveDomain(sid, idx) {
+	if (sid == 'whitelist')
+		domainsEnsureSection();
+	var next = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(uci.get('wanguard-antidpi', sid, 'domains'));
+	if (idx < 0 || idx >= next.length)
+		return;
+	next.splice(idx, 1);
+	uci.set('wanguard-antidpi', sid, 'domains', next);
+	delete state.domains.errors[sid];
+	domainsMarkDirty();
+	renderDomains();
+}
+
+function domainsCreateList() {
+	var label = (state.domains.newName || '').trim();
+	if (label.length == 0) {
+		state.domains.errors['__new'] = _('Enter a list name.');
+		renderDomains();
+		return;
+	}
+	delete state.domains.errors['__new'];
+	var sid = domainsSlug(label);
+	uci.add('wanguard-antidpi', 'domainlist', sid);
+	uci.set('wanguard-antidpi', sid, 'name', label);
+	uci.set('wanguard-antidpi', sid, 'domains', []);
+	state.domains.newName = '';
+	domainsMarkDirty();
+	renderDomains();
+}
+
+function domainsDeleteList(sid) {
+	if (state.domains.deleteArm != sid) {
+		state.domains.deleteArm = sid;
+		renderDomains();
+		return;
+	}
+	uci.remove('wanguard-antidpi', sid);
+	state.domains.deleteArm = null;
+	domainsMarkDirty();
+	renderDomains();
+}
+
+/* drop the client-side staged edits without touching the router (the
+ * pending bar's Discard covers the router-side deltas); unload+load is the
+ * uci client's reset for one config */
+function domainsDiscardEdits() {
+	state.domains.dirty = false;
+	state.domains.origEnabled = null;
+	state.domains.deleteArm = null;
+	state.domains.errors = {};
+	state.domains.inputs = {};
+	state.domains.newName = '';
+	uci.unload('wanguard-antidpi');
+	renderDomains();
+}
+
+/* after the shared apply pipeline committed (or the router deltas were
+ * reverted), the editor starts clean from the committed truth */
+function domainsAfterConfigChange() {
+	state.domains.dirty = false;
+	state.domains.origEnabled = null;
+	state.domains.deleteArm = null;
+	state.domains.errors = {};
+	state.domains.inputs = {};
+	state.domains.newName = '';
+	if (state.activeTab == 'domains')
+		renderDomains();
+}
+
+/* the shared pipeline with the editor's one client-side guard: a staged
+ * whitelist mode with an empty merged set would die at render time (the
+ * #70 loud fail) - block it here with an inline explanation instead */
+function domainsApply() {
+	var m = domainsModel();
+	if (m.enabled && m.mergedCount == 0) {
+		ui.addNotification(null, E('p', {},
+			_('Whitelist mode needs at least one domain - add domains or switch back to blanket mode first.')), 'error');
+		return;
+	}
+	reviewApply();
+}
+
+function domainsListPanel(model, l) {
+	var panel = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ l.label, ' ',
+			(l.legacy) ? chipEl({ cls: 'wg-ad-chip-muted', label: _('legacy'),
+				title: _('Pre-domainlist storage (whitelist.domains) - kept for compatibility') }) : E([]),
+			' ',
+			chipEl({ cls: 'wg-ad-chip-muted', label: '%d domain(s)'.format(l.domains.length) })
+		])
+	]);
+	panel.appendChild(kvRow(_('Used by policies'), [
+		(l.policies > 0) ? '%d'.format(l.policies) : _('—'),
+		' ',
+		E('span', { 'class': 'wg-ad-hint' }, [ _('(policy references arrive in a later release)') ])
+	]));
+
+	if (l.domains.length == 0) {
+		panel.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Empty list - contributes no domains.') ]));
+	}
+	l.domains.forEach(function(d, idx) {
+		panel.appendChild(E('div', { 'class': 'wg-ad-domrow' }, [
+			E('span', {}, [ d ]),
+			E('button', {
+				'class': 'wg-ad-domremove',
+				'title': _('Remove from list'),
+				'click': ui.createHandlerFn(null, function() { domainsRemoveDomain(l.sid, idx); })
+			}, [ '✕' ])
+		]));
+	});
+
+	var err = state.domains.errors[l.sid];
+	if (err != null)
+		panel.appendChild(E('div', { 'class': 'wg-ad-error' }, [ err ]));
+	var input = E('input', {
+		'type': 'text',
+		'placeholder': _('domain.example'),
+		'input': function(ev) { state.domains.inputs[l.sid] = ev.target.value; }
+	});
+	input.value = state.domains.inputs[l.sid] || '';
+	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		input,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { domainsAddDomain(l.sid); })
+		}, [ _('Add domain') ])
+	]));
+
+	if (!l.legacy) {
+		var armed = (state.domains.deleteArm == l.sid);
+		panel.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+			E('button', {
+				'class': 'btn cbi-button' + (armed ? ' cbi-button-negative' : ''),
+				'click': ui.createHandlerFn(null, function() { domainsDeleteList(l.sid); })
+			}, [ armed ? _('Confirm delete') : _('Delete list') ])
+		]));
+	}
+	return panel;
+}
+
+function buildDomainsView() {
+	var m = domainsModel();
+	var frag = E([]);
+
+	/* mode card */
+	var modeCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Desync mode') ])
+	]);
+	modeCard.appendChild(chipEl((m.enabled)
+		? { cls: 'wg-ad-chip-ok', label: _('Whitelist mode'), title: _('Desync is applied only to the listed hosts (SNI suffix match)') }
+		: { cls: 'wg-ad-chip-muted', label: _('Blanket mode'), title: _('Desync for every queued target') }));
+	if (m.enabledStaged)
+		modeCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+			label: _('Mode change staged - requires engine restart'),
+			title: _('SIGHUP re-reads list files only; adding or dropping the --hostlist binding needs a restart') }));
+	modeCard.appendChild(kvRow(_('Effective hostlist'), [
+		'%d'.format(m.mergedCount), ' ', _('unique domain(s)')
+	]));
+	if (m.enabled && m.mergedCount == 0)
+		modeCard.appendChild(E('div', { 'class': 'wg-ad-error' }, [
+			_('Whitelist mode with no domains fails at render time - add domains or switch back to blanket mode.')
+		]));
+	modeCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button' + (!m.enabled ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() { domainsSetMode(false); })
+		}, [ _('Blanket') ]),
+		E('button', {
+			'class': 'btn cbi-button' + (m.enabled ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() { domainsSetMode(true); })
+		}, [ _('Whitelist') ])
+	]));
+	frag.appendChild(modeCard);
+
+	/* the lists: legacy first (compat display), then the named sections */
+	frag.appendChild(domainsListPanel(m, m.legacy));
+	m.lists.forEach(function(l) {
+		frag.appendChild(domainsListPanel(m, l));
+	});
+
+	/* new list */
+	var newCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('New domain list') ])
+	]);
+	if (state.domains.errors['__new'] != null)
+		newCard.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.domains.errors['__new'] ]));
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('List name (e.g. Video domains)'),
+		'input': function(ev) { state.domains.newName = ev.target.value; }
+	});
+	nameInput.value = state.domains.newName || '';
+	newCard.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		nameInput,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, domainsCreateList)
+		}, [ _('Create list') ])
+	]));
+	frag.appendChild(newCard);
+
+	/* apply block: the shared pipeline + the honest application badges */
+	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Apply') ])
+	]);
+	if (state.domains.dirty) {
+		if (m.enabledStaged)
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn', label: _('Requires engine restart') }));
+		else
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+				label: _('Applies via reload - live connections stay up'),
+				title: _('SIGHUP re-reads the hostlist files without dropping the queue or connections') }));
+	}
+	else {
+		applyCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No unsaved edits.') ]));
+	}
+	applyCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, domainsApply),
+			'disabled': (!state.domains.dirty || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, domainsDiscardEdits),
+			'disabled': (!state.domains.dirty) ? '' : null
+		}, [ _('Discard edits') ])
+	]));
+	frag.appendChild(applyCard);
+
+	return frag;
+}
+
+/* the tab body renders once per switch (and after applies) - NOT per poll
+ * tick: a rebuild would blow away in-progress edits. The LuCI uci client is
+ * read through a lazy load; a failure renders the honest warn card. */
+function renderDomains() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.setAttribute('data-unavail', 'false');
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'domains' || !state.bodyNode)
+			return;
+		if (state.domains.origEnabled == null)
+			state.domains.origEnabled = (uci.get('wanguard-antidpi', 'whitelist', 'enabled') == '1');
+		state.domains.loaded = true;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(buildDomainsView());
+	}).catch(function(e) {
+		if (state.activeTab != 'domains' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).').format((e && e.message) || 'error') ])
+		]));
+	});
 }
 
 /* ---------- tab frame (issue #80) ---------- */
@@ -771,6 +1179,10 @@ function renderBody() {
 		node.appendChild(renderOverview());
 		return;
 	}
+	if (state.activeTab == 'domains') {
+		renderDomains();
+		return;
+	}
 
 	node.appendChild(E('div', { 'class': 'wg-ad-panel' }, [
 		E('h3', {}, [ tabLabel(state.activeTab) ]),
@@ -818,5 +1230,12 @@ return L.Class.extend({
 	reviewApply: reviewApply,
 	discardPending: discardPending,
 	applyNotice: applyNotice,
-	applySeverity: applySeverity
+	applySeverity: applySeverity,
+	domainIsValid: domainIsValid,
+	domainsModel: domainsModel,
+	renderDomains: renderDomains,
+	buildDomainsView: buildDomainsView,
+	domainsAddDomain: domainsAddDomain,
+	domainsSetMode: domainsSetMode,
+	domainsAfterConfigChange: domainsAfterConfigChange
 });

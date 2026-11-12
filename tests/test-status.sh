@@ -17,6 +17,9 @@
 #   [2] staged UCI delta -> pending count + section names
 #   [3] whitelist mode: refresh -> mode/domains/file.mtime; hostlist NOT in
 #       argv without strategy words
+#   [3b] domainlist sections (#82): merged into the same hostlist file
+#       (dedupe across sources), status.domains stays the legacy list,
+#       per-source loud fails (invalid entry names the section; half-enable)
 #   [4] tunnel: pins + resolved + state file -> per-entry source/expires_h,
 #       cron line -> cron.ok
 #   [5] strategy words -> profile count (1; with --new -> 2), hostlist enters
@@ -115,6 +118,46 @@ grab
 [ "$(jp 's.whitelist.file.mtime')" != "null" ] || fail "expected a file mtime"
 [ "$(jp 'length(s.engine.hostlists)')" = "0" ] || fail "hostlist must NOT enter the argv without strategy words"
 echo "WHITELIST-OK (mode, domains, file mtime; argv untouched without words)"
+
+# ---- [3b] domainlist sections merge into the same hostlist (issue #82) ----
+echo "== [3b] domainlist sections"
+uci set wanguard-antidpi.list_media=domainlist
+uci set wanguard-antidpi.list_media.name='Video domains'
+uci add_list wanguard-antidpi.list_media.domains='zeta.example'
+uci add_list wanguard-antidpi.list_media.domains='beta.example'
+uci set wanguard-antidpi.list_empty=domainlist
+uci set wanguard-antidpi.list_empty.name='Empty section'
+uci commit wanguard-antidpi
+"$CLI" whitelist-refresh >/dev/null
+grep -q 'zeta.example' "$HOSTLIST" || fail "domainlist section did not reach the hostlist"
+grep -q 'beta.example' "$HOSTLIST" || fail "legacy domain lost from the merged file"
+[ "$(grep -c . "$HOSTLIST")" = "3" ] || fail "expected 3 unique hosts after the merge (dedupe across sources)"
+grab
+[ "$(jp 'length(s.whitelist.domains)')" = "2" ] || fail "status domains must stay the legacy list (the #76 contract)"
+# a broken section fails the render LOUDLY, naming the section
+uci add_list wanguard-antidpi.list_media.domains='*.bad.example'
+uci commit wanguard-antidpi
+if "$CLI" engine-cmdline >/dev/null 2>/tmp/dl.err; then
+	fail "invalid domainlist entry must fail the render"
+fi
+grep -q 'domainlist "list_media"' /tmp/dl.err || fail "render failure must name the section"
+# half-enabled (whitelist on, every source empty) stays a loud fail
+uci delete wanguard-antidpi.list_media.domains
+uci delete wanguard-antidpi.whitelist.domains
+uci commit wanguard-antidpi
+if "$CLI" engine-cmdline >/dev/null 2>/tmp/dl.err; then
+	fail "enabled mode with an empty source set must fail the render"
+fi
+grep -q 'no domains are configured' /tmp/dl.err || fail "half-enable failure message lost"
+echo "DOMAINLIST-OK (merged into the hostlist, per-source loud fails)"
+# cleanup: back to the legacy-only whitelist for the following blocks
+uci delete wanguard-antidpi.list_media
+uci delete wanguard-antidpi.list_empty
+uci add_list wanguard-antidpi.whitelist.domains='alpha.example'
+uci add_list wanguard-antidpi.whitelist.domains='beta.example'
+uci commit wanguard-antidpi
+"$CLI" whitelist-refresh >/dev/null
+[ "$(grep -c . "$HOSTLIST")" = "2" ] || fail "cleanup did not restore the legacy-only file"
 
 # ---- [4] tunnel entries ----
 echo "== [4] tunnel entries"

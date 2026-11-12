@@ -27,6 +27,8 @@
 #   [4]  domain-list edit -> SIGHUP (reloaded), pid unchanged
 #   [4b] DRYRUN of the next list edit -> "would reload", no writes
 #   [5]  strategy edit -> restart, pid changed
+#   [5b] whitelist mode flip off -> restart (SIGHUP cannot rebind --hostlist)
+#   [5c] whitelist mode flip on -> restart again, hostlist back
 #   [6]  --check all green (+ --json ok:true, engine pid present)
 #   [7]  --check catches a missing hostlist file
 #   [8]  --check catches a foreign routing-mark
@@ -216,6 +218,38 @@ B=$(epid)
 [ "$B" != "$A" ] || fail "strategy edit did not restart the engine (same pid)"
 grep -q 'delta.example' "$HOSTLIST" || fail "the staged domain did not land with the restart apply"
 echo "RESTART-OK (strategy drift restarted the engine, pid $A -> $B)"
+
+# ---- [5b] whitelist mode flip off -> restart ----
+# only the --hostlist words differ (the per-profile emission is all-or-none),
+# but SIGHUP re-reads list file CONTENT - it cannot drop the binding of a
+# live process. The flip MUST go through a restart (#82 decision fix: the
+# old logic called this "hostlist words changed - reload").
+echo "== [5b] whitelist mode off -> restart"
+uci set wanguard-antidpi.whitelist.enabled='0'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "mode-flip apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+assert_out 'whitelist mode flipped' "$OUT"
+[ -f "$HOSTLIST" ] && fail "blanket apply left the hostlist file in place"
+C=$(epid)
+[ -n "$C" ] || fail "engine did not restart (log: $(cat /tmp/apply-engine.log 2>/dev/null))"
+[ "$C" != "$B" ] || fail "mode flip did not restart the engine (same pid)"
+echo "MODEFLIP-OK (mode off restarted the engine, pid $B -> $C, hostlist removed)"
+
+# ---- [5c] whitelist mode flip on -> restart again, hostlist back ----
+echo "== [5c] whitelist mode on -> restart"
+uci set wanguard-antidpi.whitelist.enabled='1'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "mode-flip-on apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+D=$(epid)
+[ -n "$D" ] || fail "engine did not restart (log: $(cat /tmp/apply-engine.log 2>/dev/null))"
+[ "$D" != "$C" ] || fail "mode flip on did not restart the engine (same pid)"
+[ -f "$HOSTLIST" ] || fail "mode-on apply did not render the hostlist"
+grep -q 'delta.example' "$HOSTLIST" || fail "the merged set lost a domain at the mode-on restart"
+echo "MODEFLIP-ON-OK (mode on restarted the engine, pid $C -> $D, hostlist back)"
 
 # ---- [6] --check all green ----
 echo "== [6] --check all green"

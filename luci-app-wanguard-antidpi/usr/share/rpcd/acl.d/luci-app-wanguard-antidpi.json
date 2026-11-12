@@ -14,7 +14,7 @@
 		"write": {
 			"ubus": {
 				"file": [ "exec" ],
-				"uci": [ "apply", "confirm", "revert" ]
+				"uci": [ "add", "apply", "confirm", "delete", "order", "revert", "set" ]
 			},
 			"file": {
 				"/usr/bin/wanguard-antidpi": [ "exec" ]

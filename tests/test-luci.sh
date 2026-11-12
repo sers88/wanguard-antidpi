@@ -171,7 +171,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold + overview in the package (issues #80/#81)"
+echo "== [8] page scaffold + overview + domains tab (issues #80/#81/#82)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -210,11 +210,19 @@ grep -qF "'wanguard-antidpi'" "$CORE" \
 grep -qF "uci.apply(5)" "$CORE" \
 	|| fail "Review & Apply must commit staged UCI (the CLI reads committed only)"
 # the ACL carries the bar's uci verbs (read-side badge re-query + write-side
-# revert/apply/confirm - rpcd checks method AND config against the ACL)
+# revert/apply/confirm - rpcd checks method AND config against the ACL) plus
+# the #82 editor's staging grants (uci save() sends add/set/delete/order)
 grep -qF '"uci": [ "get", "changes" ]' /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json \
 	|| fail "ACL read class lost the uci get/changes grant"
-grep -qF '"uci": [ "apply", "confirm", "revert" ]' /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json \
-	|| fail "ACL write class lost the uci apply/confirm/revert grant"
+grep -qF '"uci": [ "add", "apply", "confirm", "delete", "order", "revert", "set" ]' /usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json \
+	|| fail "ACL write class lost the uci staging/apply grants (#82)"
+# the #82 Domain lists tab: the section type and the strict-DNS guard are
+# pinned structurally - the editor stages client-side and applies through
+# the shared save -> apply(5) -> CLI apply pipeline
+grep -qF "'domainlist'" "$CORE" \
+	|| fail "the domains tab lost the domainlist section type"
+grep -qF "domainsModel" "$CORE" \
+	|| fail "the domains tab lost its view model (legacy + named lists)"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

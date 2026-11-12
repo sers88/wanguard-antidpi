@@ -109,3 +109,20 @@ config whitelist 'whitelist'
 	#	option enabled '0'
 	#	list domains 'example.org'
 	#	list domains 'example.net'
+
+# ---- named domain lists (issue #82) ----
+# Additional sources for the same hostlist file: every `config domainlist`
+# section below merges with whitelist.domains (deduped, sorted) when
+# whitelist mode is on. The section NAME is the stable id (policies
+# reference it), `name` is the editable label shown in the LuCI page.
+# Same strict DNS rules: no wildcards (suffix matching already covers
+# subdomains), no commas/spaces (rejected loudly at render time).
+#
+# Lists are edited from Network -> Wanguard -> Anti-DPI -> Domain lists;
+# they are inert while whitelist mode is off (blanket mode desyncs
+# everything regardless of any list).
+#
+#config domainlist 'list_media'
+#	option name 'Video domains'
+#	list domains 'example.org'
+#	list domains 'example.net'
