@@ -552,8 +552,19 @@ What runs where:
   guard against the `luci-app-wanguard` fixture, child-node completeness,
   sort-order probes (both the winning name and the losing default name),
   merged / standalone / read-only / ACL-negative tree scenarios, the
-  byte-identical-parent deviation proof, the live menu.d shape and the
-  `apk del` behavior.
+  byte-identical-parent deviation proof, the live install matrix
+  (issue #89: antidpi-only -> both -> wanguard-only after `apk del`) and
+  the `apk del` behavior.
+- `tests/luci/run-tests.js` - the LuCI view tests (issue #89; runs with
+  plain `node`, no router involved): the REAL view + core module from the
+  package are evaluated in node with stubbed LuCI globals (`view` / `poll`
+  / `rpc` / `uci` / `ui` / `E`), covering every sub-tab - the #81 overview
+  cards and the pending-bar apply pipeline, #82 domain lists staging,
+  #83 tunnel editors, #84/#85 profiles (presets, honest badges, reorder),
+  #86/#87 policies (ref validation before staging, drag priority,
+  metadata-only vs restart badges) and #88 tests & logs (counter delta,
+  debug toggle, log viewer degradations). CI runs the same file in the
+  same `node:24` container (`view-test` job / `dev-test.sh` step 13).
 
 ### Test matrix = release gate (issue #63)
 
@@ -569,7 +580,8 @@ needs every matrix job green:
 | nft table | `tests/test-nft.sh` | apply shape (priority 101, 2 queue rules, both sets, notrack predefrag #68), re-apply byte-identical, bypass with the engine down, engine queue bind, scope negatives, flush |
 | Resolver updater | `tests/test-tunnel.sh` | multi-A answers into the sorted UCI list, set-update idempotency, dedupe, partial/total failure behavior, per-IP expiry, live apply/update, no-table guard |
 | Graceful no-op | across the matrix | empty strategy + 6-word `engine-cmdline` golden (smoke), marked traffic flows with the engine down (`test-nft.sh` BYPASS), graceful no-mihomo-config paths (`test-mark.sh`, smoke) |
-| LuCI menu + ACL | `tests/test-luci.sh` | both packages install (luci-base dependency resolves), dispatcher fidelity guard, parent-node golden guard (fixture) + child completeness, sort-order (winning + losing name), merged/standalone/read-only/acl-negative trees, byte-identical-parent deviation proof, live menu.d shape, `apk del` removes the tab only |
+| LuCI menu + ACL | `tests/test-luci.sh` | both packages install (luci-base dependency resolves), dispatcher fidelity guard, parent-node golden guard (fixture) + child completeness, sort-order (winning + losing name), merged/standalone/read-only/acl-negative trees, byte-identical-parent deviation proof, the live install matrix - antidpi-only (one real tab) / both (real node wins the placeholder) / wanguard-only (stub tab, page files gone after `apk del`), `apk del` removes the tab only |
+| LuCI views | `tests/luci/run-tests.js` (node) | the real view + core evaluated with stubbed LuCI globals: every sub-tab covered (overview cards + apply pipeline, domain lists, tunnel, profiles, policies, tests & logs), staging never happens on invalid input, honest badges (restart vs reload vs metadata-only), poll ticks never rebuild editor tabs, degraded surfaces stay alive |
 
 Known limitation: live NFQUEUE scenarios (real packets processed through the
 queue) cannot run in a container whose host kernel lacks queue support - on
@@ -578,10 +590,10 @@ such hosts the matrix stays structural (`NFT-LIVE-SKIP` /
 
 CI pipeline (`feed.yml`): `build` (one tag = both packages, guard asserted) ->
 matrix (`smoke-test`, `mark-test`, `nft-test`, `tunnel-test`, `status-test`,
-`apply-test`, `luci-test` in parallel) -> `publish` (sign the index, push
-the `feed` branch; tag pushes only) -> `feed-test` (install from the live
-feed as the final canary; cannot precede publication by definition - the
-matrix already install-tested the same artifact before it was published).
+`apply-test`, `luci-test`, `view-test` in parallel) -> `publish` (sign the
+index, push the `feed` branch; tag pushes only) -> `feed-test` (install from
+the live feed as the final canary; cannot precede publication by definition -
+the matrix already install-tested the same artifact before it was published).
 
 ### Updating the upstream engine
 

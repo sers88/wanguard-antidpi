@@ -17,14 +17,18 @@
 #       ACL group is HIDDEN in standalone mode (dispatcher apply_tree_acls)
 #       - which is why the shipped parent carries OUR group (deviation from
 #       the issue's literal byte-identity, documented in the issue comment)
-#   [7] live menu.d shape with a simulated luci-app-wanguard installed
+#   [7] the #89 install matrix on the LIVE menu.d: antidpi-only (standalone
+#       Wanguard menu, one real tab) -> both installed (the real node wins
+#       the placeholder; luci-app-wanguard = byte-snapshot fixture)
 #   [8] the #80 page scaffold in the package: view/wanguard/antidpi.js +
 #       wanguard-antidpi/core.js land at the /www LuCI paths with the
 #       structural anchors (core require, status --json exec, the six
 #       sub-tabs); the placeholder view stays luci-app-wanguard's file
 #   [9] apk del removes the real tab AND the page files, keeps the simulated
 #       luci-app-wanguard file and the core package - the Anti-DPI tab falls
-#       back to the luci-app-wanguard placeholder (#79 fixture sync)
+#       back to the luci-app-wanguard placeholder (#79 fixture sync); this
+#       is the wanguard-only combo of the #89 install matrix (the stub tab,
+#       no real page files)
 #
 # Usage: test-luci.sh <version>
 set -eu
@@ -160,7 +164,19 @@ expect 'byte-identical parent hidden in standalone (deviation is load-bearing)' 
 	"$out"
 echo "BYTEPARENT-PROOF-OK"
 
-echo "== [7] live menu.d shape (simulated luci-app-wanguard installed)"
+echo "== [7] live menu.d - antidpi-only combo, then both (#89 install matrix)"
+# the live menu.d right after our install carries ONLY our file (luci-app
+# -wanguard is not installed): the standalone Wanguard menu is one real tab
+out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-ours.json)
+expect 'antidpi-only live: parent (one tab)' \
+	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard-antidpi children=antidpi' \
+	"$out"
+expect 'antidpi-only live: antidpi (real page, no placeholder)' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI acl=luci-app-wanguard-antidpi order=35 path=wanguard/antidpi' \
+	"$out"
+echo "COMBO-ANTIDPI-ONLY-OK"
+# installing luci-app-wanguard (the byte-snapshot fixture) merges both files:
+# the real node wins over the placeholder (file sort-order contract)
 cp "$FIXT" /usr/share/luci/menu.d/luci-app-wanguard.json
 out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-both.json)
 expect 'live: parent' \

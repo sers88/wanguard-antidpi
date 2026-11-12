@@ -301,11 +301,26 @@ jobs:
             openwrt/rootfs:x86_64-25.12.6 \
             sh /tests/test-luci.sh "$VER"
 
+  view-test:
+    name: Matrix - luci views (node container)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: View tests on the real view + core with LuCI stubs (same node:24 container as dev-test step 13)
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            -w /repo \
+            node:24-alpine \
+            node tests/luci/run-tests.js
+
   # ---- publication gate: reached only when the whole matrix is green.
   # ---- Tag pushes only - dispatch runs validate without publishing.
   publish:
     name: Sign index, publish feed branch (gated by the matrix)
-    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, events-test, luci-test]
+    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, events-test, luci-test, view-test]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
