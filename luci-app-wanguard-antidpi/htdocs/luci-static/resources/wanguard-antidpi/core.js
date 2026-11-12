@@ -77,21 +77,22 @@ var state = {
 		errors: {},       /* inline validation errors, per option */
 		inputs: {}        /* add-pin / add-host / number input texts (survive re-renders) */
 	},
-	profiles: {         /* Profiles tab (#84): client-side staged editor */
+	profiles: {         /* Profiles tab (#84/#85): list + drawer staged editor */
 		loaded: false,    /* the uci config has been read at least once */
 		dirty: false,     /* staged edits awaiting the apply pipeline */
 		origStrategy: null, /* committed strategy key at load time (restart-badge detect) */
 		deleteArm: null,  /* sid armed for the two-step profile delete */
-		errors: {},       /* inline validation errors, per profile (and '__new') */
-		inputs: {},       /* per-profile words textarea + name input texts */
-		newName: ''       /* new-profile label input text */
+		editor: null,     /* drawer: { sid: 'new'|<sid>, presetArm: bool } or null */
+		draft: null,      /* new-profile drawer draft: { name, proto, wordsText, color } */
+		errors: {},       /* inline validation errors, per profile (and 'editor') */
+		inputs: {}        /* per-profile words textarea + name input texts */
 	},
 	busy: false
 };
 
 /* sub-tab frame (issue #80): the order of the concept mock; the content of
  * each tab lands with its own stage (#81 overview done, #82 domain lists,
- * #83 tunnel protection, #84 profiles, #86 policies, #88 tests & logs) */
+ * #83 tunnel protection, #84/#85 profiles (list + drawer + presets), #86 policies, #88 tests & logs) */
 var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'tunnel', 'tests' ];
 
 function tabLabel(id) {
@@ -147,7 +148,15 @@ var CSS = [
 	".wg-ad-domremove { background:none; border:none; cursor:pointer; color:#c2410c; padding:0 .3em; font-size:1em; }",
 	".wg-ad-addrow { display:flex; gap:.4em; margin:.5em 0 0; }",
 	".wg-ad-addrow input { flex:1; min-width:14em; }",
-	".wg-ad-profhead { display:flex; align-items:center; gap:.4em; flex-wrap:wrap; margin-bottom:.4em; }",
+	".wg-ad-profrow { display:flex; align-items:center; gap:.5em; flex-wrap:wrap; padding:.45em 0; border-top:1px solid rgba(128,128,128,.18); }",
+	".wg-ad-profrow-off { opacity:.55; }",
+	".wg-ad-dot-blue { background:#2563EB; }",
+	".wg-ad-dot-green { background:#22C55E; }",
+	".wg-ad-dot-purple { background:#7C3AED; }",
+	".wg-ad-dot-orange { background:#EA580C; }",
+	".wg-ad-dot-gray { background:#6B7280; }",
+	".wg-ad-editor { background:rgba(128,128,128,.06); border:1px solid rgba(128,128,128,.3); border-left:4px solid rgba(128,128,128,.45); border-radius:6px; padding:1em; margin:0 0 .9em; }",
+	".wg-ad-presetrow { display:flex; gap:.5em; align-items:center; flex-wrap:wrap; margin:.4em 0; }",
 	".wg-ad-words { width:100%; min-height:7em; font-family:monospace; font-size:.85em; white-space:pre; }"
 ].join('\n');
 
@@ -446,11 +455,19 @@ function buildStrategyCard() {
 	});
 	card.appendChild(table);
 
+	/* the concept's "Open profiles" affordance (#85): jump from the live
+	 * strategy view to the profiles management */
 	var meta = [];
 	if (st.engine && st.engine.version != null)
 		meta.push(st.engine.version);
-	meta.push(_('Read-only: profile management arrives in a later release.'));
-	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ meta.join(' · ') ]));
+	card.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { switchTab('profiles'); })
+		}, [ _('Open profiles') ])
+	]));
+	if (meta.length)
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ meta.join(' · ') ]));
 	return card;
 }
 
@@ -1584,7 +1601,7 @@ function renderTunnel() {
 	});
 }
 
-/* ---------- profiles tab (#84) ---------- */
+/* ---------- profiles tab (#84/#85) ---------- */
 
 /* named strategy profiles (config profile): one section = one nfqws2
  * profile block on the render, in section file order; the section id is
@@ -1592,7 +1609,69 @@ function renderTunnel() {
  * editable. The editor stages client-side through the uci client (the
  * #82/#83 lifecycle) and applies through the shared save -> apply(5) ->
  * CLI apply pipeline; strategy/enabled edits drift the engine argv, so
- * the honest badge is a restart. */
+ * the honest badge is a restart. The #85 concept adds the list view
+ * (color dot, protocol badges, policy counter) and a New/Edit drawer
+ * with generic presets. */
+
+/* color palette (design contract: the dot, same keys as the wanguard
+ * group colors; `option color` is pure UI identity metadata) */
+var PROFILE_COLORS = {
+	blue: '#2563EB',
+	green: '#22C55E',
+	purple: '#7C3AED',
+	orange: '#EA580C',
+	gray: '#6B7280'
+};
+
+/* generic strategy presets (#85): STARTING POINTS for the words editor,
+ * not tuned strategies - each word is engine-valid and the combination
+ * follows the README tuning section (the canonical --payload types and
+ * a bare desync function). No provider-specific tuning lives here (the
+ * private-strategy policy). tests/test-profiles.sh starts the engine on
+ * BOTH presets byte-exactly, and tests/test-luci.sh pins the same words
+ * in this file - the three stay in sync by construction. */
+var PROFILE_PRESETS = [
+	{
+		id: 'tls-split',
+		label: _('TLS over TCP (generic)'),
+		proto: 'tcp',
+		words: [ '--filter-tcp=443', '--payload=tls_client_hello',
+			'--lua-desync=multisplit:pos=midsld' ]
+	},
+	{
+		id: 'quic-fake',
+		label: _('QUIC over UDP (generic)'),
+		proto: 'quic',
+		words: [ '--filter-udp=443', '--payload=quic_initial',
+			'--lua-desync=fake:repeats=2' ]
+	}
+];
+
+/* how many policy sections reference this profile (the #86 ref contract:
+ * `option profile <sid>`; zero while no policies exist, but the guard
+ * must be live from day one so a delete can never orphan a policy) */
+function profilesPolicyUse(sid) {
+	var n = 0;
+	(uci.sections('wanguard-antidpi', 'policy') || []).forEach(function(s) {
+		if (s.profile == sid)
+			n++;
+	});
+	return n;
+}
+
+/* protocol badges are derived from the WORDS (the engine truth: the
+ * --filter flags scope the desync), not from the proto metadata option
+ * (design: the engine renders by words, proto is advisory) */
+function profilesProtoOfWords(words) {
+	var out = [];
+	words.forEach(function(w) {
+		if (w.indexOf('--filter-tcp=') == 0 && out.indexOf('TCP') < 0)
+			out.push('TCP');
+		if (w.indexOf('--filter-udp=') == 0 && out.indexOf('QUIC') < 0)
+			out.push('QUIC');
+	});
+	return out;
+}
 
 function profilesModel() {
 	var legacy = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(
@@ -1609,7 +1688,9 @@ function profilesModel() {
 				return out;
 			})(s.proto),
 			words: (Array.isArray(s.strategy_words) ? s.strategy_words : []).slice(),
-			enabled: (s.enabled != null) ? (s.enabled == '1') : true
+			enabled: (s.enabled != null) ? (s.enabled == '1') : true,
+			color: (typeof s.color == 'string' && PROFILE_COLORS[s.color]) ? s.color : 'gray',
+			policies: profilesPolicyUse(s['.name'])
 		};
 	});
 	return {
@@ -1716,25 +1797,55 @@ function profilesSetEnabled(sid, on) {
 	renderProfiles();
 }
 
+/* the dot color (UI identity metadata - never enters the engine argv) */
+function profilesSetColor(sid, color) {
+	uci.set('wanguard-antidpi', sid, 'color', color);
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+/* create a profile from the drawer draft (name required, words must pass
+ * the one-word-per-line validation - invalid input is never staged) */
 function profilesAddProfile() {
-	var label = (state.profiles.newName || '').trim();
+	var d = state.profiles.draft || {};
+	var label = (d.name || '').trim();
 	if (label.length == 0) {
-		state.profiles.errors['__new'] = _('Enter a profile name.');
+		state.profiles.errors.editor = _('Enter a profile name.');
 		renderProfiles();
 		return;
 	}
-	delete state.profiles.errors['__new'];
+	var parsed = profilesParseWords(d.wordsText);
+	if (parsed.bad.length) {
+		state.profiles.errors.editor = _('Each strategy word must be a single argv word (no whitespace): %s').format(parsed.bad.join(', '));
+		renderProfiles();
+		return;
+	}
+	delete state.profiles.errors.editor;
 	var sid = profilesSlug(label);
 	uci.add('wanguard-antidpi', 'profile', sid);
 	uci.set('wanguard-antidpi', sid, 'name', label);
-	uci.set('wanguard-antidpi', sid, 'strategy_words', []);
+	uci.set('wanguard-antidpi', sid, 'strategy_words', parsed.words);
 	uci.set('wanguard-antidpi', sid, 'enabled', '1');
-	state.profiles.newName = '';
+	if (d.proto && d.proto.length)
+		uci.set('wanguard-antidpi', sid, 'proto', d.proto.slice().sort().join(' '));
+	if (d.color && PROFILE_COLORS[d.color])
+		uci.set('wanguard-antidpi', sid, 'color', d.color);
+	state.profiles.editor = null;
+	state.profiles.draft = null;
 	profilesMarkDirty();
 	renderProfiles();
 }
 
 function profilesDeleteProfile(sid) {
+	/* policy-ref guard (#85): a delete must never orphan a policy - the
+	 * user unlinks the policies first (the #86 editor owns that flow) */
+	var used = profilesPolicyUse(sid);
+	if (used > 0) {
+		state.profiles.errors[sid] = _('Referenced by %d policy(s) - unlink them first.').format(used);
+		state.profiles.deleteArm = null;
+		renderProfiles();
+		return;
+	}
 	if (state.profiles.deleteArm != sid) {
 		state.profiles.deleteArm = sid;
 		renderProfiles();
@@ -1742,6 +1853,63 @@ function profilesDeleteProfile(sid) {
 	}
 	uci.remove('wanguard-antidpi', sid);
 	state.profiles.deleteArm = null;
+	if (state.profiles.editor && state.profiles.editor.sid == sid)
+		state.profiles.editor = null;
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+/* ---------- profiles drawer (#85) ---------- */
+
+function profilesOpenEditor(sid) {
+	state.profiles.deleteArm = null;
+	if (sid == 'new')
+		state.profiles.draft = { name: '', proto: [], wordsText: '', color: 'blue' };
+	else
+		delete state.profiles.inputs[sid + '.words'];
+	state.profiles.editor = { sid: sid, presetArm: false };
+	delete state.profiles.errors.editor;
+	renderProfiles();
+}
+
+function profilesCloseEditor() {
+	state.profiles.editor = null;
+	state.profiles.draft = null;
+	delete state.profiles.errors.editor;
+	renderProfiles();
+}
+
+/* apply a preset's words+proto onto the drawer target. In the new-profile
+ * draft it just fills the form; on an existing profile it is a two-step
+ * action when words are already staged (no silent overwrite). */
+function profilesApplyPreset(pid) {
+	var preset = null;
+	PROFILE_PRESETS.forEach(function(p) {
+		if (p.id == pid)
+			preset = p;
+	});
+	if (!preset)
+		return;
+	var ed = state.profiles.editor;
+	if (!ed)
+		return;
+	if (ed.sid == 'new') {
+		state.profiles.draft.wordsText = preset.words.join('\n');
+		state.profiles.draft.proto = preset.proto.split(' ').slice();
+		renderProfiles();
+		return;
+	}
+	var cur = uci.get('wanguard-antidpi', ed.sid, 'strategy_words');
+	var hasWords = (Array.isArray(cur) && cur.length > 0);
+	if (hasWords && !ed.presetArm) {
+		ed.presetArm = true;
+		renderProfiles();
+		return;
+	}
+	uci.set('wanguard-antidpi', ed.sid, 'strategy_words', preset.words.slice());
+	uci.set('wanguard-antidpi', ed.sid, 'proto', preset.proto);
+	delete state.profiles.inputs[ed.sid + '.words'];
+	ed.presetArm = false;
 	profilesMarkDirty();
 	renderProfiles();
 }
@@ -1790,9 +1958,10 @@ function profilesDiscardEdits() {
 	state.profiles.dirty = false;
 	state.profiles.origStrategy = null;
 	state.profiles.deleteArm = null;
+	state.profiles.editor = null;
+	state.profiles.draft = null;
 	state.profiles.errors = {};
 	state.profiles.inputs = {};
-	state.profiles.newName = '';
 	uci.unload('wanguard-antidpi');
 	renderProfiles();
 }
@@ -1803,9 +1972,10 @@ function profilesAfterConfigChange() {
 	state.profiles.dirty = false;
 	state.profiles.origStrategy = null;
 	state.profiles.deleteArm = null;
+	state.profiles.editor = null;
+	state.profiles.draft = null;
 	state.profiles.errors = {};
 	state.profiles.inputs = {};
-	state.profiles.newName = '';
 	if (state.activeTab == 'profiles')
 		renderProfiles();
 }
@@ -1844,38 +2014,31 @@ function profilesLegacyCard(m) {
 	return card;
 }
 
-function profilesSectionCard(m, p, idx) {
+/* one list row (the #85 concept): color dot, name, protocol badges
+ * derived from the words, word-count hint, policy counter, and the
+ * row actions (order / edit / guarded delete) */
+function profilesListRow(m, p, idx) {
 	var armed = (state.profiles.deleteArm == p.sid);
-	var wordsText = state.profiles.inputs[p.sid + '.words'];
-	if (wordsText == null)
-		wordsText = p.words.join('\n');
-	var card = E('div', { 'class': 'wg-ad-panel' });
-	var head = E('div', { 'class': 'wg-ad-profhead' }, [
-		E('strong', {}, [ p.name ]),
-		' ',
-		(p.enabled)
-			? chipEl({ cls: 'wg-ad-chip-ok', label: _('enabled') })
-			: chipEl({ cls: 'wg-ad-chip-muted', label: _('disabled') }),
-		' ',
-		chipEl({ cls: 'wg-ad-chip-muted', label: '%d word(s)'.format(p.words.length) }),
-		(!p.enabled)
-			? E('span', { 'class': 'wg-ad-hint' }, [ ' ' + _('skipped on the render') ])
-			: ((p.words.length == 0)
-				? E('span', { 'class': 'wg-ad-hint' }, [ ' ' + _('no words - contributes nothing to the strategy') ])
-				: E([]))
-	]);
-	card.appendChild(head);
-
-	/* name + enabled + order/remove row */
-	var nameInput = E('input', {
-		'type': 'text',
-		'placeholder': _('Profile name'),
-		'input': function(ev) {
-			state.profiles.inputs[p.sid + '.name'] = ev.target.value;
-			profilesSetName(p.sid, ev.target.value);
-		}
+	var protoBadges = profilesProtoOfWords(p.words);
+	var row = E('div', { 'class': 'wg-ad-profrow' + (p.enabled ? '' : ' wg-ad-profrow-off') });
+	row.appendChild(E('span', {
+		'class': 'wg-ad-dot wg-ad-dot-' + p.color,
+		'title': _('Color: %s').format(p.color)
+	}));
+	row.appendChild(E('strong', {}, [ p.name ]));
+	if (!p.enabled)
+		row.appendChild(chipEl({ cls: 'wg-ad-chip-muted', label: _('disabled') }));
+	protoBadges.forEach(function(b) {
+		row.appendChild(chipEl({ cls: 'wg-ad-chip-muted', label: b }));
 	});
-	nameInput.value = state.profiles.inputs[p.sid + '.name'] || p.name;
+	if (!p.enabled)
+		row.appendChild(E('span', { 'class': 'wg-ad-hint' }, [ _('skipped on the render') ]));
+	else if (p.words.length == 0)
+		row.appendChild(E('span', { 'class': 'wg-ad-hint' }, [ _('no words - contributes nothing to the strategy') ]));
+	if (p.policies > 0)
+		row.appendChild(chipEl({ cls: 'wg-ad-chip-muted', label: '%d policy(s)'.format(p.policies) }));
+	else
+		row.appendChild(E('span', { 'class': 'wg-ad-hint' }, [ _('No policies') ]));
 	var actions = E('div', { 'class': 'wg-ad-actions' }, [
 		E('button', {
 			'class': 'btn cbi-button',
@@ -1890,54 +2053,197 @@ function profilesSectionCard(m, p, idx) {
 			'click': ui.createHandlerFn(null, function() { profilesMove(p.sid, 1); })
 		}, [ '↓' ]),
 		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { profilesOpenEditor(p.sid); })
+		}, [ _('Edit') ]),
+		E('button', {
 			'class': 'btn cbi-button cbi-button-negative',
+			'title': (p.policies > 0) ? _('Unlink the policies first.') : null,
+			'disabled': (p.policies > 0) ? '' : null,
 			'click': ui.createHandlerFn(null, function() { profilesDeleteProfile(p.sid); })
 		}, [ armed ? _('Confirm delete?') : _('Delete') ])
 	]);
-	card.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [ nameInput, actions ]));
+	row.appendChild(actions);
+	var wrap = E('div', {}, [ row ]);
+	if (state.profiles.errors[p.sid] != null) {
+		wrap.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors[p.sid] ]));
+		delete state.profiles.errors[p.sid];
+	}
+	return wrap;
+}
 
-	/* enabled + proto toggles */
-	var enabledCheck = E('input', { 'type': 'checkbox' });
-	enabledCheck.checked = p.enabled;
-	enabledCheck.addEventListener('change', function(ev) {
-		profilesSetEnabled(p.sid, ev.target.checked);
+/* color picker row (shared by the drawer modes): the palette keys render
+ * as dots; the active key gets the active button style */
+function profilesColorRow(current, onPick) {
+	var row = E('div', { 'class': 'wg-ad-chips' }, [
+		E('span', { 'class': 'wg-ad-hint' }, [ _('Color dot:') ])
+	]);
+	Object.keys(PROFILE_COLORS).forEach(function(k) {
+		row.appendChild(E('button', {
+			'class': 'btn cbi-button' + ((current == k) ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() { onPick(k); })
+		}, [ E('span', { 'class': 'wg-ad-dot wg-ad-dot-' + k }), ' ' + k ]));
 	});
-	var protoRow = E('div', { 'class': 'wg-ad-chips' }, [
-		E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('enabled') ]),
+	return row;
+}
+
+/* proto toggle row (shared): the tokens are UI metadata for the future
+ * policy matching (#86); the badges on the list derive from the words */
+function profilesProtoRowOf(current, onToggle) {
+	var row = E('div', { 'class': 'wg-ad-chips' }, [
 		E('span', { 'class': 'wg-ad-hint' }, [ _('Protocols (UI metadata):') ])
 	]);
 	[ 'tcp', 'udp', 'quic' ].forEach(function(tok) {
-		protoRow.appendChild(E('button', {
-			'class': 'btn cbi-button' + ((p.proto.indexOf(tok) >= 0) ? ' wg-ad-modebtn-active' : ''),
-			'click': ui.createHandlerFn(null, function() {
-				profilesToggleProto(p.sid, tok, p.proto.indexOf(tok) < 0);
-			})
+		row.appendChild(E('button', {
+			'class': 'btn cbi-button' + ((current.indexOf(tok) >= 0) ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() { onToggle(tok); })
 		}, [ tok.toUpperCase() ]));
 	});
-	card.appendChild(protoRow);
+	return row;
+}
 
-	/* strategy words: one per line */
+function profilesPresetRow(armed) {
+	var row = E('div', { 'class': 'wg-ad-presetrow' }, [
+		E('span', { 'class': 'wg-ad-hint' }, [ _('Generic presets (starting points - tune in the words editor):') ])
+	]);
+	PROFILE_PRESETS.forEach(function(p) {
+		row.appendChild(E('button', {
+			'class': 'btn cbi-button',
+			'title': p.words.join('\n'),
+			'click': ui.createHandlerFn(null, function() { profilesApplyPreset(p.id); })
+		}, [ (armed && ed().sid != 'new')
+			? _('Confirm: replace words with "%s"?').format(p.label)
+			: p.label ]));
+	});
+	return row;
+}
+
+/* the drawer target: either the new-profile draft or an existing section */
+function ed() {
+	return state.profiles.editor || {};
+}
+
+function profilesEditorPanel(m) {
+	var edv = state.profiles.editor;
+	var isNew = (edv.sid == 'new');
+	var p = null;
+	if (!isNew) {
+		m.sections.forEach(function(s) {
+			if (s.sid == edv.sid)
+				p = s;
+		});
+		if (!p) /* the section vanished (deleted from another view) */
+			return null;
+	}
+
+	var panel = E('div', { 'class': 'wg-ad-editor' }, [
+		E('h3', {}, [ isNew ? _('New profile') : _('Edit profile: %s').format(p.name) ])
+	]);
+
+	/* name */
+	var nameVal, onName;
+	if (isNew) {
+		nameVal = function() { return state.profiles.draft.name; };
+		onName = function(v) { state.profiles.draft.name = v; };
+	}
+	else {
+		nameVal = function() { return state.profiles.inputs[p.sid + '.name'] || p.name; };
+		onName = function(v) {
+			state.profiles.inputs[p.sid + '.name'] = v;
+			profilesSetName(p.sid, v);
+		};
+	}
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('Profile name'),
+		'input': function(ev) { onName(ev.target.value); }
+	});
+	nameInput.value = nameVal();
+	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [ nameInput ]));
+
+	/* proto + presets */
+	var protoVal = isNew
+		? function() { return state.profiles.draft.proto; }
+		: function() { return p.proto; };
+	var protoToggle = isNew
+		? function(tok) {
+			var a = state.profiles.draft.proto;
+			var i = a.indexOf(tok);
+			if (i >= 0) a.splice(i, 1); else a.push(tok);
+			renderProfiles();
+		}
+		: function(tok) { profilesToggleProto(p.sid, tok, p.proto.indexOf(tok) < 0); };
+	panel.appendChild(profilesProtoRowOf(protoVal(), protoToggle));
+	panel.appendChild(profilesPresetRow(edv.presetArm));
+
+	/* words */
+	var wordsVal = isNew
+		? function() { return state.profiles.draft.wordsText; }
+		: function() {
+			var t = state.profiles.inputs[p.sid + '.words'];
+			return (t == null) ? p.words.join('\n') : t;
+		};
 	var wordsInput = E('textarea', {
 		'class': 'wg-ad-words',
 		'spellcheck': 'false',
 		'placeholder': _('--filter-tcp=443\n--payload=tls_client_hello\n--lua-desync=…'),
 		'input': function(ev) {
-			state.profiles.inputs[p.sid + '.words'] = ev.target.value;
+			if (isNew)
+				state.profiles.draft.wordsText = ev.target.value;
+			else
+				state.profiles.inputs[p.sid + '.words'] = ev.target.value;
 		},
 		'change': function(ev) {
-			state.profiles.inputs[p.sid + '.words'] = ev.target.value;
-			profilesSetWords(p.sid);
+			if (isNew) {
+				state.profiles.draft.wordsText = ev.target.value;
+				renderProfiles();
+			}
+			else {
+				state.profiles.inputs[p.sid + '.words'] = ev.target.value;
+				profilesSetWords(p.sid);
+			}
 		}
 	});
-	wordsInput.value = wordsText;
-	card.appendChild(wordsInput);
-	if (state.profiles.errors[p.sid] != null)
-		card.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors[p.sid] ]));
-	else
-		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
-			_('One strategy word per line (the nfqws2 argv grammar - each line becomes one engine argument).')
+	wordsInput.value = wordsVal();
+	panel.appendChild(wordsInput);
+	panel.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('One strategy word per line (the nfqws2 argv grammar - each line becomes one engine argument).')
+	]));
+
+	/* color + enabled */
+	var colorVal = isNew ? state.profiles.draft.color : p.color;
+	var colorPick = isNew
+		? function(k) { state.profiles.draft.color = k; renderProfiles(); }
+		: function(k) { profilesSetColor(p.sid, k); };
+	panel.appendChild(profilesColorRow(colorVal, colorPick));
+	if (!isNew) {
+		var enabledCheck = E('input', { 'type': 'checkbox' });
+		enabledCheck.checked = p.enabled;
+		enabledCheck.addEventListener('change', function(ev) {
+			profilesSetEnabled(p.sid, ev.target.checked);
+		});
+		panel.appendChild(E('div', { 'class': 'wg-ad-chips' }, [
+			E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('enabled') ])
 		]));
-	return card;
+	}
+
+	if (state.profiles.errors.editor != null)
+		panel.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors.editor ]));
+
+	/* footer actions */
+	var footer = [];
+	if (isNew) {
+		footer.push(E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, profilesAddProfile)
+		}, [ _('Create profile') ]));
+	}
+	footer.push(E('button', {
+		'class': 'btn cbi-button',
+		'click': ui.createHandlerFn(null, profilesCloseEditor)
+	}, [ isNew ? _('Cancel') : _('Close') ]));
+	panel.appendChild(E('div', { 'class': 'wg-ad-actions' }, footer));
+	return panel;
 }
 
 function buildProfilesView() {
@@ -1948,39 +2254,31 @@ function buildProfilesView() {
 	if (legacyCard != null)
 		frag.appendChild(legacyCard);
 
-	if (m.sections.length == 0) {
-		frag.appendChild(E('div', { 'class': 'wg-ad-panel' }, [
-			E('h3', {}, [ _('Strategy profiles') ]),
-			E('p', { 'class': 'wg-ad-hint' }, [
-				_('No profiles configured - the legacy strategy words drive the engine.')
-			])
-		]));
-	}
-
-	m.sections.forEach(function(p, idx) {
-		frag.appendChild(profilesSectionCard(m, p, idx));
-	});
-
-	/* add-profile row */
-	var nameInput = E('input', {
-		'type': 'text',
-		'placeholder': _('New profile name (e.g. Balanced)'),
-		'input': function(ev) { state.profiles.newName = ev.target.value; }
-	});
-	nameInput.value = state.profiles.newName;
-	var addCard = E('div', { 'class': 'wg-ad-panel' }, [
-		E('h3', {}, [ _('Add profile') ])
+	/* the list panel (#85 concept): rows + New profile */
+	var list = E('div', { 'class': 'wg-ad-panel' });
+	var head = E('div', { 'class': 'wg-ad-head' }, [
+		E('h3', {}, [ _('Strategy profiles') ]),
+		E('div', { 'class': 'wg-ad-actions' }, [
+			E('button', {
+				'class': 'btn cbi-button cbi-button-action',
+				'click': ui.createHandlerFn(null, function() { profilesOpenEditor('new'); })
+			}, [ _('New profile') ])
+		])
 	]);
-	if (state.profiles.errors['__new'] != null)
-		addCard.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors['__new'] ]));
-	addCard.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
-		nameInput,
-		E('button', {
-			'class': 'btn cbi-button cbi-button-action',
-			'click': ui.createHandlerFn(null, profilesAddProfile)
-		}, [ _('Create profile') ])
-	]));
-	frag.appendChild(addCard);
+	list.appendChild(head);
+	if (m.sections.length == 0)
+		list.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('No profiles configured - the legacy strategy words drive the engine.')
+		]));
+	m.sections.forEach(function(p, idx) {
+		list.appendChild(profilesListRow(m, p, idx));
+	});
+	frag.appendChild(list);
+
+	/* the drawer (New/Edit) */
+	var panel = (state.profiles.editor != null) ? profilesEditorPanel(m) : null;
+	if (panel != null)
+		frag.appendChild(panel);
 
 	/* apply block: the honest badges (strategy/enabled/order edits drift the
 	 * engine argv -> restart; name/proto are metadata -> no restart) */
@@ -2170,10 +2468,17 @@ return L.Class.extend({
 	tunnelAfterConfigChange: tunnelAfterConfigChange,
 	profilesModel: profilesModel,
 	profilesStrategyKey: profilesStrategyKey,
+	profilesPolicyUse: profilesPolicyUse,
+	profilesProtoOfWords: profilesProtoOfWords,
+	PROFILE_PRESETS: PROFILE_PRESETS,
 	renderProfiles: renderProfiles,
 	buildProfilesView: buildProfilesView,
+	profilesOpenEditor: profilesOpenEditor,
+	profilesCloseEditor: profilesCloseEditor,
+	profilesApplyPreset: profilesApplyPreset,
 	profilesAddProfile: profilesAddProfile,
 	profilesSetEnabled: profilesSetEnabled,
+	profilesSetColor: profilesSetColor,
 	profilesSetWords: profilesSetWords,
 	profilesMove: profilesMove,
 	profilesAdoptLegacy: profilesAdoptLegacy,

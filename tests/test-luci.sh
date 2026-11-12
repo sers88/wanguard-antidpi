@@ -250,6 +250,31 @@ grep -qF "uci.move" "$CORE" \
 	|| fail "the profiles tab lost the section reorder path (order = render order)"
 grep -qF "profile_sections" "$CORE" \
 	|| fail "the Overview card lost the named-profiles enrichment (#84 status surface)"
+# the #85 profiles page: list row (color dot / badges / policy counter),
+# the New/Edit drawer, the generic presets and the delete guard are pinned
+# structurally - plus the PRESET WORDS sync guard: tests/test-profiles.sh
+# [10] starts the engine on these exact words, so the test and the shipped
+# presets cannot drift apart silently
+grep -qF "PROFILE_PRESETS" "$CORE" \
+	|| fail "the profiles drawer lost the generic presets"
+grep -qF "PROFILE_COLORS" "$CORE" \
+	|| fail "the profiles list lost the color-dot palette (design contract)"
+grep -qF "profilesPolicyUse" "$CORE" \
+	|| fail "the profiles list lost the policy counter (#86 refs)"
+grep -qF "profilesProtoOfWords" "$CORE" \
+	|| fail "the profiles badges must derive from the words (engine truth)"
+grep -qF "profilesOpenEditor" "$CORE" \
+	|| fail "the profiles drawer lost its open path"
+grep -qF "profilesApplyPreset" "$CORE" \
+	|| fail "the profiles drawer lost the preset application"
+grep -qF "wg-ad-profrow" "$CORE" \
+	|| fail "the profiles list row lost its style hooks"
+grep -qF -- "--lua-desync=multisplit:pos=midsld" "$CORE" \
+	|| fail "the TLS preset words drifted from the engine-tested set (test-profiles [10])"
+grep -qF -- "--lua-desync=fake:repeats=2" "$CORE" \
+	|| fail "the QUIC preset words drifted from the engine-tested set (test-profiles [10])"
+grep -qF "Open profiles" "$CORE" \
+	|| fail "the Overview strategy card lost the Open profiles affordance (#85)"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

@@ -28,8 +28,9 @@
 #   [7]  empty-word enabled profile -> skipped with a warn
 #   [8]  whitelist + 2/3 profiles -> --hostlist count = profile block count
 #   [9]  status --json: profile_sections (id/name/proto/enabled/words)
-#   [10] live (NFQUEUE): engine starts on a 2-profile argv, fetch flows,
-#        running_argv carries the profile separators
+#   [10] live (NFQUEUE): engine starts on a 2-preset argv (the TLS and QUIC
+#        GENERIC PRESETS byte-exactly - both shipped presets engine-valid),
+#        fetch flows, running_argv carries the profile separators
 set -eu
 
 CLI=/usr/bin/wanguard-antidpi
@@ -262,8 +263,8 @@ grab
 [ "$(jp 's.engine.profiles')" = "1" ] || fail "rendered profile count must count enabled-with-words only"
 echo "STATUS-SECTIONS-OK (id/name/proto/enabled/words in the status document)"
 
-# ---- [10] live engine on a 2-profile argv ----
-echo "== [10] live engine (multi-profile health check)"
+# ---- [10] live engine on a 2-preset argv ----
+echo "== [10] live engine (multi-preset health check)"
 LIVE=1
 nft add table inet devprobe84 2>/dev/null || LIVE=0
 if [ "$LIVE" = 1 ]; then
@@ -300,8 +301,10 @@ while [ $i -lt 30 ]; do
 	sleep 1
 done
 netstat -lnt 2>/dev/null | grep -q ":$MPORT " || fail "mihomo mixed-port did not come up (log: $(tail -2 /tmp/profiles-mihomo.log))"
-# profile A: real TCP desync functions; profile B: UDP filter block - the
-# engine must accept the whole multi-profile argv and keep serving.
+# profile A: the TLS preset byte-exactly (real TCP desync functions);
+# profile B: the QUIC preset (set below) - the engine must accept the whole
+# multi-preset argv and keep serving, which proves every shipped preset is
+# engine-valid.
 # (busybox uci set on a list option DEMOTES it to a scalar - delete first,
 # then add_list per word; AGENTS #82 gotcha.)
 uci delete "$CONF.prof_a.strategy_words" 2>/dev/null || :
@@ -310,30 +313,38 @@ uci add_list "$CONF.prof_a.strategy_words=--payload=tls_client_hello"
 uci add_list "$CONF.prof_a.strategy_words=--lua-desync=multisplit:pos=midsld"
 uci set "$CONF.prof_b.enabled=1"
 uci delete "$CONF.prof_b.strategy_words" 2>/dev/null || :
+# profile B = the QUIC preset byte-exactly (the UI ships the same words in
+# PROFILE_PRESETS; test-luci [8] pins them in core.js - the preset words are
+# engine-valid by construction)
 uci add_list "$CONF.prof_b.strategy_words=--filter-udp=443"
+uci add_list "$CONF.prof_b.strategy_words=--payload=quic_initial"
+uci add_list "$CONF.prof_b.strategy_words=--lua-desync=fake:repeats=2"
 uci commit "$CONF"
+# both profiles now carry the GENERIC PRESETS word-for-word (TLS split /
+# QUIC fake) - starting the engine here proves every shipped preset is
+# engine-valid
 set -- $("$CLI" engine-cmdline)
 prog=$1
 shift
 "$prog" "$@" >/tmp/profiles-engine.log 2>&1 &
 ENG_PID=$!
 sleep 3
-kill -0 "$ENG_PID" 2>/dev/null || fail "engine died on the 2-profile argv (log: $(tail -3 /tmp/profiles-engine.log))"
+kill -0 "$ENG_PID" 2>/dev/null || fail "engine died on the 2-preset argv (log: $(tail -3 /tmp/profiles-engine.log))"
 code=""
 for r in 1 2 3; do
 	code=$(curl -s -m 20 -x "http://127.0.0.1:$MPORT" -o /dev/null -w '%{http_code}' "$PROBE" || true)
 	[ "$code" = "200" ] && break
 	sleep 2
 done
-[ "$code" = "200" ] || fail "traffic did not flow through the 2-profile engine (code=$code)"
+[ "$code" = "200" ] || fail "traffic did not flow through the 2-preset engine (code=$code)"
 grab
 [ "$(jp 's.engine.profiles')" = "2" ] || fail "status must count 2 rendered profiles"
-[ "$(jp 'length(s.engine.running_argv)')" = "11" ] || fail "expected 11 running-argv entries (binary + 5 base + 3 A + --new + 1 B), got $(jp 'length(s.engine.running_argv)')"
+[ "$(jp 'length(s.engine.running_argv)')" = "13" ] || fail "expected 13 running-argv entries (binary + 5 base + 3 A + --new + 3 B), got $(jp 'length(s.engine.running_argv)')"
 ucode -e "import { open } from 'fs'; let a = json(open('$JS').read('all')).engine.running_argv;
 	let n = 0; for (let i = 0; i < length(a); i++) if (a[i] == '--new') n++;
 	if (n != 1) { warn('expected exactly one --new in the running argv, got ' + n + '\n'); exit(1); }" \
 	|| fail "the running argv must carry the profile separator"
-echo "ENGINE-MULTI-PROFILE-OK (started, fetch 200, running argv carries both blocks)"
+echo "ENGINE-MULTI-PRESET-OK (both generic presets engine-valid: started, fetch 200, running argv carries both blocks)"
 
 # ---- cleanup ----
 kill "$ENG_PID" 2>/dev/null
