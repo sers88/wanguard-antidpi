@@ -51,7 +51,7 @@ options live in this section, issue #62):
 | mihomo | proxy core; with `routing-mark 0x10000000` its own DIRECT egress is the add-on's scope (the CLI installs the mark idempotently, #60) |
 | nftables (`table inet wanguard_antidpi`) | own table: output `predefrag` @ -401 (engine mark `notrack`, #68) + postrouting @ 101, `meta mark 0x10000000 queue flags bypass to <qnum>`; never touches wanguard / fw4 tables (final rule set: #61, notrack: #68) |
 | nfqws2 (zapret2) | desync engine, single instance, `--qnum=<qnum>`, gzipped lua strategies loaded via `--lua-init=@`; graceful no-op when the strategy is empty |
-| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status, tunnel-update/status, cron-install/remove; DRYRUN-aware |
+| wanguard-antidpi (CLI) | single control surface: version, engine-version, engine-cmdline, nft-render/apply/flush, mark-install/ensure/remove/status, tunnel-update/status, cron-install/remove, status/events (read-only state + syslog tail for the LuCI page); DRYRUN-aware |
 | resolver updater (#62) | `tunnel-update`: nslookup per `tunnel_hosts` entry, maintains `tunnel.proxy_resolved` in UCI with per-IP expiry (state file), re-applies the table only when the set changed and the table lives |
 | procd init | ensure the mihomo mark (non-fatal) -> refresh the tunnel set (non-fatal) -> apply table -> ensure cron line -> engine instance (respawn 3600 5 0, stdout/stderr to syslog); stop = kill -> drop cron line -> flush table |
 | apk feed | signed index on the `feed` branch; package built by CI from the sha256-pinned upstream artifact |

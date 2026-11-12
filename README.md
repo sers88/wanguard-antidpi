@@ -145,7 +145,7 @@ back.
 | Path | What |
 |---|---|
 | `/usr/bin/nfqws2` | static desync engine from the pinned upstream zapret2 release (shipped unmodified) |
-| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`), whitelist render/reload/status, `apply [--check]` (idempotent orchestration for the LuCI page) and `status [--json]` (read-only state surface); all state-changing commands are DRYRUN-aware |
+| `/usr/bin/wanguard-antidpi` | control CLI (**ucode**, `router/wanguard-antidpi.uc`): version, engine command line, nft render/apply/flush, mihomo mark install/remove/status, tunnel resolver updater (`tunnel-update`/`tunnel-status`) and its cron schedule (`cron-install`/`cron-remove`), whitelist render/reload/status, `apply [--check]` (idempotent orchestration for the LuCI page), `status [--json]` (read-only state surface) and `events [--filter=F] [--tail=N]` (read-only syslog tail for the Tests & Logs tab: filter = engine\|nfqws2\|antidpi\|mihomo, tail clamped to [1, 200] - filtering and the bound run on the router); all state-changing commands are DRYRUN-aware |
 | `/usr/share/wanguard-antidpi/lua/zapret-lib.lua.gz` | upstream lua library (gzipped lua is supported natively by nfqws2) |
 | `/usr/share/wanguard-antidpi/lua/zapret-antidpi.lua.gz` | upstream desync strategy functions |
 | `/usr/share/wanguard-antidpi/wanguard-antidpi.nft` | scope table template (`@QNUM@`, `@FWMARK@`, `@PROXY_ELEMENTS@` rendered from the config by `nft-render`; includes the pre-CR conntrack notrack for engine packets, #68) |
@@ -455,11 +455,23 @@ the Domain lists tab until the policies referencing them are unlinked.
   (config renders, nft table in force, mark installed with our value,
   engine running, hostlist present when consumed) with a human report or
   `--json`. DRYRUN prints the plan without touching live state.
+- **events (issue #88)**: `wanguard-antidpi events [--json]
+  [--filter=engine|nfqws2|antidpi|mihomo] [--tail=N]` - the Tests & Logs
+  log viewer's surface. Same syslog tail as the status events (engine =
+  the `nfqws2|wanguard-antidpi` grep, 20-line default there), with the
+  UI's filter choice and a UI-chosen tail clamped to [1, 200] (default
+  50). Filtering and the bound run on the router - the browser never
+  pulls the raw ring buffer. Degraded (`available=false`) when no syslogd
+  is running.
 - **engine debug logging**: `uci set wanguard-antidpi.engine.debug='1'; uci
   commit wanguard-antidpi; /etc/init.d/wanguard-antidpi restart` - nfqws2
   then runs with `--debug=1` and logs per-packet verdicts to syslog
   (`logread | grep nfqws2`). Verbose by design; meant for tuning sessions -
-  turn it back off with `'0'`.
+  turn it back off with `'0'`. The LuCI Tests & Logs tab (issue #88) flips
+  the same option through the staged pipeline (the flag rides the engine
+  argv, so a flip is an engine restart) and shows the log tail with the
+  filters above; the queue-counters card measures the per-tick delta -
+  the same window the header's "Processing active" chip reads.
 - **exclude a destination from desync manually**: static pins go to
   `tunnel.proxy_servers` (canonical IPv4/CIDR each), then restart the
   service - the merged set (static pins + resolver answers) is re-rendered

@@ -259,6 +259,26 @@ jobs:
             openwrt/rootfs:x86_64-25.12.6 \
             sh /tests/test-policies.sh
 
+  events-test:
+    name: Matrix - events surface (OpenWrt container)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      - name: Events matrix in OpenWrt container (logread stub on PATH)
+        run: |
+          docker run --rm \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 \
+            sh /tests/test-events.sh
+
   luci-test:
     name: Matrix - luci menu + ACL (OpenWrt container)
     needs: build
@@ -285,7 +305,7 @@ jobs:
   # ---- Tag pushes only - dispatch runs validate without publishing.
   publish:
     name: Sign index, publish feed branch (gated by the matrix)
-    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, luci-test]
+    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, events-test, luci-test]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:

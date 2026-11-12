@@ -171,7 +171,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold + overview + domains + tunnel + policies tabs (issues #80-#87)"
+echo "== [8] page scaffold + all six tabs (issues #80-#88)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -308,6 +308,28 @@ grep -qF "Domain list edits apply via reload - live connections stay up" "$CORE"
 	|| fail "the apply card lost the honest reload chip"
 grep -qF "Referenced by %d policy(s) - unlink them first." "$CORE" \
 	|| fail "the domains tab lost the policy-ref delete guard (#87)"
+# the #88 tests & logs tab: counters with the per-tick delta, the
+# validation reuse, the debug toggle and the log viewer (CLI-side bound)
+grep -qF "renderTests" "$CORE" \
+	|| fail "the tests & logs tab lost its render path"
+grep -qF "testsUpdateCounters" "$CORE" \
+	|| fail "the counters card lost its per-tick patch (log snapshot must survive)"
+grep -qF "LOG_FILTERS" "$CORE" \
+	|| fail "the log viewer lost its filter options"
+grep -qF "'events', '--json'" "$CORE" \
+	|| fail "the log viewer must fetch through the events --json CLI surface (#88)"
+grep -qF "copyFallback" "$CORE" \
+	|| fail "the copy button lost the execCommand degradation (the router's http:// LuCI)"
+grep -qF "Turn on verbose logging" "$CORE" \
+	|| fail "the debug toggle lost its entry point"
+grep -qF "rides the engine argv - apply restarts the engine" "$CORE" \
+	|| fail "the debug flip lost the honest restart badge"
+grep -qF "Diagnostic surface, not a resting state" "$CORE" \
+	|| fail "the debug card lost the turn-it-off warning (#88)"
+grep -qF "logread is unavailable on this system" "$CORE" \
+	|| fail "the log viewer lost the honest degraded card"
+grep -qF "Not tested - active probing arrives in a later release" "$CORE" \
+	|| fail "the provider effectiveness row must stay honest (#92 backlog)"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

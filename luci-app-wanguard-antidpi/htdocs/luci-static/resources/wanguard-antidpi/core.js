@@ -1,12 +1,14 @@
 /* luci-app-wanguard-antidpi core — the shared engine behind the Anti-DPI
- * page (view/wanguard/antidpi.js, issues #80/#81/#82/#83). Thin client over the
+ * page (view/wanguard/antidpi.js, issues #80-#88). Thin client over the
  * `wanguard-antidpi` CLI surfaces (#76 status, #77 apply): ONE status exec
  * per refresh plus the strategy-words exec (engine-cmdline), with the
- * heavier probes (apply --check, apply) strictly on-demand behind their
- * buttons. The browser never touches nft/logread directly; its only direct
+ * heavier probes (apply --check, apply, the Tests & Logs log fetch
+ * `events --json`) strictly on-demand behind their buttons. The browser
+ * never touches nft/logread directly; its only direct
  * UCI verbs are the Domain lists editor's staging (#82), the Tunnel
  * protection editor's staging (#83), the Profiles editor's staging
- * (#84/#85) and the Policies editor's staging (#87 - all client-side via
+ * (#84/#85), the Policies editor's staging (#87) and the Tests & Logs
+ * debug toggle (#88 - all client-side via
  * the uci client, applied through the same save -> apply(5) -> CLI apply
  * pipeline as the pending bar) and the bar's Discard (uci revert,
  * config-scoped).
@@ -106,12 +108,24 @@ var state = {
 		errors: {},       /* inline validation errors, per policy (and 'editor') */
 		inputs: {}        /* per-policy name/device_group/priority input texts */
 	},
+	tests: {            /* Tests & Logs tab (#88): counters + log viewer + debug toggle */
+		countersHost: null, /* the counters card holder - patched per tick (the
+		                         log snapshot and the debug editor must survive) */
+		origDebug: null,  /* committed engine.debug at load (restart-badge detect) */
+		logBusy: false,
+		logError: null,   /* rpc/exec failure of the last log fetch */
+		logFilter: 'engine',
+		logLines: null,   /* last fetched snapshot (array of lines) or null = never fetched */
+		logAvail: null    /* last snapshot's availability (logread present) */
+	},
+	prevCounters: null, /* the counters snapshot of the previous tick (#88 deltas) */
 	busy: false
 };
 
-/* sub-tab frame (issue #80): the order of the concept mock; the content of
- * each tab lands with its own stage (#81 overview done, #82 domain lists,
- * #83 tunnel protection, #84/#85 profiles (list + drawer + presets), #86 policies, #88 tests & logs) */
+/* sub-tab frame (issue #80): the order of the concept mock; every tab is
+ * real since #88 (#81 overview, #82 domain lists, #83 tunnel protection,
+ * #84/#85 profiles, #86/#87 policies, #88 tests & logs) - the placeholder
+ * branch below stays as the honest fallback for future tabs */
 var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'tunnel', 'tests' ];
 
 function tabLabel(id) {
@@ -179,7 +193,10 @@ var CSS = [
 	".wg-ad-words { width:100%; min-height:7em; font-family:monospace; font-size:.85em; white-space:pre; }",
 	".wg-ad-rowmenu { display:flex; gap:.5em; align-items:center; flex-wrap:wrap; padding:.3em 0 .45em .7em; margin-left:.4em; border-left:2px solid rgba(128,128,128,.35); }",
 	".wg-ad-polrow { cursor:grab; }",
-	".wg-ad-search { min-width:16em; }"
+	".wg-ad-search { min-width:16em; }",
+	".wg-ad-log { max-height:22em; overflow:auto; font-family:monospace; font-size:.78em; white-space:pre-wrap; word-break:break-all; background:rgba(128,128,128,.08); border-radius:4px; padding:.6em; margin:.4em 0; }",
+	".wg-ad-copy { background:none; border:1px solid rgba(128,128,128,.4); border-radius:3px; cursor:pointer; font-size:.78em; padding:.05em .5em; opacity:.7; color:inherit; }",
+	".wg-ad-copy:hover { opacity:1; }"
 ].join('\n');
 
 /* ---------- status fetching / parsing ---------- */
@@ -303,17 +320,24 @@ function engineChip() {
  * engine handles marked traffic — the chip follows the client-side delta
  * between consecutive polls (the concept's "queue-дельты", spike-75 §6).
  * First tick has no delta evidence yet -> idle; a table with no counters
- * is a degraded surface -> Table absent. */
+ * is a degraded surface -> Table absent. The same snapshot feeds the Tests
+ * & Logs counters card (#88): prevCounters is the previous tick's object
+ * (every refresh re-parses the status document, so the reference never
+ * aliases the current tick). */
 function processingChip() {
 	var st = state.status;
 	var c = (st.nft && st.nft.counters) ? st.nft.counters : null;
-	if (c == null)
+	if (c == null) {
+		state.prevPkts = null;
+		state.prevCounters = null;
 		return { cls: 'wg-ad-chip-warn',
 			label: (st.nft && st.nft.table_present) ? _('Processing unknown') : _('Table absent') };
+	}
 	var pkts = ((c.tcp && c.tcp.packets != null) ? c.tcp.packets : 0) +
 		((c.udp && c.udp.packets != null) ? c.udp.packets : 0);
 	var active = (state.prevPkts != null && pkts > state.prevPkts);
 	state.prevPkts = pkts;
+	state.prevCounters = c;
 	return active
 		? { cls: 'wg-ad-chip-ok', label: _('Processing active') }
 		: { cls: 'wg-ad-chip-muted', label: _('Processing idle') };
@@ -721,6 +745,7 @@ function discardPending() {
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
 		policiesAfterConfigChange();
+		testsAfterConfigChange();
 		ui.changes.init();
 		return refresh().then(update);
 	}).catch(function(e) {
@@ -754,6 +779,7 @@ function reviewApply() {
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
 		policiesAfterConfigChange();
+		testsAfterConfigChange();
 		return refresh().then(update);
 	}).catch(function(e) {
 		state.applyBusy = false;
@@ -3258,6 +3284,351 @@ function renderPolicies() {
 	});
 }
 
+/* ---------- tests & logs tab (#88) ---------- */
+
+/* Observability of the engine: the queue counters with the per-tick delta
+ * (the measurement window that backs the header's "Processing active"
+ * chip), the full validation panel (the same Run checks surface as the
+ * Overview - buildValidationCard is reused, provider effectiveness stays
+ * the honest "Not tested" row, #92), the engine.debug toggle (a staged
+ * UCI edit through the shared apply pipeline - the flag rides the engine
+ * argv, so a flip is a restart; nfqws2 accepts ONLY 0/1, the #70 fact) and
+ * the log viewer (an on-demand `events --json` fetch - the filter and the
+ * tail bound run on the router, the browser never pulls the raw ring).
+ * Per-tick only the counters card is patched; the log snapshot and the
+ * debug editor survive ticks. */
+
+var LOG_FILTERS = [
+	{ id: 'engine', label: 'Engine (nfqws2 + wanguard-antidpi)' },
+	{ id: 'nfqws2', label: 'nfqws2 verdicts' },
+	{ id: 'antidpi', label: 'wanguard-antidpi service' },
+	{ id: 'mihomo', label: 'mihomo warnings' }
+];
+var LOG_TAIL = 50; /* the UI's tail request (the CLI clamps to [1, 200]) */
+
+/* clipboard helper: navigator.clipboard is unavailable on the router's
+ * http:// LuCI (no secure context) - the execCommand fallback keeps the
+ * copy buttons alive (the luci-app-wanguard pattern); every failure path
+ * degrades to a toast, never throws */
+function copyText(text) {
+	var done = function(okflag) {
+		ui.addNotification(null, E('p', {},
+			okflag ? _('Log copied to the clipboard') : _('Copy failed')),
+			okflag ? 'info' : 'error');
+	};
+	try {
+		if (typeof navigator != 'undefined' && navigator.clipboard &&
+			typeof navigator.clipboard.writeText == 'function') {
+			navigator.clipboard.writeText(text).then(function() { done(true); },
+				function() { copyFallback(text, done); });
+			return;
+		}
+	}
+	catch (e) { /* fall through to the fallback */ }
+	copyFallback(text, done);
+}
+
+function copyFallback(text, done) {
+	var okflag = false;
+	try {
+		if (typeof document != 'undefined' && typeof document.createElement == 'function' &&
+			document.body) {
+			var ta = document.createElement('textarea');
+			ta.value = text;
+			ta.setAttribute('readonly', '');
+			ta.style.position = 'fixed';
+			ta.style.opacity = '0';
+			document.body.appendChild(ta);
+			ta.select();
+			try { okflag = (document.execCommand('copy') === true); }
+			catch (e) { okflag = false; }
+			document.body.removeChild(ta);
+		}
+	}
+	catch (e) { okflag = false; }
+	done(okflag);
+}
+
+function counterVal(c, rule, field) {
+	if (c == null || c[rule] == null || c[rule][field] == null)
+		return null;
+	return c[rule][field];
+}
+
+/* the counters card: the two queue-rule counters (TCP/UDP 443) with the
+ * delta over the last tick window; first window renders muted deltas */
+function testsCountersCard() {
+	var st = state.status;
+	var c = (st.nft && st.nft.counters) ? st.nft.counters : null;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Queue counters'), ' ',
+			((st.nft && st.nft.table_present) && c == null)
+				? chipEl({ cls: 'wg-ad-chip-muted', label: _('no counters') }) : E([]) ])
+	]);
+	if (c == null) {
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			(st.nft && st.nft.table_present)
+				? _('The scope table reports no counter objects.')
+				: _('The scope table is absent - it arrives with the service start (or `wanguard-antidpi nft-apply`).')
+		]));
+		return card;
+	}
+	var prev = state.prevCounters;
+	var row = function(name, rule) {
+		var p = counterVal(c, rule, 'packets');
+		var b = counterVal(c, rule, 'bytes');
+		var dP = null, dB = null;
+		/* the delta needs a PREVIOUS-tick snapshot: the same object (the
+		 * same status document, e.g. at tab open) means no window was
+		 * measured yet - muted is the honest render */
+		if (prev != null && prev !== c) {
+			var op = counterVal(prev, rule, 'packets');
+			var ob = counterVal(prev, rule, 'bytes');
+			if (p != null && op != null)
+				dP = p - op;
+			if (b != null && ob != null)
+				dB = b - ob;
+		}
+		return E('tr', {}, [
+			E('td', {}, [ name ]),
+			E('td', {}, [ (p != null) ? String(p) : '—' ]),
+			E('td', {}, [ (dP != null) ? '+' + dP : '—' ]),
+			E('td', {}, [ (b != null) ? String(b) : '—' ]),
+			E('td', {}, [ (dB != null) ? '+' + dB : '—' ])
+		]);
+	};
+	card.appendChild(E('table', { 'class': 'wg-ad-table' }, [
+		E('tr', {}, [
+			E('th', {}, [ _('Rule') ]),
+			E('th', {}, [ _('Packets') ]),
+			E('th', {}, [ _('Δ packets') ]),
+			E('th', {}, [ _('Bytes') ]),
+			E('th', {}, [ _('Δ bytes') ])
+		]),
+		row(_('TCP (443) queue'), 'tcp'),
+		row(_('UDP (443) queue'), 'udp')
+	]));
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Δ = between the last two polls - the same window the Processing chip reads.')
+	]));
+	return card;
+}
+
+/* the per-tick patch: rebuild ONLY the counters card - the log pre and the
+ * debug editor keep their DOM (a rebuild would blow away the snapshot the
+ * user is reading) */
+function testsUpdateCounters() {
+	if (state.activeTab != 'tests' || !state.bodyNode || !state.tests.countersHost)
+		return;
+	state.tests.countersHost.innerHTML = '';
+	state.tests.countersHost.appendChild(testsCountersCard());
+}
+
+/* the on-demand log fetch: one `events --json` exec per Refresh click,
+ * never in the poll tick */
+function testsFetchLog() {
+	if (state.tests.logBusy)
+		return;
+	state.tests.logBusy = true;
+	state.tests.logError = null;
+	renderTests();
+	return callCli(CLI, [ 'events', '--json',
+		'--filter=' + state.tests.logFilter, '--tail=' + LOG_TAIL
+	]).then(function(res) {
+		var doc = null;
+		if (res && typeof res.stdout == 'string' && res.stdout.length) {
+			try { doc = JSON.parse(res.stdout); } catch (e) {}
+		}
+		if (doc != null && doc.lines != null && doc.available != null) {
+			state.tests.logLines = doc.lines;
+			state.tests.logAvail = doc.available;
+			state.tests.logError = null;
+		}
+		else {
+			/* keep a previous snapshot visible; surface the failure */
+			state.tests.logError = (res && typeof res.stderr == 'string' && res.stderr.length)
+				? res.stderr.split('\n')[0].trim()
+				: _('the output is not an events report');
+		}
+		state.tests.logBusy = false;
+		renderTests();
+	}).catch(function(e) {
+		state.tests.logBusy = false;
+		state.tests.logError = (e && e.message) || 'error';
+		renderTests();
+	});
+}
+
+function testsLogCard() {
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Syslog tail') ])
+	]);
+	if (state.tests.logError != null)
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The log fetch failed: %s').format(state.tests.logError) ])
+		]));
+
+	/* the filter select + Refresh (+ Copy when a snapshot exists) */
+	var sel = E('select', {
+		'change': function(ev) {
+			state.tests.logFilter = ev.target.value;
+			renderTests();
+		}
+	});
+	LOG_FILTERS.forEach(function(f) {
+		sel.appendChild(E('option', { 'value': f.id }, [ f.label ]));
+	});
+	sel.value = state.tests.logFilter;
+
+	var actions = E('div', { 'class': 'wg-ad-actions' }, [
+		E('span', { 'class': 'wg-ad-kv-label' }, [ _('Filter:') ]),
+		sel,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, testsFetchLog),
+			'disabled': state.tests.logBusy ? '' : null
+		}, [ state.tests.logBusy ? _('Fetching…') : _('Refresh') ])
+	]);
+	if (state.tests.logLines != null && state.tests.logLines.length)
+		actions.appendChild(E('button', {
+			'class': 'wg-ad-copy',
+			'click': ui.createHandlerFn(null, function() {
+				copyText(state.tests.logLines.join('\n'));
+			})
+		}, [ _('Copy') ]));
+	card.appendChild(actions);
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('The filter and the %d-line bound run on the router; the browser never pulls the raw log.').format(LOG_TAIL)
+	]));
+
+	if (state.tests.logLines == null) {
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Not fetched yet.') ]));
+		return card;
+	}
+	if (!state.tests.logAvail) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('logread is unavailable on this system (no running syslogd).') ])
+		]));
+		return card;
+	}
+	if (!state.tests.logLines.length) {
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('No matching lines in the syslog tail.')
+		]));
+		return card;
+	}
+	/* one text node - log lines are data, never HTML (the #80 discipline) */
+	card.appendChild(E('pre', { 'class': 'wg-ad-log' },
+		[ state.tests.logLines.join('\n') ]));
+	return card;
+}
+
+function testsToggleDebug() {
+	var cur = uci.get('wanguard-antidpi', 'engine', 'debug');
+	if (cur == null)
+		return;
+	uci.set('wanguard-antidpi', 'engine', 'debug', (cur == '1') ? '0' : '1');
+	renderTests();
+}
+
+/* the debug toggle card: a staged UCI edit through the shared pipeline.
+ * The flip is honest about its cost (--debug rides the argv -> restart)
+ * and about its nature: a diagnostic surface, not a resting state. */
+function testsDebugCard(loadError) {
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Engine verbose logging') ])
+	]);
+	if (loadError != null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).')
+				.format((loadError && loadError.message) || 'error') ])
+		]));
+		return card;
+	}
+	var staged = uci.get('wanguard-antidpi', 'engine', 'debug');
+	if (staged == null) {
+		card.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The engine section is missing from the configuration - the toggle needs it.') ])
+		]));
+		return card;
+	}
+	var stagedOn = (staged == '1');
+	if (stagedOn)
+		card.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+			label: _('Verbose logging is ON - turn it off when done'),
+			title: _('nfqws2 logs every verdict: the syslog ring fills within minutes under load') }));
+	else
+		card.appendChild(chipEl({ cls: 'wg-ad-chip-muted',
+			label: _('Verbose logging is off') }));
+	if (state.tests.origDebug != null && staged != state.tests.origDebug)
+		card.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+			label: _('The debug flag rides the engine argv - apply restarts the engine'),
+			title: _('nfqws2 --debug accepts only 0 or 1 (no levels); the restart re-reads the argv') }));
+	card.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, testsToggleDebug)
+		}, [ stagedOn ? _('Turn off verbose logging') : _('Turn on verbose logging') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, reviewApply),
+			'disabled': (staged == state.tests.origDebug || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ])
+	]));
+	card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Diagnostic surface, not a resting state: verbose logging fills the syslog ring quickly.')
+	]));
+	return card;
+}
+
+function buildTestsView(node, loadError) {
+	/* the counters holder - patched per tick (testsUpdateCounters) */
+	var countersHost = E([]);
+	state.tests.countersHost = countersHost;
+	countersHost.appendChild(testsCountersCard());
+	node.appendChild(countersHost);
+	/* the validation panel: the Overview card reused verbatim (issue: a
+	 * duplicate or a link - the duplicate keeps Run checks reachable from
+	 * both tabs; provider effectiveness stays "Not tested", #92) */
+	node.appendChild(buildValidationCard());
+	node.appendChild(testsDebugCard(loadError));
+	node.appendChild(testsLogCard());
+}
+
+/* the tab body: uci.load covers the debug option only - a failure degrades
+ * that card while the rest of the tab (counters/validation/log) stays
+ * alive. The log snapshot and the debug editor survive poll ticks; only
+ * the counters card is patched per tick. */
+function renderTests() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'tests' || !state.bodyNode)
+			return;
+		if (state.tests.origDebug == null)
+			state.tests.origDebug = uci.get('wanguard-antidpi', 'engine', 'debug');
+		state.bodyNode.innerHTML = '';
+		buildTestsView(state.bodyNode);
+	}).catch(function(e) {
+		if (state.activeTab != 'tests' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		buildTestsView(state.bodyNode, e);
+	});
+}
+
+/* after the shared pipeline committed (or the deltas were reverted), the
+ * debug toggle restarts from the committed truth */
+function testsAfterConfigChange() {
+	state.tests.origDebug = null;
+	state.tests.countersHost = null;
+	if (state.activeTab == 'tests')
+		renderTests();
+}
+
 /* ---------- tab frame (issue #80) ---------- */
 
 function buildTabbar() {
@@ -3323,6 +3694,10 @@ function renderBody() {
 		renderTunnel();
 		return;
 	}
+	if (state.activeTab == 'tests') {
+		renderTests();
+		return;
+	}
 
 	node.appendChild(E('div', { 'class': 'wg-ad-panel' }, [
 		E('h3', {}, [ tabLabel(state.activeTab) ]),
@@ -3334,10 +3709,15 @@ function renderBody() {
  * body on an availability flip, while the data-driven Overview is open, or
  * right after a config-change cycle (the after-config renders of the
  * editor tabs used the PRE-refresh status - one fresh rebuild is safe
- * there: the cycle already reset every editor) */
+ * there: the cycle already reset every editor). The Tests & Logs tab gets
+ * the lighter touch: only its counters card is patched per tick. */
 function update() {
 	var wasUnavailable = (state.bodyNode != null &&
 		state.bodyNode.getAttribute('data-unavail') == 'true');
+	/* the Tests & Logs counters window is measured BEFORE updateChips
+	 * advances the processing snapshot: the card's delta = the previous
+	 * tick's counters vs the freshly fetched ones */
+	testsUpdateCounters();
 	updateChips();
 	if (!state.bodyNode)
 		return;
@@ -3423,5 +3803,14 @@ return L.Class.extend({
 	policiesDrop: policiesDrop,
 	policiesApply: policiesApply,
 	policiesValidateDraft: policiesValidateDraft,
-	policiesAfterConfigChange: policiesAfterConfigChange
+	policiesAfterConfigChange: policiesAfterConfigChange,
+	LOG_FILTERS: LOG_FILTERS,
+	renderTests: renderTests,
+	buildTestsView: buildTestsView,
+	testsCountersCard: testsCountersCard,
+	testsUpdateCounters: testsUpdateCounters,
+	testsFetchLog: testsFetchLog,
+	testsToggleDebug: testsToggleDebug,
+	testsAfterConfigChange: testsAfterConfigChange,
+	copyText: copyText
 });

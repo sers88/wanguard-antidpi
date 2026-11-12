@@ -59,6 +59,13 @@
 //                   default = human key: value lines. Every surface degrades
 //                   explicitly (null/false + a "degraded" reason in JSON) -
 //                   the page renders "unavailable" from the same keys
+//   events [--filter=F] [--tail=N]
+//                    read-only syslog tail for the Tests & Logs tab (#88):
+//                   F = engine|nfqws2|antidpi|mihomo (default engine =
+//                   the status events contract), N clamped to [1, 200]
+//                   (default 50); filtering and the tail bound run on the
+//                   router, the browser never pulls the raw ring. Degraded
+//                   (available=false) when no syslogd is running
 //
 // DRYRUN contract: WANGUARD_ANTIDPI_DRYRUN=1 makes every state-changing
 // command print what it would do, touch nothing, exit 0. This is how the
@@ -2000,13 +2007,29 @@ function status_pending_info() {
 	return { count: count, sections: arr };
 }
 
-function status_events_info() {
-	// filtered syslog tail (nfqws2 / wanguard-antidpi). logread is probed
-	// first: containers and minimal setups have no running syslogd - that is
-	// a degraded surface, not an empty result.
+/* The syslog-tail engine behind the `status` events AND the `events`
+ * command (#88): logread is probed first (containers and minimal setups
+ * have no running syslogd - a degraded surface, not an empty result), the
+ * filtering happens CLI-side (the issue criterion: the browser never
+ * pulls the raw ring buffer) over a bounded tail. Filters:
+ *   engine  - nfqws2 + wanguard-antidpi (the status events default)
+ *   nfqws2  - engine verdicts only
+ *   antidpi - service/init/cron messages only
+ *   mihomo  - mihomo lines (its log-level is warning, so the ring only
+ *             carries warning+ from it)
+ * The tail is clamped by the caller: the router never ships an unbounded
+ * log to the UI. */
+function log_tail_info(filter, tail) {
+	let re = 'nfqws2|wanguard-antidpi';
+	if (filter == 'nfqws2')
+		re = 'nfqws2';
+	else if (filter == 'antidpi')
+		re = 'wanguard-antidpi';
+	else if (filter == 'mihomo')
+		re = 'mihomo';
 	if (system('logread >/dev/null 2>&1') != 0)
 		return { available: false, lines: [] };
-	let fp = popen('logread 2>/dev/null | grep -E "nfqws2|wanguard-antidpi" | tail -n 20', 'r');
+	let fp = popen('logread 2>/dev/null | grep -E "' + re + '" | tail -n ' + tail, 'r');
 	let out = (fp != null) ? fp.read('all') : '';
 	if (fp != null)
 		fp.close();
@@ -2018,6 +2041,65 @@ function status_events_info() {
 			push(lines, ln);
 	}
 	return { available: true, lines: lines };
+}
+
+/* the default status surface (the #76 byte contract): the combined engine
+ * tail, 20 lines */
+function status_events_info() {
+	return log_tail_info('engine', 20);
+}
+
+/* the Tests & Logs surface (#88): the same syslog tail as the status
+ * events, with the UI's filter selection and a UI-chosen (clamped) tail.
+ * Read-only, DRYRUN-free. */
+function cmd_events() {
+	let want_json = false;
+	let filter = 'engine';
+	let tail = 50;
+	for (let i = 1; i < length(ARGV); i++) {
+		let a = ARGV[i];
+		if (a == '--json')
+			want_json = true;
+		else if (index(a, '--filter=') == 0) {
+			let v = substr(a, length('--filter='));
+			if (v == 'engine' || v == 'nfqws2' || v == 'antidpi' || v == 'mihomo')
+				filter = v;
+			else {
+				warn('events: unknown filter "' + v + '" (engine|nfqws2|antidpi|mihomo)\n');
+				exit(2);
+			}
+		}
+		else if (index(a, '--tail=') == 0) {
+			let v = substr(a, length('--tail='));
+			if (v == null || match(v, /^[0-9]+$/) == null || int(v) < 1) {
+				warn('events: --tail must be a positive number\n');
+				exit(2);
+			}
+			tail = (int(v) > 200) ? 200 : int(v);
+		}
+		else {
+			warn('events: unknown option "' + a + '"\n');
+			exit(2);
+		}
+	}
+	let ev = log_tail_info(filter, tail);
+	if (want_json) {
+		printf('%J\n', {
+			available: ev.available,
+			filter: filter,
+			tail: tail,
+			lines: ev.lines
+		});
+		return;
+	}
+	if (!ev.available) {
+		print('events: unavailable (no running syslogd)\n');
+		return;
+	}
+	print('events: filter=' + filter + ' tail=' + tail +
+		' line(s): ' + length(ev.lines) + '\n');
+	for (let i = 0; i < length(ev.lines); i++)
+		print(ev.lines[i] + '\n');
 }
 
 function cmd_status() {
@@ -2532,11 +2614,15 @@ case 'apply':
 	cmd_apply();
 	break;
 
+case 'events':
+	cmd_events();
+	break;
+
 case 'status':
 	cmd_status();
 	break;
 
 default:
-	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status|apply [--check]|status [--json]]\n');
+	warn('usage: wanguard-antidpi [version|engine-version|engine-cmdline|nft-render|nft-apply|nft-flush|mark-install|mark-ensure|mark-remove|mark-status|tunnel-update|tunnel-status|cron-install|cron-remove|whitelist-refresh|whitelist-reload|whitelist-status|apply [--check]|status [--json]|events [--filter=F] [--tail=N]]\n');
 	exit(2);
 }
