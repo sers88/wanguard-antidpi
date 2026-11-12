@@ -12,8 +12,8 @@
 # Packages (one tag = both packages at the same version, issue #78):
 #   wanguard-antidpi            core: static nfqws2 engine + ucode CLI +
 #                               procd init + nft template + UCI config
-#   luci-app-wanguard-antidpi   LuCI app: menu.d + rpcd ACL (the view lands
-#                               with issue #80). depends are independent both
+#   luci-app-wanguard-antidpi   LuCI app: menu.d + rpcd ACL + the page
+#                               (issue #80). depends are independent both
 #                               ways: NOT luci-app-wanguard - the packages
 #                               work standalone and together.
 #
@@ -95,8 +95,8 @@ pkg wanguard-antidpi \
 	"Anti-DPI add-on for OpenWrt: nfqws2 (zapret2) engine scoped to mihomo DIRECT egress" \
 	"$DEPS" "$W"
 
-# ---- luci-app-wanguard-antidpi (issue #78) ----
-# Menu + ACL scaffold; the view lands with issue #80. Two menu.d contract
+# ---- luci-app-wanguard-antidpi (issues #78/#80) ----
+# Menu + ACL + page scaffold. Two menu.d contract
 # points proven by tests/test-luci.sh (and spike-75):
 #   - the file is named wanguard-antidpi.json so menu.d glob order processes
 #     it AFTER luci-app-wanguard.json (the default luci-app-wanguard-antidpi
@@ -107,11 +107,19 @@ pkg wanguard-antidpi \
 #     installed (standalone mode) and dispatcher apply_tree_acls() would
 #     hide the whole menu
 L="$work/luci-app-wanguard-antidpi"
-mkdir -p "$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d"
+mkdir -p "$L/usr/share/luci/menu.d" "$L/usr/share/rpcd/acl.d" \
+	"$L/www/luci-static/resources/view/wanguard" \
+	"$L/www/luci-static/resources/wanguard-antidpi"
 inst "$ROOT/luci-app-wanguard-antidpi/usr/share/luci/menu.d/wanguard-antidpi.json" \
 	"$L/usr/share/luci/menu.d/wanguard-antidpi.json" 644
 inst "$ROOT/luci-app-wanguard-antidpi/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json" \
 	"$L/usr/share/rpcd/acl.d/luci-app-wanguard-antidpi.json" 644
+# the page (issue #80): view + shared core module. The LuCI loader resolves
+# 'require wanguard-antidpi.core' to /www/luci-static/resources/wanguard-antidpi/core.js
+inst "$ROOT/luci-app-wanguard-antidpi/htdocs/luci-static/resources/view/wanguard/antidpi.js" \
+	"$L/www/luci-static/resources/view/wanguard/antidpi.js" 644
+inst "$ROOT/luci-app-wanguard-antidpi/htdocs/luci-static/resources/wanguard-antidpi/core.js" \
+	"$L/www/luci-static/resources/wanguard-antidpi/core.js" 644
 pkg luci-app-wanguard-antidpi \
 	"LuCI app for wanguard-antidpi anti-DPI strategies (WAN Guard > Anti-DPI tab)" \
 	"wanguard-antidpi luci-base" "$L"

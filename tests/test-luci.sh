@@ -18,9 +18,13 @@
 #       - which is why the shipped parent carries OUR group (deviation from
 #       the issue's literal byte-identity, documented in the issue comment)
 #   [7] live menu.d shape with a simulated luci-app-wanguard installed
-#   [8] apk del removes the real tab, keeps the simulated luci-app-wanguard
-#       file and the core package - the Anti-DPI tab falls back to the
-#       luci-app-wanguard placeholder (#79 fixture sync)
+#   [8] the #80 page scaffold in the package: view/wanguard/antidpi.js +
+#       wanguard-antidpi/core.js land at the /www LuCI paths with the
+#       structural anchors (core require, status --json exec, the six
+#       sub-tabs); the placeholder view stays luci-app-wanguard's file
+#   [9] apk del removes the real tab AND the page files, keeps the simulated
+#       luci-app-wanguard file and the core package - the Anti-DPI tab falls
+#       back to the luci-app-wanguard placeholder (#79 fixture sync)
 #
 # Usage: test-luci.sh <version>
 set -eu
@@ -167,10 +171,34 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"
+echo "== [8] page scaffold in the package (issue #80)"
+VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
+CORE=/www/luci-static/resources/wanguard-antidpi/core.js
+[ -f "$VIEW" ] || fail "view missing: $VIEW"
+[ -f "$CORE" ] || fail "core module missing: $CORE"
+[ ! -f /www/luci-static/resources/view/wanguard/antidpi-placeholder.js ] \
+	|| fail "the placeholder view must stay in luci-app-wanguard (wanguard-public)"
+ls -l "$VIEW" | grep -q '^-rw-r--r--' || fail "view must be 0644"
+ls -l "$CORE" | grep -q '^-rw-r--r--' || fail "core module must be 0644"
+grep -qF "'require wanguard-antidpi.core as" "$VIEW" \
+	|| fail "view does not require the shared core module"
+grep -qF "'require rpc'" "$CORE" || fail "core module lost the rpc dependency"
+grep -qF "'/usr/bin/wanguard-antidpi'" "$CORE" || fail "core module lost the CLI path"
+grep -qF "'status', '--json'" "$CORE" \
+	|| fail "core module must exec status --json (the #76 surface)"
+grep -qF "L.Class.extend" "$CORE" \
+	|| fail "core module must yield a LuCI class (module loader contract)"
+for tab in overview profiles policies domains tunnel tests; do
+	grep -qF "'$tab'" "$CORE" || fail "tab '$tab' missing from the core tab table"
+done
+echo "VIEW-OK"
+
+echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"
 apk del luci-app-wanguard-antidpi >/dev/null
 [ ! -f "$MENU" ] || fail "apk del left the menu file"
 [ ! -f "$ACL" ] || fail "apk del left the acl file"
+[ ! -f "$VIEW" ] || fail "apk del left the view file (#80)"
+[ ! -f "$CORE" ] || fail "apk del left the core module (#80)"
 [ -f /usr/share/luci/menu.d/luci-app-wanguard.json ] \
 	|| fail "apk del touched the simulated luci-app-wanguard menu file"
 apk list --installed 2>/dev/null | grep -q "^wanguard-antidpi-$VER " \
