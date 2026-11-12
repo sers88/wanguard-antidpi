@@ -77,12 +77,21 @@ var state = {
 		errors: {},       /* inline validation errors, per option */
 		inputs: {}        /* add-pin / add-host / number input texts (survive re-renders) */
 	},
+	profiles: {         /* Profiles tab (#84): client-side staged editor */
+		loaded: false,    /* the uci config has been read at least once */
+		dirty: false,     /* staged edits awaiting the apply pipeline */
+		origStrategy: null, /* committed strategy key at load time (restart-badge detect) */
+		deleteArm: null,  /* sid armed for the two-step profile delete */
+		errors: {},       /* inline validation errors, per profile (and '__new') */
+		inputs: {},       /* per-profile words textarea + name input texts */
+		newName: ''       /* new-profile label input text */
+	},
 	busy: false
 };
 
 /* sub-tab frame (issue #80): the order of the concept mock; the content of
  * each tab lands with its own stage (#81 overview done, #82 domain lists,
- * #83 tunnel protection, #85 profiles, #87 policies, #88 tests & logs) */
+ * #83 tunnel protection, #84 profiles, #86 policies, #88 tests & logs) */
 var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'tunnel', 'tests' ];
 
 function tabLabel(id) {
@@ -137,7 +146,9 @@ var CSS = [
 	".wg-ad-domrow { display:flex; align-items:center; gap:.5em; padding:.15em 0; border-bottom:1px dotted rgba(128,128,128,.2); font-family:monospace; font-size:.85em; }",
 	".wg-ad-domremove { background:none; border:none; cursor:pointer; color:#c2410c; padding:0 .3em; font-size:1em; }",
 	".wg-ad-addrow { display:flex; gap:.4em; margin:.5em 0 0; }",
-	".wg-ad-addrow input { flex:1; min-width:14em; }"
+	".wg-ad-addrow input { flex:1; min-width:14em; }",
+	".wg-ad-profhead { display:flex; align-items:center; gap:.4em; flex-wrap:wrap; margin-bottom:.4em; }",
+	".wg-ad-words { width:100%; min-height:7em; font-family:monospace; font-size:.85em; white-space:pre; }"
 ].join('\n');
 
 /* ---------- status fetching / parsing ---------- */
@@ -403,6 +414,20 @@ function buildStrategyCard() {
 	});
 	card.appendChild(row);
 
+	var groups = parseStrategy(s.words);
+	/* named profiles (#84): when the rendered block count matches the
+	 * enabled-with-words section count, show the real section names -
+	 * otherwise keep the generic labels (the render skips empty/disabled
+	 * profiles, so a mismatch is honest) */
+	var secs = (st.engine && st.engine.profile_sections) || [];
+	var names = null;
+	if (secs.length) {
+		var en = secs.filter(function(p) { return p.enabled && p.words > 0; })
+			.map(function(p) { return p.name; });
+		if (en.length == groups.length)
+			names = en;
+	}
+
 	var table = E('table', { 'class': 'wg-ad-table' }, [
 		E('tr', {}, [
 			E('th', {}, [ _('Profile') ]),
@@ -411,9 +436,9 @@ function buildStrategyCard() {
 			E('th', {}, [ _('Policies') ])
 		])
 	]);
-	parseStrategy(s.words).forEach(function(p) {
+	groups.forEach(function(p, i) {
 		table.appendChild(E('tr', {}, [
-			E('td', {}, [ p.name ]),
+			E('td', {}, [ (names && names[i]) ? names[i] : p.name ]),
 			E('td', {}, [ p.proto.join(' ') || _('—') ]),
 			E('td', {}, [ '%d'.format(p.words.length) ]),
 			E('td', {}, [ '%d'.format(p.desync) ])
@@ -654,6 +679,7 @@ function discardPending() {
 		uci.unload('wanguard-antidpi');
 		domainsAfterConfigChange();
 		tunnelAfterConfigChange();
+		profilesAfterConfigChange();
 		ui.changes.init();
 		return refresh().then(update);
 	}).catch(function(e) {
@@ -684,6 +710,7 @@ function reviewApply() {
 		ui.changes.init();
 		domainsAfterConfigChange();
 		tunnelAfterConfigChange();
+		profilesAfterConfigChange();
 		return refresh().then(update);
 	}).catch(function(e) {
 		state.applyBusy = false;
@@ -1557,6 +1584,466 @@ function renderTunnel() {
 	});
 }
 
+/* ---------- profiles tab (#84) ---------- */
+
+/* named strategy profiles (config profile): one section = one nfqws2
+ * profile block on the render, in section file order; the section id is
+ * the stable ref target (policies #86 will reference it), the label is
+ * editable. The editor stages client-side through the uci client (the
+ * #82/#83 lifecycle) and applies through the shared save -> apply(5) ->
+ * CLI apply pipeline; strategy/enabled edits drift the engine argv, so
+ * the honest badge is a restart. */
+
+function profilesModel() {
+	var legacy = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(
+		uci.get('wanguard-antidpi', 'engine', 'nfqws2_opt'));
+	var sections = (uci.sections('wanguard-antidpi', 'profile') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			name: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name'],
+			proto: (function(v) {
+				var out = [];
+				(typeof v == 'string' ? v.split(' ') : []).forEach(function(t) {
+					if (t.length) out.push(t);
+				});
+				return out;
+			})(s.proto),
+			words: (Array.isArray(s.strategy_words) ? s.strategy_words : []).slice(),
+			enabled: (s.enabled != null) ? (s.enabled == '1') : true
+		};
+	});
+	return {
+		sections: sections,
+		legacyWords: legacy,
+		/* profiles replace the legacy opt while any section exists (#84):
+		 * the UI must show that loudly, the CLI warns on every render */
+		legacyIgnored: (sections.length > 0 && legacy.length > 0)
+	};
+}
+
+/* the derived strategy key: enabled profiles with words, in section order,
+ * joined with --new separators - the exact mirror of the CLI's
+ * profile_strategy_words (an empty-word profile is skipped there too) */
+function profilesStrategyKey(m) {
+	var words = [];
+	var any = false;
+	m.sections.forEach(function(p) {
+		if (!p.enabled || !p.words.length)
+			return;
+		if (any)
+			words.push('--new');
+		any = true;
+		p.words.forEach(function(w) { words.push(w); });
+	});
+	return words.join('\u0001');
+}
+
+/* 'prof_balanced'-style stable section id derived from the label (same
+ * contract as the domainlist slug: refs go by section name) */
+function profilesSlug(label) {
+	var base = ('prof_' + label.toLowerCase().replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '')).replace(/^prof_prof/, 'prof').slice(0, 48);
+	var sid = base, n = 2;
+	while (uci.get('wanguard-antidpi', sid) != null) {
+		sid = base + '_' + n;
+		n++;
+	}
+	return sid;
+}
+
+function profilesMarkDirty() {
+	state.profiles.dirty = true;
+}
+
+/* parse the words textarea: one strategy word per line; a word rides in
+ * the engine argv, so whitespace inside it can never be staged (the CLI
+ * dies loudly on it - the UI keeps that state unreachable) */
+function profilesParseWords(text) {
+	var words = [];
+	var bad = [];
+	(text || '').split(/\r?\n/).forEach(function(line) {
+		var w = line.trim();
+		if (!w.length)
+			return;
+		if (/\s/.test(w))
+			bad.push(w);
+		else
+			words.push(w);
+	});
+	return { words: words, bad: bad };
+}
+
+/* proto tokens ride in a single space-separated option (design contract;
+ * policy matching #86 reads them) */
+function profilesToggleProto(sid, token, on) {
+	var cur = uci.get('wanguard-antidpi', sid, 'proto') || '';
+	var toks = [];
+	cur.split(' ').forEach(function(t) {
+		if (t.length && toks.indexOf(t) < 0 && t != token)
+			toks.push(t);
+	});
+	if (on)
+		toks.push(token);
+	toks.sort();
+	uci.set('wanguard-antidpi', sid, 'proto', toks.join(' '));
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+function profilesSetName(sid, text) {
+	uci.set('wanguard-antidpi', sid, 'name', text);
+	profilesMarkDirty();
+	/* no re-render: the input keeps the focus while typing */
+}
+
+function profilesSetWords(sid) {
+	var text = state.profiles.inputs[sid + '.words'] || '';
+	var parsed = profilesParseWords(text);
+	if (parsed.bad.length) {
+		state.profiles.errors[sid] = _('Each strategy word must be a single argv word (no whitespace): %s').format(parsed.bad.join(', '));
+		renderProfiles();
+		return;
+	}
+	delete state.profiles.errors[sid];
+	uci.set('wanguard-antidpi', sid, 'strategy_words', parsed.words);
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+function profilesSetEnabled(sid, on) {
+	uci.set('wanguard-antidpi', sid, 'enabled', on ? '1' : '0');
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+function profilesAddProfile() {
+	var label = (state.profiles.newName || '').trim();
+	if (label.length == 0) {
+		state.profiles.errors['__new'] = _('Enter a profile name.');
+		renderProfiles();
+		return;
+	}
+	delete state.profiles.errors['__new'];
+	var sid = profilesSlug(label);
+	uci.add('wanguard-antidpi', 'profile', sid);
+	uci.set('wanguard-antidpi', sid, 'name', label);
+	uci.set('wanguard-antidpi', sid, 'strategy_words', []);
+	uci.set('wanguard-antidpi', sid, 'enabled', '1');
+	state.profiles.newName = '';
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+function profilesDeleteProfile(sid) {
+	if (state.profiles.deleteArm != sid) {
+		state.profiles.deleteArm = sid;
+		renderProfiles();
+		return;
+	}
+	uci.remove('wanguard-antidpi', sid);
+	state.profiles.deleteArm = null;
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+/* section order = render order (first match wins semantics); the uci
+ * client's move() stages an order delta (the save() pipeline sends it) */
+function profilesMove(sid, dir) {
+	var sids = profilesModel().sections.map(function(p) { return p.sid; });
+	var i = sids.indexOf(sid);
+	var j = i + dir;
+	if (i < 0 || j < 0 || j >= sids.length)
+		return;
+	uci.move('wanguard-antidpi', sid, sids[j], dir > 0);
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+/* adopt the legacy engine.nfqws2_opt into a fresh profile (the migration
+ * path: profiles replace the legacy words on the next apply); the proto
+ * tokens are derived from the words' filter flags */
+function profilesAdoptLegacy() {
+	var m = profilesModel();
+	if (!m.legacyWords.length)
+		return;
+	var sid = profilesSlug(_('Adopted legacy'));
+	uci.add('wanguard-antidpi', 'profile', sid);
+	uci.set('wanguard-antidpi', sid, 'name', _('Adopted legacy'));
+	uci.set('wanguard-antidpi', sid, 'strategy_words', m.legacyWords.slice());
+	var proto = [];
+	m.legacyWords.forEach(function(w) {
+		if (w.indexOf('--filter-tcp=') == 0 && proto.indexOf('tcp') < 0)
+			proto.push('tcp');
+		if (w.indexOf('--filter-udp=') == 0 && proto.indexOf('quic') < 0)
+			proto.push('quic');
+	});
+	if (proto.length)
+		uci.set('wanguard-antidpi', sid, 'proto', proto.join(' '));
+	uci.set('wanguard-antidpi', sid, 'enabled', '1');
+	profilesMarkDirty();
+	renderProfiles();
+}
+
+/* drop the client-side staged edits (committed truth untouched); the
+ * shared pending-bar Discard covers the router-side deltas */
+function profilesDiscardEdits() {
+	state.profiles.dirty = false;
+	state.profiles.origStrategy = null;
+	state.profiles.deleteArm = null;
+	state.profiles.errors = {};
+	state.profiles.inputs = {};
+	state.profiles.newName = '';
+	uci.unload('wanguard-antidpi');
+	renderProfiles();
+}
+
+/* after the shared pipeline committed (or the router deltas were reverted),
+ * the editor starts clean from the committed truth */
+function profilesAfterConfigChange() {
+	state.profiles.dirty = false;
+	state.profiles.origStrategy = null;
+	state.profiles.deleteArm = null;
+	state.profiles.errors = {};
+	state.profiles.inputs = {};
+	state.profiles.newName = '';
+	if (state.activeTab == 'profiles')
+		renderProfiles();
+}
+
+function profilesApply() {
+	reviewApply();
+}
+
+/* legacy strategy card: without profiles the legacy words ARE the
+ * strategy (active); with profiles they are ignored (#84 render contract)
+ * - the card must say which, and offer the adopt migration path */
+function profilesLegacyCard(m) {
+	if (!m.legacyWords.length)
+		return null;
+	var card = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Legacy strategy (engine.nfqws2_opt)'), ' ',
+			chipEl(m.sections.length
+				? { cls: 'wg-ad-chip-warn', label: _('ignored while profiles exist'),
+					title: _('Strategy profile sections replace the legacy words on the render') }
+				: { cls: 'wg-ad-chip-ok', label: _('active') }) ]),
+		E('p', { 'class': 'wg-ad-hint' }, [
+			_('Pre-profile storage: one UCI list item per strategy word.')
+		])
+	]);
+	var row = E('div', { 'class': 'wg-ad-chips' });
+	m.legacyWords.forEach(function(w) {
+		row.appendChild(E('span', { 'class': 'wg-ad-chip wg-ad-word' }, [ w ]));
+	});
+	card.appendChild(row);
+	card.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, profilesAdoptLegacy)
+		}, [ _('Adopt into a profile') ])
+	]));
+	return card;
+}
+
+function profilesSectionCard(m, p, idx) {
+	var armed = (state.profiles.deleteArm == p.sid);
+	var wordsText = state.profiles.inputs[p.sid + '.words'];
+	if (wordsText == null)
+		wordsText = p.words.join('\n');
+	var card = E('div', { 'class': 'wg-ad-panel' });
+	var head = E('div', { 'class': 'wg-ad-profhead' }, [
+		E('strong', {}, [ p.name ]),
+		' ',
+		(p.enabled)
+			? chipEl({ cls: 'wg-ad-chip-ok', label: _('enabled') })
+			: chipEl({ cls: 'wg-ad-chip-muted', label: _('disabled') }),
+		' ',
+		chipEl({ cls: 'wg-ad-chip-muted', label: '%d word(s)'.format(p.words.length) }),
+		(!p.enabled)
+			? E('span', { 'class': 'wg-ad-hint' }, [ ' ' + _('skipped on the render') ])
+			: ((p.words.length == 0)
+				? E('span', { 'class': 'wg-ad-hint' }, [ ' ' + _('no words - contributes nothing to the strategy') ])
+				: E([]))
+	]);
+	card.appendChild(head);
+
+	/* name + enabled + order/remove row */
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('Profile name'),
+		'input': function(ev) {
+			state.profiles.inputs[p.sid + '.name'] = ev.target.value;
+			profilesSetName(p.sid, ev.target.value);
+		}
+	});
+	nameInput.value = state.profiles.inputs[p.sid + '.name'] || p.name;
+	var actions = E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'title': _('Move up'),
+			'disabled': (idx == 0) ? '' : null,
+			'click': ui.createHandlerFn(null, function() { profilesMove(p.sid, -1); })
+		}, [ '↑' ]),
+		E('button', {
+			'class': 'btn cbi-button',
+			'title': _('Move down'),
+			'disabled': (idx == m.sections.length - 1) ? '' : null,
+			'click': ui.createHandlerFn(null, function() { profilesMove(p.sid, 1); })
+		}, [ '↓' ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, function() { profilesDeleteProfile(p.sid); })
+		}, [ armed ? _('Confirm delete?') : _('Delete') ])
+	]);
+	card.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [ nameInput, actions ]));
+
+	/* enabled + proto toggles */
+	var enabledCheck = E('input', { 'type': 'checkbox' });
+	enabledCheck.checked = p.enabled;
+	enabledCheck.addEventListener('change', function(ev) {
+		profilesSetEnabled(p.sid, ev.target.checked);
+	});
+	var protoRow = E('div', { 'class': 'wg-ad-chips' }, [
+		E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('enabled') ]),
+		E('span', { 'class': 'wg-ad-hint' }, [ _('Protocols (UI metadata):') ])
+	]);
+	[ 'tcp', 'udp', 'quic' ].forEach(function(tok) {
+		protoRow.appendChild(E('button', {
+			'class': 'btn cbi-button' + ((p.proto.indexOf(tok) >= 0) ? ' wg-ad-modebtn-active' : ''),
+			'click': ui.createHandlerFn(null, function() {
+				profilesToggleProto(p.sid, tok, p.proto.indexOf(tok) < 0);
+			})
+		}, [ tok.toUpperCase() ]));
+	});
+	card.appendChild(protoRow);
+
+	/* strategy words: one per line */
+	var wordsInput = E('textarea', {
+		'class': 'wg-ad-words',
+		'spellcheck': 'false',
+		'placeholder': _('--filter-tcp=443\n--payload=tls_client_hello\n--lua-desync=…'),
+		'input': function(ev) {
+			state.profiles.inputs[p.sid + '.words'] = ev.target.value;
+		},
+		'change': function(ev) {
+			state.profiles.inputs[p.sid + '.words'] = ev.target.value;
+			profilesSetWords(p.sid);
+		}
+	});
+	wordsInput.value = wordsText;
+	card.appendChild(wordsInput);
+	if (state.profiles.errors[p.sid] != null)
+		card.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors[p.sid] ]));
+	else
+		card.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('One strategy word per line (the nfqws2 argv grammar - each line becomes one engine argument).')
+		]));
+	return card;
+}
+
+function buildProfilesView() {
+	var m = profilesModel();
+	var frag = E([]);
+
+	var legacyCard = profilesLegacyCard(m);
+	if (legacyCard != null)
+		frag.appendChild(legacyCard);
+
+	if (m.sections.length == 0) {
+		frag.appendChild(E('div', { 'class': 'wg-ad-panel' }, [
+			E('h3', {}, [ _('Strategy profiles') ]),
+			E('p', { 'class': 'wg-ad-hint' }, [
+				_('No profiles configured - the legacy strategy words drive the engine.')
+			])
+		]));
+	}
+
+	m.sections.forEach(function(p, idx) {
+		frag.appendChild(profilesSectionCard(m, p, idx));
+	});
+
+	/* add-profile row */
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('New profile name (e.g. Balanced)'),
+		'input': function(ev) { state.profiles.newName = ev.target.value; }
+	});
+	nameInput.value = state.profiles.newName;
+	var addCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Add profile') ])
+	]);
+	if (state.profiles.errors['__new'] != null)
+		addCard.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.profiles.errors['__new'] ]));
+	addCard.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		nameInput,
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, profilesAddProfile)
+		}, [ _('Create profile') ])
+	]));
+	frag.appendChild(addCard);
+
+	/* apply block: the honest badges (strategy/enabled/order edits drift the
+	 * engine argv -> restart; name/proto are metadata -> no restart) */
+	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Apply') ])
+	]);
+	if (state.profiles.dirty) {
+		var strategyChanged = (profilesStrategyKey(profilesModel()) != state.profiles.origStrategy);
+		if (strategyChanged)
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
+				label: _('Strategy changed - apply restarts the engine'),
+				title: _('The strategy words ride in the engine argv: any word/enabled/order change needs a restart to take effect') }));
+		else
+			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+				label: _('Metadata only - the engine stays untouched'),
+				title: _('Name and protocol edits do not appear in the engine argv') }));
+	}
+	else {
+		applyCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No unsaved edits.') ]));
+	}
+	applyCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, profilesApply),
+			'disabled': (!state.profiles.dirty || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, profilesDiscardEdits),
+			'disabled': (!state.profiles.dirty) ? '' : null
+		}, [ _('Discard edits') ])
+	]));
+	frag.appendChild(applyCard);
+	return frag;
+}
+
+/* the tab body renders once per switch (and after applies) - NOT per poll
+ * tick: a rebuild would blow away in-progress edits (the #82 rule). */
+function renderProfiles() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.setAttribute('data-unavail', 'false');
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'profiles' || !state.bodyNode)
+			return;
+		if (state.profiles.origStrategy == null)
+			state.profiles.origStrategy = profilesStrategyKey(profilesModel());
+		state.profiles.loaded = true;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(buildProfilesView());
+	}).catch(function(e) {
+		if (state.activeTab != 'profiles' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).').format((e && e.message) || 'error') ])
+		]));
+	});
+}
+
 /* ---------- tab frame (issue #80) ---------- */
 
 function buildTabbar() {
@@ -1604,6 +2091,10 @@ function renderBody() {
 
 	if (state.activeTab == 'overview') {
 		node.appendChild(renderOverview());
+		return;
+	}
+	if (state.activeTab == 'profiles') {
+		renderProfiles();
 		return;
 	}
 	if (state.activeTab == 'domains') {
@@ -1676,5 +2167,15 @@ return L.Class.extend({
 	tunnelAddPin: tunnelAddPin,
 	tunnelAddHost: tunnelAddHost,
 	tunnelSetNum: tunnelSetNum,
-	tunnelAfterConfigChange: tunnelAfterConfigChange
+	tunnelAfterConfigChange: tunnelAfterConfigChange,
+	profilesModel: profilesModel,
+	profilesStrategyKey: profilesStrategyKey,
+	renderProfiles: renderProfiles,
+	buildProfilesView: buildProfilesView,
+	profilesAddProfile: profilesAddProfile,
+	profilesSetEnabled: profilesSetEnabled,
+	profilesSetWords: profilesSetWords,
+	profilesMove: profilesMove,
+	profilesAdoptLegacy: profilesAdoptLegacy,
+	profilesAfterConfigChange: profilesAfterConfigChange
 });

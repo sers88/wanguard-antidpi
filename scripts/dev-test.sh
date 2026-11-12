@@ -29,14 +29,14 @@ hostpath() {
 	if uname -s | grep -qiE 'mingw|msys|cygwin'; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
 }
 
-echo "=== [1/9] kernel probe (NFQUEUE support in the container kernel)"
+echo "=== [1/10] kernel probe (NFQUEUE support in the container kernel)"
 probe=$(sh scripts/kernel-probe.sh) || {
 	printf '%s\n' "$probe"
 	exit 1
 }
 printf '%s\n' "$probe"
 
-echo "=== [2/9] local build"
+echo "=== [2/10] local build"
 sh scripts/dev-build.sh "$@"
 
 ls out/wanguard-antidpi-*.apk >/dev/null 2>&1 || {
@@ -51,7 +51,7 @@ ls out/luci-app-wanguard-antidpi-*.apk >/dev/null 2>&1 || {
 	exit 1
 }
 
-echo "=== [3/9] install + smoke matrix (fresh container)"
+echo "=== [3/10] install + smoke matrix (fresh container)"
 docker run --rm \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/scripts"):/scripts:ro" \
@@ -59,47 +59,54 @@ docker run --rm \
 	"$IMAGE" \
 	sh /tests/container-smoke.sh local "$ver"
 
-echo "=== [4/9] mihomo mark integration (fresh container, NET_ADMIN)"
+echo "=== [4/10] mihomo mark integration (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-mark.sh
 
-echo "=== [5/9] nft scope table (fresh container, NET_ADMIN)"
+echo "=== [5/10] nft scope table (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-nft.sh
 
-echo "=== [6/9] tunnel resolver updater (fresh container, NET_ADMIN)"
+echo "=== [6/10] tunnel resolver updater (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-tunnel.sh
 
-echo "=== [7/9] status surface (fresh container, NET_ADMIN)"
+echo "=== [7/10] status surface (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-status.sh
 
-echo "=== [8/9] apply orchestration (fresh container, NET_ADMIN)"
+echo "=== [8/10] apply orchestration (fresh container, NET_ADMIN)"
 docker run --rm --cap-add NET_ADMIN \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-apply.sh
 
-echo "=== [9/9] luci menu + ACL matrix (fresh container; needs the feed for luci-base)"
+echo "=== [9/10] luci menu + ACL matrix (fresh container; needs the feed for luci-base)"
 docker run --rm \
 	-v "$(hostpath "$PWD/out"):/out:ro" \
 	-v "$(hostpath "$PWD/tests"):/tests:ro" \
 	"$IMAGE" \
 	sh /tests/test-luci.sh "$ver"
+
+echo "=== [10/10] strategy profiles (fresh container, NET_ADMIN; live part probes NFQUEUE)"
+docker run --rm --cap-add NET_ADMIN \
+	-v "$(hostpath "$PWD/out"):/out:ro" \
+	-v "$(hostpath "$PWD/tests"):/tests:ro" \
+	"$IMAGE" \
+	sh /tests/test-profiles.sh
 
 if printf '%s\n' "$probe" | grep -q '^NFQUEUE-OK'; then
 	echo "DEV-TEST-OK (matrix green: $ver; NFQUEUE live scenarios testable here)"

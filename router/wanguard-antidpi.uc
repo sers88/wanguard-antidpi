@@ -163,6 +163,74 @@ function load_tunnel() {
 	};
 }
 
+function load_profiles() {
+	// named strategy profile sections (issue #84): refs go by the section
+	// name (stable id), the label is editable; render order = section file
+	// order (uci foreach). Missing section/options degrade softly - an empty
+	// list means "no profiles" and keeps the legacy nfqws2_opt contract.
+	let out = [];
+	uci.cursor().foreach(CONF, 'profile', function(s) {
+		// proto is UI metadata (tcp/udp/quic); the strategy words themselves
+		// carry the --filter-tcp/--filter-udp flags on the render
+		let proto = [];
+		if (type(s.proto) == 'string') {
+			let toks = split(s.proto, ' ');
+			if (type(toks) == 'array') {
+				for (let i = 0; i < length(toks); i++)
+					if (length(toks[i]) > 0)
+						push(proto, toks[i]);
+			}
+		}
+		push(out, {
+			id: s['.name'],
+			name: (type(s.name) == 'string' && length(s.name) > 0) ? s.name : s['.name'],
+			proto: proto,
+			words: (type(s.strategy_words) == 'array') ? s.strategy_words : [],
+			enabled: (s.enabled == null || s.enabled != '0') ? true : false
+		});
+	});
+	return out;
+}
+
+function profile_strategy_words() {
+	// the profile-driven strategy (issue #84): enabled sections in file
+	// order, joined with --new separators; null = NO profile sections at all
+	// (the legacy engine.nfqws2_opt renders verbatim - the r9 byte-golden
+	// contract). Each word lands in the engine argv, so it must be a single
+	// argv word: anything containing whitespace fails the render loudly
+	// (named section in the message), not silently.
+	let ps = load_profiles();
+	if (length(ps) == 0)
+		return null;
+	let words = [];
+	let any_words = false;
+	for (let i = 0; i < length(ps); i++) {
+		let p = ps[i];
+		if (!p.enabled)
+			continue;
+		if (length(p.words) == 0) {
+			warn('wanguard-antidpi: profile "' + p.id + '" is enabled but has no strategy words - skipped\n');
+			continue;
+		}
+		if (any_words)
+			push(words, '--new');
+		any_words = true;
+		for (let j = 0; j < length(p.words); j++) {
+			let w = p.words[j];
+			if (type(w) != 'string' || length(w) == 0 ||
+			    index(w, ' ') >= 0 || index(w, '\t') >= 0)
+				die('profile "' + p.id + '": strategy word "' + w +
+					'" must be a single argv word (no whitespace)');
+			push(words, w);
+		}
+	}
+	if (!any_words) {
+		warn('wanguard-antidpi: profile sections present but none renders strategy words - no-op strategy\n');
+		return [];
+	}
+	return words;
+}
+
 function load_whitelist() {
 	// soft section (issue #70, same contract as tunnel): a missing section is
 	// the blanket mode (desync for every queued target). Only the literal '1'
@@ -365,14 +433,25 @@ function engine_argv() {
 	// PROFILE (verified in the container: "profile N include hostlist"), so
 	// it is re-emitted after every --new profile separator. The FILE content
 	// is the merged source set (#82); the binding rides on the mode alone.
-	let wl_emit = (src.enabled == '1' && length(c.opt) > 0);
+	// Strategy source (issue #84): profile sections REPLACE the legacy
+	// engine.nfqws2_opt when present; with no profile sections the legacy
+	// list renders verbatim and the r9 byte-golden contract stays untouched.
+	let strategy = profile_strategy_words();
+	if (strategy == null) {
+		strategy = c.opt;
+	}
+	else if (length(c.opt) > 0) {
+		warn('wanguard-antidpi: profile sections present - engine.nfqws2_opt (' +
+			length(c.opt) + ' words) is IGNORED\n');
+	}
+	let wl_emit = (src.enabled == '1' && length(strategy) > 0);
 	if (wl_emit)
 		push(a, '--hostlist=' + HOSTLIST);
-	// strategy words verbatim: one UCI list item = one argv word (the shell
-	// word-split contract is gone with the ucode base)
-	for (let i = 0; i < length(c.opt); i++) {
-		push(a, c.opt[i]);
-		if (wl_emit && c.opt[i] == '--new' && i + 1 < length(c.opt))
+	// strategy words verbatim: one word = one argv word (the shell word-split
+	// contract is gone with the ucode base)
+	for (let i = 0; i < length(strategy); i++) {
+		push(a, strategy[i]);
+		if (wl_emit && strategy[i] == '--new' && i + 1 < length(strategy))
 			push(a, '--hostlist=' + HOSTLIST);
 	}
 	return a;
@@ -1403,8 +1482,14 @@ function status_engine_info() {
 		}
 	}
 	// no strategy words at all = the graceful no-op (zero profiles); each
-	// --new starts the next profile set
-	let profiles = (length(c.opt) == 0) ? 0 : newc + 1;
+	// --new starts the next profile set. The word count comes from the
+	// STRATEGY SOURCE (profiles replace the legacy opt, issue #84), not
+	// from c.opt alone.
+	let psecs = load_profiles();
+	let strategy = profile_strategy_words();
+	if (strategy == null)
+		strategy = c.opt;
+	let profiles = (length(strategy) == 0) ? 0 : newc + 1;
 	let ver = null;
 	if (access(ENGINE, 'x')) {
 		let fp = popen(ENGINE + ' --version 2>/dev/null', 'r');
@@ -1416,10 +1501,20 @@ function status_engine_info() {
 			ver = null;
 	}
 	let pid = status_pidof('nfqws2');
+	let sections = [];
+	for (let i = 0; i < length(psecs); i++)
+		push(sections, {
+			id: psecs[i].id,
+			name: psecs[i].name,
+			proto: psecs[i].proto,
+			enabled: psecs[i].enabled,
+			words: length(psecs[i].words)
+		});
 	return {
 		pid: pid,
 		version: ver,
 		profiles: profiles,
+		profile_sections: sections,
 		hostlists: lists,
 		running_argv: (pid != null) ? status_proc_cmdline(pid) : null
 	};
@@ -1608,6 +1703,7 @@ function cmd_status() {
 			pid: en.pid,
 			version: en.version,
 			profiles: en.profiles,
+			profile_sections: en.profile_sections,
 			hostlists: en.hostlists,
 			running_argv: en.running_argv
 		},
@@ -1630,7 +1726,9 @@ function cmd_status() {
 		((s.service.pid != null) ? ', engine pid ' + s.service.pid : ', engine not running') +
 		((s.service.uptime_s != null) ? ' (uptime ' + s.service.uptime_s + 's)' : '') + '\n');
 	print('engine: ' + ((s.engine.version != null) ? s.engine.version : 'unknown') +
-		', profiles ' + s.engine.profiles + ', hostlists ' + length(s.engine.hostlists) +
+		', profiles ' + s.engine.profiles +
+		', sections ' + length(s.engine.profile_sections) +
+		', hostlists ' + length(s.engine.hostlists) +
 		((s.engine.running_argv != null) ? ', running argv captured' : '') + '\n');
 	print('nft: ' + (s.nft.table_present ?
 		('table present (tcp ' + s.nft.counters.tcp.packets + ' pkts / udp ' + s.nft.counters.udp.packets + ' pkts)') :
@@ -1731,9 +1829,14 @@ function apply_engine_decision(file_changed) {
 	let c = load_config();
 	let new_argv = engine_argv();
 	let old_argv = apply_running_argv();
+	// the "worth starting" check counts the STRATEGY SOURCE (profiles
+	// replace the legacy opt, issue #84), not c.opt alone
+	let strategy = profile_strategy_words();
+	if (strategy == null)
+		strategy = c.opt;
 	if (old_argv == null)
-		return (length(c.opt) > 0)
-			? { action: 'restart', reason: 'engine not running - starting with ' + length(c.opt) + ' strategy words' }
+		return (length(strategy) > 0)
+			? { action: 'restart', reason: 'engine not running - starting with ' + length(strategy) + ' strategy words' }
 			: { action: 'noop', reason: 'engine not running, no strategy words - nothing to start' };
 	if (!apply_argv_equal(old_argv, new_argv)) {
 		if (apply_argv_equal(apply_argv_without_hostlist(old_argv), apply_argv_without_hostlist(new_argv))) {

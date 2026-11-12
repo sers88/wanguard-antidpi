@@ -24,6 +24,9 @@
 #       cron line -> cron.ok
 #   [5] strategy words -> profile count (1; with --new -> 2), hostlist enters
 #       the rendered argv (whitelist still enabled)
+#   [5b] named profile sections (#84): listed in the status document
+#       (id/name/proto/enabled/words); profiles REPLACE the legacy opt on the
+#       render while sections exist; delete reverts to the legacy strategy
 #   [6] live table: apply -> table_present + counter objects (structural)
 #   [7] engine-cmdline byte-parity guard over the refactored argv builder
 #       (default 6-word golden + ipset emission on a populated set)
@@ -74,6 +77,7 @@ grab
 jp_str 's.engine.version' | grep -q . || fail "engine.version empty (binary ships in the package)"
 [ "$(jp 's.engine.profiles')" = "0" ] || fail "expected 0 profiles with an empty strategy"
 [ "$(jp 'length(s.engine.hostlists)')" = "0" ] || fail "expected no hostlists with an empty strategy"
+[ "$(jp 'length(s.engine.profile_sections)')" = "0" ] || fail "expected no profile sections on a bare config"
 [ "$(jp 's.engine.running_argv')" = "null" ] || fail "expected running_argv null"
 [ "$(jp 's.nft.table_present')" = "false" ] || fail "expected table absent"
 [ "$(jp 's.nft.counters')" = "null" ] || fail "expected counters null"
@@ -192,6 +196,28 @@ uci commit wanguard-antidpi
 grab
 [ "$(jp 's.engine.profiles')" = "2" ] || fail "expected 2 profiles after --new"
 echo "PROFILES-OK (1 word set -> 1; --new -> 2; hostlist per-profile present)"
+
+# ---- [5b] named profile sections (#84) ----
+echo "== [5b] profile sections in the status document"
+uci set wanguard-antidpi.prof_x=profile
+uci set wanguard-antidpi.prof_x.name='Status profile'
+uci set wanguard-antidpi.prof_x.proto='tcp quic'
+uci add_list wanguard-antidpi.prof_x.strategy_words='--filter-tcp=443'
+uci commit wanguard-antidpi
+grab
+[ "$(jp 'length(s.engine.profile_sections)')" = "1" ] || fail "expected the profile section listed"
+[ "$(jp_str 's.engine.profile_sections[0].id')" = "prof_x" ] || fail "section id"
+[ "$(jp_str 's.engine.profile_sections[0].name')" = "Status profile" ] || fail "section label"
+[ "$(jp 'length(s.engine.profile_sections[0].proto)')" = "2" ] || fail "proto tokens"
+[ "$(jp 's.engine.profile_sections[0].enabled')" = "true" ] || fail "default enabled"
+[ "$(jp 's.engine.profile_sections[0].words')" = "1" ] || fail "word count"
+[ "$(jp 's.engine.profiles')" = "1" ] || fail "profiles must REPLACE the legacy opt while sections exist (got $(jp 's.engine.profiles'))"
+uci delete wanguard-antidpi.prof_x
+uci commit wanguard-antidpi
+grab
+[ "$(jp 'length(s.engine.profile_sections)')" = "0" ] && [ "$(jp 's.engine.profiles')" = "2" ] \
+	|| fail "deleting the section must restore the legacy strategy"
+echo "STATUS-PROFILES-OK (sections listed; profiles replace the legacy opt; delete reverts)"
 
 # ---- [6] live table ----
 echo "== [6] live nft table"

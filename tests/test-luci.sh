@@ -233,6 +233,23 @@ grep -qF "tunnelModel" "$CORE" \
 	|| fail "the tunnel tab lost its view model (pins/hosts/status)"
 grep -qF "renderTunnel" "$CORE" \
 	|| fail "the tunnel tab lost its render entry point"
+# the #84 Profiles tab: the view model (sections + legacy shadowing), the
+# derived strategy key (the CLI profile_strategy_words mirror behind the
+# honest restart badge), the words parser (whitespace can never be staged -
+# the #61-family render contract) and the editor surfaces are pinned
+# structurally
+grep -qF "profilesModel" "$CORE" \
+	|| fail "the profiles tab lost its view model (sections + legacy)"
+grep -qF "profilesStrategyKey" "$CORE" \
+	|| fail "the profiles tab lost the derived strategy key (restart-badge detect)"
+grep -qF "profilesParseWords" "$CORE" \
+	|| fail "the profiles tab lost the one-word-per-line parser"
+grep -qF "renderProfiles" "$CORE" \
+	|| fail "the profiles tab lost its render entry point"
+grep -qF "uci.move" "$CORE" \
+	|| fail "the profiles tab lost the section reorder path (order = render order)"
+grep -qF "profile_sections" "$CORE" \
+	|| fail "the Overview card lost the named-profiles enrichment (#84 status surface)"
 echo "VIEW-OK"
 
 echo "== [9] apk del removes the real tab, keeps the simulated luci-app-wanguard + core"

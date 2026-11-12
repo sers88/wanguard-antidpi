@@ -30,6 +30,7 @@
 #   [5b] whitelist mode flip off -> restart (SIGHUP cannot rebind --hostlist)
 #   [5c] whitelist mode flip on -> restart again, hostlist back
 #   [5d] tunnel pin add/remove -> set + --ipset-exclude-ip rebuilt (#83)
+#   [5e] profile strategy edit -> restart, profile words in /proc cmdline (#84)
 #   [6]  --check all green (+ --json ok:true, engine pid present)
 #   [7]  --check catches a missing hostlist file
 #   [8]  --check catches a foreign routing-mark
@@ -281,6 +282,43 @@ tr '\0' '\n' < "/proc/$F/cmdline" | grep -qF '192.0.2.99' \
 nft list set inet wanguard_antidpi proxy_servers 2>/dev/null | grep -qF '192.0.2.99' \
 	&& fail "nft set still carries the removed pin" || :
 echo "PINDEL-OK (pin add/remove restarted the engine, set + --ipset-exclude-ip rebuilt, pid $E -> $F)"
+
+# ---- [5e] profile strategy change -> restart (not SIGHUP) ----
+# profiles replace the legacy opt on the render (#84): switching the
+# strategy THROUGH a profile section must drift the live argv -> restart,
+# with the profile words visible in the running /proc cmdline. The profile
+# words must be ENGINE-VALID (a bogus word kills the started engine and the
+# follow-up no-op check would see a dead process): a distinct filter port
+# keeps the argv drift checkable while the engine stays alive.
+echo "== [5e] profile strategy edit -> restart"
+uci set wanguard-antidpi.prof_t=profile
+uci set wanguard-antidpi.prof_t.name='Test profile'
+uci add_list wanguard-antidpi.prof_t.strategy_words='--filter-tcp=8443'
+uci add_list wanguard-antidpi.prof_t.strategy_words='--payload=tls_client_hello'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "profile-apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+G=$(epid)
+[ -n "$G" ] || fail "profile apply did not restart the engine"
+[ "$G" != "$F" ] || fail "profile strategy change did not restart the engine (same pid)"
+tr '\0' '\n' < "/proc/$G/cmdline" | grep -qx -- '--filter-tcp=8443' \
+	|| fail "live engine argv lost the profile words (SIGHUP path taken instead of restart?): $(tr '\0' ' ' < /proc/$G/cmdline)"
+# no-change repeat with the profile-driven strategy -> idempotent no-op
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "profile no-op apply exited $RC: $OUT"
+assert_out 'engine: no-op' "$OUT"
+[ "$(epid)" = "$G" ] || fail "no-op profile apply disturbed the engine pid"
+# back to the legacy strategy -> restart again (the profiles-vs-legacy flip);
+# the legacy opt words never left the config (the profile SHADOWED them), so
+# deleting the section reverts the render byte-exactly - [6] --check green
+# depends on this exact pre-state (whitelist on, 6 legacy words, hostlist)
+uci delete wanguard-antidpi.prof_t
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "legacy-restore apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+echo "PROFILE-RESTART-OK (profile strategy change = restart, no-op after, legacy flip = restart)"
 
 # ---- [6] --check all green ----
 echo "== [6] --check all green"
