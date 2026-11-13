@@ -55,7 +55,7 @@
 	},
 	"admin/network/wanguard/antidpi": {
 		"title": "Anti-DPI placeholder",
-		"order": 10,
+		"order": 35,
 		"action": {
 			"type": "view",
 			"path": "wanguard/antidpi-placeholder"

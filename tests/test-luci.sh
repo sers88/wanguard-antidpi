@@ -90,8 +90,9 @@ echo "GUARDS-OK"
 
 echo "== [4] sort-order probes (#75 A_fixed / A_default, executable)"
 mkdir -p /tmp/luci/sort-ok /tmp/luci/sort-bad
-# the fixture IS the shipped luci-app-wanguard.json (synced at #79, carries
-# the placeholder child); correct name: ours sorts after luci-app-wanguard.json
+# the fixture IS the shipped luci-app-wanguard.json (synced at #79/#93, carries
+# the placeholder child at the real tab position); correct name: ours sorts
+# after luci-app-wanguard.json
 # -> the real node wins
 cp "$FIXT" /tmp/luci/sort-ok/luci-app-wanguard.json
 cp "$MENU" /tmp/luci/sort-ok/wanguard-antidpi.json
@@ -106,7 +107,7 @@ cp "$FIXT" /tmp/luci/sort-bad/luci-app-wanguard.json
 cp "$MENU" /tmp/luci/sort-bad/luci-app-wanguard-antidpi.json
 out=$(ucode "$UC" tree /tmp/luci/sort-bad /tmp/luci/acl-both.json)
 expect 'sort-order: default filename loses to the placeholder' \
-	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=10 path=wanguard/antidpi-placeholder' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=35 path=wanguard/antidpi-placeholder' \
 	"$out"
 echo "SORTORDER-OK"
 
@@ -365,8 +366,8 @@ out=$(ucode "$UC" tree /usr/share/luci/menu.d /tmp/luci/acl-both.json)
 expect 'uninstall: luci tabs remain (placeholder child included)' \
 	'wanguard.parent: satisfied=1 readonly=0 title=WAN Guard acl=luci-app-wanguard children=antidpi,devices,diagnostics,groups,overview' \
 	"$out"
-expect 'uninstall: antidpi tab = the #79 placeholder' \
-	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=10 path=wanguard/antidpi-placeholder' \
+expect 'uninstall: antidpi tab = the #79 placeholder (at the real tab position, #93)' \
+	'wanguard.antidpi: satisfied=1 readonly=0 title=Anti-DPI placeholder acl=luci-app-wanguard order=35 path=wanguard/antidpi-placeholder' \
 	"$out"
 echo "UNINSTALL-OK"
 
