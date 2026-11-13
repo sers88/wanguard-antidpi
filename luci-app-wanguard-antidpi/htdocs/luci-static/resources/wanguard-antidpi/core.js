@@ -181,6 +181,7 @@ var CSS = [
 	".wg-ad-domremove { background:none; border:none; cursor:pointer; color:#c2410c; padding:0 .3em; font-size:1em; }",
 	".wg-ad-addrow { display:flex; gap:.4em; margin:.5em 0 0; }",
 	".wg-ad-addrow input { flex:1; min-width:14em; }",
+	".wg-ad-formrow { display:flex; gap:.6em; align-items:center; flex-wrap:wrap; margin:.5em 0 0; }",
 	".wg-ad-profrow { display:flex; align-items:center; gap:.5em; flex-wrap:wrap; padding:.45em 0; border-top:1px solid rgba(128,128,128,.18); }",
 	".wg-ad-profrow-off { opacity:.55; }",
 	".wg-ad-dot-blue { background:#2563EB; }",
@@ -2134,7 +2135,7 @@ function profilesListRow(m, p, idx) {
 /* color picker row (shared by the drawer modes): the palette keys render
  * as dots; the active key gets the active button style */
 function profilesColorRow(current, onPick) {
-	var row = E('div', { 'class': 'wg-ad-chips' }, [
+	var row = E('div', { 'class': 'wg-ad-formrow' }, [
 		E('span', { 'class': 'wg-ad-hint' }, [ _('Color dot:') ])
 	]);
 	Object.keys(PROFILE_COLORS).forEach(function(k) {
@@ -2149,7 +2150,7 @@ function profilesColorRow(current, onPick) {
 /* proto toggle row (shared): the tokens are UI metadata for the future
  * policy matching (#86); the badges on the list derive from the words */
 function profilesProtoRowOf(current, onToggle) {
-	var row = E('div', { 'class': 'wg-ad-chips' }, [
+	var row = E('div', { 'class': 'wg-ad-formrow' }, [
 		E('span', { 'class': 'wg-ad-hint' }, [ _('Protocols (UI metadata):') ])
 	]);
 	[ 'tcp', 'udp', 'quic' ].forEach(function(tok) {
@@ -2281,7 +2282,7 @@ function profilesEditorPanel(m) {
 		enabledCheck.addEventListener('change', function(ev) {
 			profilesSetEnabled(p.sid, ev.target.checked);
 		});
-		panel.appendChild(E('div', { 'class': 'wg-ad-chips' }, [
+		panel.appendChild(E('div', { 'class': 'wg-ad-formrow' }, [
 			E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('enabled') ])
 		]));
 	}
@@ -3016,7 +3017,7 @@ function policiesEditorPanel(m) {
 		m.lists, listPick, true, _('Pick a list…')));
 
 	/* protocol toggles */
-	var protoRow = E('div', { 'class': 'wg-ad-chips' }, [
+	var protoRow = E('div', { 'class': 'wg-ad-formrow' }, [
 		E('span', { 'class': 'wg-ad-hint' }, [ _('Protocols (block filters):') ])
 	]);
 	var protoCurrent = isNew ? state.policies.draft.proto : p.proto;
@@ -3083,7 +3084,7 @@ function policiesEditorPanel(m) {
 		else
 			policiesSetEnabled(p.sid, ev.target.checked);
 	});
-	panel.appendChild(E('div', { 'class': 'wg-ad-chips' }, [
+	panel.appendChild(E('div', { 'class': 'wg-ad-formrow' }, [
 		E('label', { 'class': 'wg-ad-hint' }, [ enabledCheck, ' ' + _('Enable policy') ])
 	]));
 

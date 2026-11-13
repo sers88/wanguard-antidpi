@@ -1292,6 +1292,8 @@ suite('#84/#85 profiles: drawer, presets, badges, reorder, guards', async () => 
 	const rows = () =>
 		findAll(ad.state.bodyNode, (n) => n.attrs && typeof n.attrs.class === 'string' &&
 			n.attrs.class.split(' ').indexOf('wg-ad-profrow') >= 0);
+	const drawerRow = (label) => findAll(ad.state.bodyNode, (n) => n.tag === 'div' &&
+		typeof n.attrs.class === 'string' && flat(n).indexOf(label) === 0)[0] || null;
 
 	ad = loadCore();
 	v = loadView(ad);
@@ -1304,6 +1306,8 @@ suite('#84/#85 profiles: drawer, presets, badges, reorder, guards', async () => 
 	await tick(); await tick();
 	ok('legacy card: active badge', chips().includes('active'), chips());
 	ok('legacy adopt button', btn('Adopt into a profile') != null);
+	ok('legacy words strip keeps the chip-strip class (header/card strips stay tucked)',
+		findByClass(ad.state.bodyNode, 'wg-ad-chips') != null);
 	ok('list panel header', texts().includes('Strategy profiles'));
 	ok('empty state hint', texts().includes('No profiles configured - the legacy strategy words drive the engine.'));
 	ok('New profile button', btn('New profile') != null);
@@ -1314,6 +1318,12 @@ suite('#84/#85 profiles: drawer, presets, badges, reorder, guards', async () => 
 	await tick();
 	ok('drawer opens with the New profile title', texts().includes('New profile'));
 	ok('drawer Cancel button', btn('Cancel') != null);
+	ok('drawer rows use the formrow spacing class (#94: proto + color, not the negative-margin chip strip)',
+		drawerRow('Protocols (UI metadata):') != null &&
+		drawerRow('Protocols (UI metadata):').attrs.class.indexOf('wg-ad-formrow') >= 0 &&
+		drawerRow('Color dot:') != null &&
+		drawerRow('Color dot:').attrs.class.indexOf('wg-ad-formrow') >= 0,
+		[ 'Protocols (UI metadata):', 'Color dot:' ].map((l) => drawerRow(l) && drawerRow(l).attrs.class));
 	click(btn('Create profile'));
 	await tick();
 	ok('name-required error shown', texts().includes('Enter a profile name.'));
@@ -1669,6 +1679,8 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 	};
 	const stagedPolSids = () => ad.policiesModel().sections.map((p) => p.sid);
 	const orderedSids = () => ad.policiesModel().ordered.map((p) => p.sid);
+	const drawerRow = (label) => findAll(ad.state.bodyNode, (n) => n.tag === 'div' &&
+		typeof n.attrs.class === 'string' && flat(n).indexOf(label) === 0)[0] || null;
 
 	ad = loadCore();
 	v = loadView(ad);
@@ -1732,6 +1744,11 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 	await tick();
 	ok('drawer opens with the edit title', texts().includes('Edit policy: Video traffic'), texts());
 	ok('drawer Close button', btn('Close') != null);
+	ok('drawer proto toggles row = wg-ad-formrow spacing (#94: no negative-margin collision with the list select)',
+		drawerRow('Protocols (block filters):') != null &&
+		drawerRow('Protocols (block filters):').attrs.class.indexOf('wg-ad-formrow') >= 0 &&
+		drawerRow('Protocols (block filters):').attrs.class.indexOf('wg-ad-chips') < 0,
+		drawerRow('Protocols (block filters):') && drawerRow('Protocols (block filters):').attrs.class);
 	ok('device-group staged-future badge', texts().includes('stored, ignored by the current render'), texts());
 	ok('two selects without strategy (list + action)', selects().length === 2, selects().length);
 	/* bogus refs: validated BEFORE staging (the issue criterion) */
