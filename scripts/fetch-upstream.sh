@@ -25,10 +25,10 @@ cd "$(dirname "$0")/.."
 # Default pins; override via environment for local experiments only.
 # ZAPRET2_VERSION_DEFAULT is the machine-readable pin: the CI tag guard and
 # the container smoke read it to assert the shipped engine matches.
-ZAPRET2_VERSION_DEFAULT=1.0.6
+ZAPRET2_VERSION_DEFAULT=1.0.7
 ZAPRET2_VERSION="${ZAPRET2_VERSION:-$ZAPRET2_VERSION_DEFAULT}"
-ZAPRET2_TARBALL_SHA256="${ZAPRET2_TARBALL_SHA256:-51bed396f3737ed6358006772cd50fe97a405ec9bb8886426cb004b1dd094ede}"
-NFQWS2_SHA256="${NFQWS2_SHA256:-25049b2bff954c02051e1102a06d34f2f0f946b069d350c9065a86ecd88267c1}"
+ZAPRET2_TARBALL_SHA256="${ZAPRET2_TARBALL_SHA256:-d2799bc8dffc03a21f977d3a0e2d8a8626105db630c03d9b99d5164980d5db16}"
+NFQWS2_SHA256="${NFQWS2_SHA256:-4bb2634f0266bcc3cbe5988f4fc8c5e824649dd11edc418e71a415096c2505b0}"
 URL="https://github.com/bol-van/zapret2/releases/download/v$ZAPRET2_VERSION/zapret2-v$ZAPRET2_VERSION-openwrt-embedded.tar.gz"
 
 if [ -f out/upstream/nfqws2 ]; then
