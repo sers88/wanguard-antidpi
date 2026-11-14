@@ -1,0 +1,185 @@
+name: upstream watch
+
+# Track the pinned upstream engine (issue #100): once a day compare the pin
+# in scripts/fetch-upstream.sh with the latest STABLE bol-van/zapret2 release
+# and open a PR that bumps the pin when upstream moves. The PR carries both
+# sha256 pins - computed from the release openwrt-embedded artifact, with the
+# binary hash cross-checked against the upstream sha256sum.txt - plus a fresh
+# fetch-upstream.sh verification and a full feed.yml matrix dispatched on the
+# bump branch. Releasing stays a human act: review the upstream changelog
+# against our pinned strategy, then tag vX.Y.Z-r1 (the tag guard in feed.yml
+# enforces pin/tag agreement, the matrix gates publication).
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Detect and print the would-be bump, push nothing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: bol-van/zapret2
+
+jobs:
+  watch:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned vs latest upstream version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          pinned=$(grep -m1 '^ZAPRET2_VERSION_DEFAULT=' scripts/fetch-upstream.sh | cut -d= -f2)
+          [ -n "$pinned" ] || { echo "ERROR: cannot read ZAPRET2_VERSION_DEFAULT from scripts/fetch-upstream.sh" >&2; exit 1; }
+          latest=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name' | sed 's/^v//')
+          url=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.html_url')
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$latest" ]; then
+            echo "bump_needed=false" >> "$GITHUB_OUTPUT"
+            echo "== pin is up to date - zapret2 v$pinned"
+          elif [ "$pinned" = "$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | head -n1)" ]; then
+            echo "bump_needed=true" >> "$GITHUB_OUTPUT"
+            echo "== upstream zapret2 v$latest released, pin is v$pinned - bump needed"
+          else
+            echo "ERROR: latest upstream release (v$latest) is LOWER than the pin (v$pinned) - a release was removed or moved. Manual attention required." >&2
+            exit 1
+          fi
+
+      - name: Compute the new pins from the release artifact
+        id: pins
+        if: steps.ver.outputs.bump_needed == 'true'
+        run: |
+          set -eu
+          ver='${{ steps.ver.outputs.latest }}'
+          base="zapret2-v$ver"
+          mkdir -p out/upstream.unpack
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 \
+            -o "out/$base-openwrt-embedded.tar.gz" \
+            "https://github.com/$UPSTREAM_REPO/releases/download/v$ver/$base-openwrt-embedded.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 \
+            -o out/sha256sum.txt \
+            "https://github.com/$UPSTREAM_REPO/releases/download/v$ver/sha256sum.txt"
+          upstream_bin=$(grep 'binaries/linux-x86_64/nfqws2' out/sha256sum.txt | cut -d' ' -f1)
+          [ -n "$upstream_bin" ] || { echo "ERROR: no binaries/linux-x86_64/nfqws2 entry in upstream sha256sum.txt" >&2; exit 1; }
+          tar -xzf "out/$base-openwrt-embedded.tar.gz" -C out/upstream.unpack \
+            "$base/binaries/linux-x86_64/nfqws2" \
+            "$base/lua/zapret-lib.lua.gz" \
+            "$base/lua/zapret-antidpi.lua.gz"
+          bin=$(sha256sum "out/upstream.unpack/$base/binaries/linux-x86_64/nfqws2" | cut -d' ' -f1)
+          [ "$bin" = "$upstream_bin" ] || { echo "ERROR: extracted nfqws2 sha256 $bin does not match the upstream sha256sum.txt entry ($upstream_bin)" >&2; exit 1; }
+          tb=$(sha256sum "out/$base-openwrt-embedded.tar.gz" | cut -d' ' -f1)
+          echo "== tarball sha256 - $tb"
+          echo "== nfqws2 sha256 - $bin (matches upstream sha256sum.txt)"
+          echo "tb=$tb" >> "$GITHUB_OUTPUT"
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Apply the pins to fetch-upstream.sh
+        if: steps.ver.outputs.bump_needed == 'true'
+        env:
+          NEW: ${{ steps.ver.outputs.latest }}
+          TB: ${{ steps.pins.outputs.tb }}
+          BIN: ${{ steps.pins.outputs.bin }}
+        run: |
+          set -eu
+          sed -i "s|^ZAPRET2_VERSION_DEFAULT=.*|ZAPRET2_VERSION_DEFAULT=$NEW|" scripts/fetch-upstream.sh
+          sed -i 's|^ZAPRET2_TARBALL_SHA256=.*|ZAPRET2_TARBALL_SHA256="${ZAPRET2_TARBALL_SHA256:-'"$TB"'}"|' scripts/fetch-upstream.sh
+          sed -i 's|^NFQWS2_SHA256=.*|NFQWS2_SHA256="${NFQWS2_SHA256:-'"$BIN"'}"|' scripts/fetch-upstream.sh
+          git --no-pager diff scripts/fetch-upstream.sh
+
+      - name: Verify - fetch-upstream.sh on the fresh pins (full download path)
+        if: steps.ver.outputs.bump_needed == 'true'
+        run: |
+          sh -n scripts/fetch-upstream.sh
+          rm -rf out
+          sh scripts/fetch-upstream.sh
+
+      - name: Open the bump PR and dispatch the matrix on it
+        if: steps.ver.outputs.bump_needed == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD: ${{ steps.ver.outputs.pinned }}
+          NEW: ${{ steps.ver.outputs.latest }}
+          URL: ${{ steps.ver.outputs.url }}
+          TB: ${{ steps.pins.outputs.tb }}
+          BIN: ${{ steps.pins.outputs.bin }}
+        run: |
+          set -eu
+          branch="upstream/v$NEW"
+
+          cat > body.md <<EOF
+          Automated upstream-watch bump - the daily check found a new stable upstream release.
+
+          | | |
+          |---|---|
+          | zapret2 | v$OLD -> v$NEW |
+          | release | $URL |
+          | tarball sha256 | $TB |
+          | nfqws2 sha256 (linux-x86_64) | $BIN |
+
+          Both pins were computed from the release openwrt-embedded artifact; the
+          binary hash matches the upstream sha256sum.txt entry (cross-checked in
+          the watch job), and scripts/fetch-upstream.sh re-fetched and verified
+          both pins on the full download path. The full CI matrix is dispatched
+          on this branch.
+
+          Checklist before tagging (releasing stays a human act):
+
+          - skim the upstream changelog for engine changes that may interact with
+            our pinned strategy (multisplit/fake argv, packaged lua members)
+          - the matrix run on this branch is green
+          - merge, then tag v$NEW-r1 - the tag guard requires the package major
+            version to equal the pin, and a green matrix publishes the feed
+          EOF
+
+          # Idempotency: one PR per upstream version, ever. A PR for this head
+          # branch in ANY state (open/closed/merged) means the bump was already
+          # surfaced - the owner may have closed it on purpose.
+          pr_state=$(gh pr view "$branch" --json state --jq .state 2>/dev/null || true)
+          if [ -n "$pr_state" ]; then
+            echo "== a PR for $branch already exists (state - $pr_state), nothing to do"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "== branch $branch exists without a PR (a previous run failed mid-way) - recreating the PR only"
+          else
+            git config user.name "wanguard-antidpi-upstream-bot"
+            git config user.email "wanguard-antidpi-upstream-bot@users.noreply.github.com"
+            git checkout -b "$branch"
+            git add scripts/fetch-upstream.sh
+            git commit -q -m "impl(100): upstream watch - pin zapret2 v$NEW" \
+              -m "tarball $TB / nfqws2 $BIN / $URL"
+            git push -q "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/$branch"
+            echo "== pushed $branch"
+          fi
+
+          gh pr create --title "upstream - bump zapret2 v$OLD -> v$NEW" \
+            --body-file body.md --base main --head "$branch"
+
+          # Full-matrix validation on the bump branch (non-tag run validates
+          # only - publication is tag-gated in feed.yml). A fresh ref may take
+          # a moment to propagate, hence the retry.
+          dispatched=0
+          for i in 1 2 3; do
+            if gh workflow run feed.yml --ref "$branch"; then dispatched=1; break; fi
+            sleep 5
+          done
+          [ "$dispatched" -eq 1 ] || { echo "ERROR - failed to dispatch feed.yml on $branch (dispatch it manually)" >&2; exit 1; }
+          echo "== PR opened, matrix dispatched on $branch"

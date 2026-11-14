@@ -93,4 +93,6 @@ When attaching logs, configs or `nft list` output to an issue:
 By contributing you agree that your contributions are licensed under this
 repository's MIT license. Upstream engine artifacts (the nfqws2 binary and
 lua strategies) are never modified by hand - they are pinned byte-for-byte
-in `scripts/fetch-upstream.sh`.
+in `scripts/fetch-upstream.sh`, and pin bumps arrive as automated
+upstream-watch PRs (a scheduled workflow compares the pin with the latest
+upstream release; humans review, merge and tag).
