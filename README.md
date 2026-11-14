@@ -672,6 +672,10 @@ matrix (`smoke-test`, `mark-test`, `nft-test`, `tunnel-test`, `status-test`,
 index, push the `feed` branch; tag pushes only) -> `feed-test` (install from
 the live feed as the final canary; cannot precede publication by definition -
 the matrix already install-tested the same artifact before it was published).
+A separate scheduled workflow (`upstream-watch.yml`) checks the upstream pin
+daily and opens the pin-bump PR when a new stable `zapret2` release appears
+(both hashes computed from the release artifact and cross-checked against the
+upstream `sha256sum.txt`; the full matrix is dispatched on the bump branch).
 
 ### Updating the upstream engine
 
@@ -680,9 +684,15 @@ The pin lives in `scripts/fetch-upstream.sh` as the single source of truth:
 and the canonical `binaries/linux-x86_64/nfqws2` hash from the upstream
 `sha256sum.txt`). Bumping the engine:
 
-1. update the pin (version + both hashes) in `scripts/fetch-upstream.sh`;
-2. `sh scripts/dev-test.sh` - the build fetches the new artifact, verifies
-   both hashes, and the whole matrix must stay green;
+1. the automated way: `upstream-watch.yml` opens the bump PR within a day of
+   the upstream release (pin + both hashes updated, `fetch-upstream.sh`
+   re-verified on the full download path, full matrix dispatched on the bump
+   branch) - review the upstream changelog against the pinned strategy,
+   merge, tag `vX.Y.Z-r1`;
+2. the manual way (the fallback, and exactly what the automation does):
+   update the pin (version + both hashes) in `scripts/fetch-upstream.sh`,
+   then `sh scripts/dev-test.sh` - the build fetches the new artifact,
+   verifies both hashes, and the whole matrix must stay green;
 3. tag `vX.Y.Z` (package `X.Y.Z-r1`) and push - CI runs the same matrix and
    publishes the feed only on green; a tag that disagrees with the pin
    fails the CI version guard.
