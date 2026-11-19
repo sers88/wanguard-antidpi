@@ -155,3 +155,33 @@ config whitelist 'whitelist'
 #	option action 'bypass'
 #	option profile ''
 #	option enabled '1'
+
+# ---- forward sources (spike #95 phase B, issue #102) ----
+# Optional LAN-source groups that bring FORWARD traffic (LAN clients going
+# straight out, bypassing mihomo) into the desync queue. Every enabled
+# section renders its own nft set plus a TCP/UDP 443 rule pair with the same
+# connbytes caps as the mihomo scope (TCP: first 20 packets, UDP: first 5 -
+# the rest of a connection is never touched). The section NAME is the stable
+# id (status surfaces, future device_group refs); `name` is the editable
+# label shown in the LuCI page.
+#
+# The per-group mark (0x01000000..0x0F000000) is assigned automatically by
+# enabled-section order - do not pick marks by hand, the budget holds 15
+# groups (docs/ARCHITECTURE.md).
+#
+# GUARD RAILS (enforced loudly at render time):
+#   - '0.0.0.0/0' is rejected BY DESIGN: a blanket source would desync every
+#     LAN service including the packet-modification-incompatible ones
+#     (banking apps, some games). List explicit CIDR groups only - DHCP
+#     reservations give devices stable addresses.
+#   - duplicate networks across enabled sections are rejected (the first
+#     match would silently win).
+#
+# Until per-group strategies land (device_group, phase D) every source group
+# is desynchronized with the GLOBAL strategy. Apply is a table re-apply: the
+# engine does NOT restart and live connections survive.
+#
+#config source 'lan_main'
+#	option name 'Main LAN'
+#	option enabled '1'
+#	list networks '192.168.1.0/24'

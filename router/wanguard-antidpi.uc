@@ -16,6 +16,8 @@
 //                   exactly what the init shim starts, byte-for-byte)
 //   nft-render      print the rendered nft ruleset (template + UCI engine/
 //                   tunnel options: qnum, fwmark, proxy_servers set elements)
+//                   plus the forward-source scope (config source sections,
+//                   issue #102 - empty render without any)
 //   nft-apply       apply the table (idempotent; DRYRUN-aware)
 //   nft-flush       delete the table (idempotent; DRYRUN-aware)
 //   mark-install    inject routing-mark into the mihomo config (issue #60):
@@ -54,11 +56,12 @@
 //                   --json report); repeated apply without config changes
 //                   = no-op
 //   status [--json]  read-only state surface for the LuCI page (issue #76):
-//                   service/engine/nft/tunnel/whitelist/mihomo/pending/events
-//                   in one call; --json = one JSON document (stable keys),
-//                   default = human key: value lines. Every surface degrades
-//                   explicitly (null/false + a "degraded" reason in JSON) -
-//                   the page renders "unavailable" from the same keys
+//                   service/engine/nft/scope/tunnel/whitelist/mihomo/
+//                   pending/events in one call; --json = one JSON document
+//                   (stable keys), default = human key: value lines. Every
+//                   surface degrades explicitly (null/false + a "degraded"
+//                   reason in JSON) - the page renders "unavailable" from
+//                   the same keys
 //   events [--filter=F] [--tail=N]
 //                    read-only syslog tail for the Tests & Logs tab (#88):
 //                   F = engine|nfqws2|antidpi|mihomo (default engine =
@@ -115,6 +118,15 @@ const CRON_TAG = 'wanguard-antidpi-tunnel-update';
 const HOSTLIST = BASE + '/whitelist.hosts';
 const INIT = '/etc/init.d/wanguard-antidpi';
 const CLI_SELF = '/usr/bin/wanguard-antidpi';
+
+// Forward-source scope (spike #95 phase B, issue #102): every enabled
+// `config source` section pulls an explicit LAN CIDR group into the queue.
+// Group marks are assigned automatically by enabled-section file order in
+// the free nibble 0x01000000..0x0F000000 (15 groups, mark map:
+// docs/ARCHITECTURE.md §5) - mihomo 0x10000000, the engine fwmark and the
+// core policy marks stay clear. There is no user-facing mark knob.
+const SOURCE_MARK_STEP = 0x01000000;
+const SOURCE_MARK_MAX = 15;
 
 function die(msg) {
 	warn('wanguard-antidpi: ' + msg + '\n');
@@ -578,6 +590,109 @@ function merge_proxy_entries(t) {
 	return els;
 }
 
+function load_sources() {
+	// forward-source opt-in sections (issue #102): the section NAME is the
+	// stable id (device_group refs in phase D), `name` is the editable
+	// label. Soft loader - missing sections/options render nothing (the
+	// golden contract); strict validation happens in source_scope() at
+	// render time, so a broken section fails nft-render/apply loudly and
+	// stays invisible to the read-only status (which degrades instead).
+	let out = [];
+	uci.cursor().foreach(CONF, 'source', function(s) {
+		push(out, {
+			id: s['.name'],
+			name: (type(s.name) == 'string' && length(s.name) > 0) ? s.name : s['.name'],
+			networks: (type(s.networks) == 'array') ? s.networks : [],
+			enabled: (s.enabled == null || s.enabled != '0') ? true : false
+		});
+	});
+	return out;
+}
+
+function source_scope() {
+	// the render model for the forward-source scope (issue #102): validate
+	// every enabled section loudly, assign the group marks by enabled file
+	// order, render the per-source nft sets + egress rule pairs. Returns
+	// null when nothing renders (no sections / all disabled / all empty) -
+	// the template tokens render empty and the table stays byte-identical
+	// to the issue #61/#68 golden.
+	//
+	// Guard rails (owner decisions, spike #95 verdict §8): 0.0.0.0/0 is
+	// rejected by design - a blanket source would desync every LAN service
+	// including the packet-modification-incompatible ones; duplicate
+	// networks across enabled sections are rejected (ambiguous first-match);
+	// the group-mark budget caps the enabled count.
+	let srcs = load_sources();
+	let claimed = {};
+	let n = 0;
+	let sets = '';
+	let rules = '';
+	let list = [];
+	for (let i = 0; i < length(srcs); i++) {
+		let sc = srcs[i];
+		if (!sc.enabled)
+			continue;
+		// the section id lands inside the generated nft file (set names) -
+		// strict charset, no escaping (render-injection safety, same rule
+		// as every address that reaches the render)
+		if (match(sc.id, /^[A-Za-z0-9_]+$/) == null)
+			die('source "' + sc.id + '": section name must be [A-Za-z0-9_] (it names the nft set)');
+		if (length(sc.networks) == 0) {
+			warn('wanguard-antidpi: source "' + sc.id + '" is enabled but has no networks - skipped\n');
+			continue;
+		}
+		let els = [];
+		for (let j = 0; j < length(sc.networks); j++) {
+			let e = sc.networks[j];
+			if (!valid_addr_entry(e))
+				die('source "' + sc.id + '": network is not a canonical IPv4/CIDR: "' + e + '"');
+			if (e == '0.0.0.0/0')
+				die('source "' + sc.id + '": 0.0.0.0/0 is rejected by design - a blanket source would desync every LAN service including the packet-modification-incompatible ones (spike #95 owner decision); list explicit CIDR groups');
+			if (claimed[e] != null)
+				die('source "' + sc.id + '": network ' + e + ' is already claimed by source "' + claimed[e] + '" (overlapping scope is ambiguous - the first match would silently win)');
+			claimed[e] = sc.id;
+			push(els, e);
+		}
+		n++;
+		if (n > SOURCE_MARK_MAX)
+			die('more than ' + SOURCE_MARK_MAX + ' enabled source sections (the group-mark nibble 0x01000000..0x0F000000 holds ' + SOURCE_MARK_MAX + ' groups - docs/ARCHITECTURE.md §5)');
+		let elsline = '';
+		for (let j = 0; j < length(els); j++)
+			elsline += ((j > 0) ? ', ' : '') + els[j];
+		let mark = sprintf('0x%08x', n * SOURCE_MARK_STEP);
+		push(list, { id: sc.id, name: sc.name, mark: mark });
+		sets += '\tset src_' + sc.id + ' {\n' +
+			'\t\ttype ipv4_addr\n' +
+			'\t\tflags interval\n' +
+			'\t\telements = { ' + elsline + ' }\n' +
+			'\t}\n';
+		// per-source rule pair AFTER the mihomo rules (a queue verdict is
+		// terminal, so the mihomo scope can never be pre-empted). The group
+		// mark rides on the SAME rule as the queue verdict - the engine's
+		// --filter-mark (device_group, phase D) reads it off the queued
+		// packet copy. Same daddr exclusions and connbytes caps as the
+		// mihomo scope; queue bypass = fail open. The label is NOT rendered
+		// (free text, injection safety) - only the charset-checked id is.
+		for (let k = 0; k < 2; k++) {
+			let proto = (k == 0) ? 'tcp' : 'udp';
+			let cap = (k == 0) ? '1-20' : '1-5';
+			rules += '\t\t# source ' + sc.id + ' (group mark ' + mark +
+				'): LAN-forward ' + proto + ' 443, packets ' + cap + ' (issue #102)\n' +
+				'\t\tip saddr @src_' + sc.id + ' \\\n' +
+				'\t\tmeta mark & @FWMARK@ == 0 \\\n' +
+				'\t\tip daddr != @proxy_servers \\\n' +
+				'\t\tip daddr != @local_v4 \\\n' +
+				'\t\t' + proto + ' dport 443 ct original packets ' + cap + ' \\\n' +
+				'\t\tcounter \\\n' +
+				'\t\tmeta mark set ' + mark + ' \\\n' +
+				'\t\tqueue num @QNUM@ bypass\n';
+		}
+	}
+	if (n == 0)
+		return null;
+	return { list: list, sets: sets, rules: rules };
+}
+
 function cmd_version() {
 	let v = readfile(STAMP);
 	if (v == null)
@@ -709,18 +824,25 @@ function cmd_engine_cmdline() {
 function render_nft() {
 	// substitutions (issue #61): @QNUM@ queue number, @FWMARK@ the desync
 	// anti-loop mark (must equal the engine's --fwmark), @PROXY_ELEMENTS@
-	// the rendered set elements for the tunnel exclusion (#62 fills them)
+	// the rendered set elements for the tunnel exclusion (#62 fills them);
+	// @SOURCE_SETS@/@SOURCE_RULES@ the forward-source scope (issue #102).
+	// The source tokens are substituted FIRST: the rendered source text
+	// carries @FWMARK@/@QNUM@ itself (same engine anti-loop guard, same
+	// queue), so the value substitutions must run after it is in place.
 	let c = load_config();
 	let t = load_tunnel();
 	let tpl = readfile(NFT_TEMPLATE);
 	if (tpl == null)
 		die('nft template missing: ' + NFT_TEMPLATE);
+	let sc = source_scope();
 	let els = merge_proxy_entries(t);
 	// manual join: ucode join() returns null (2026.01.16)
 	let elsline = '';
 	for (let i = 0; i < length(els); i++)
 		elsline += ((i > 0) ? ', ' : '') + els[i];
-	let r = replace(tpl, /@QNUM@/g, c.qnum);
+	let r = replace(tpl, /@SOURCE_SETS@/g, (sc != null) ? sc.sets : '');
+	r = replace(r, /@SOURCE_RULES@/g, (sc != null) ? sc.rules : '');
+	r = replace(r, /@QNUM@/g, c.qnum);
 	r = replace(r, /@FWMARK@/g, c.fwmark);
 	r = replace(r, /@PROXY_ELEMENTS@/g, (length(els) > 0) ? '\t\telements = { ' + elsline + ' }\n' : '');
 	return r;
@@ -1917,6 +2039,87 @@ function status_nft_counters() {
 	};
 }
 
+function status_scope_info() {
+	// the forward-source scope surface (issue #102). Degradation contract:
+	// this is a READ-ONLY status - a broken source config must not die the
+	// status call (validation errors fire on the render paths: nft-render,
+	// apply preflight). Marks mirror the source_scope() assignment without
+	// the validation; counters attribute from one nft -j walk by the
+	// rendered set reference (src_<sid>). Sources rendered before a config
+	// edit simply find no matching rules -> counters stay null.
+	let srcs = load_sources();
+	if (length(srcs) == 0)
+		return { enabled: false, sources: [] };
+	let n = 0;
+	let out = [];
+	for (let i = 0; i < length(srcs); i++) {
+		let sc = srcs[i];
+		let mark = null;
+		if (sc.enabled && length(sc.networks) > 0) {
+			if (n < SOURCE_MARK_MAX) {
+				n++;
+				mark = sprintf('0x%08x', n * SOURCE_MARK_STEP);
+			}
+			// over budget: mark stays null - the render fails loudly on
+			// every apply, status keeps listing the section
+		}
+		push(out, {
+			id: sc.id,
+			name: sc.name,
+			enabled: sc.enabled,
+			networks: sc.networks,
+			mark: mark,
+			counters: { tcp: null, udp: null }
+		});
+	}
+	if (system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') != 0)
+		return { enabled: true, sources: out };
+	let fp = popen('nft -j list table inet ' + TABLE + ' 2>/dev/null', 'r');
+	let raw = (fp != null) ? fp.read('all') : '';
+	if (fp != null)
+		fp.close();
+	let doc = json(raw);
+	if (doc == null || type(doc.nftables) != 'array')
+		return { enabled: true, sources: out };
+	for (let i = 0; i < length(doc.nftables); i++) {
+		let r = doc.nftables[i].rule;
+		if (r == null || type(r.expr) != 'array')
+			continue;
+		let setname = null;
+		let proto = null;
+		let cnt = null;
+		let has_queue = false;
+		for (let j = 0; j < length(r.expr); j++) {
+			let e = r.expr[j];
+			// NB: every set reference arrives as the STRING "@<name>" (the
+			// daddr exclusions @proxy_servers/@local_v4 included) - only a
+			// @src_ reference attributes this rule to a source group
+			if (type(e.match) == 'object' && type(e.match.right) == 'string' &&
+			    substr(e.match.right, 0, 5) == '@src_')
+				setname = substr(e.match.right, 5);
+			// the dport payload arrives NESTED in the match expression
+			// (match.left.payload), not as a top-level expr element
+			if (type(e.match) == 'object' && type(e.match.left) == 'object' &&
+			    type(e.match.left.payload) == 'object' &&
+			    e.match.left.payload.field == 'dport')
+				proto = e.match.left.payload.protocol;
+			if (type(e.counter) == 'object')
+				cnt = e.counter;
+			if (type(e.queue) == 'object')
+				has_queue = true;
+		}
+		if (!has_queue || setname == null || proto == null || cnt == null)
+			continue;
+		for (let j = 0; j < length(out); j++) {
+			if (out[j].mark == null)
+				continue;
+			if (out[j].id == setname)
+				out[j].counters[proto] = { packets: int(cnt.packets), bytes: int(cnt.bytes) };
+		}
+	}
+	return { enabled: true, sources: out };
+}
+
 function status_tunnel_info() {
 	let t = load_tunnel();
 	let st = load_state();
@@ -2112,6 +2315,7 @@ function cmd_status() {
 	let nftc = status_nft_counters();
 	if (nftc == null)
 		degraded.nft = 'table absent';
+	let scope = status_scope_info();
 	let t = status_tunnel_info();
 	let w = status_whitelist_info();
 	let m = status_mihomo_info();
@@ -2142,6 +2346,7 @@ function cmd_status() {
 			running_argv: en.running_argv
 		},
 		nft: { table_present: (nftc != null), counters: nftc },
+		scope: scope,
 		tunnel: t,
 		whitelist: w,
 		mihomo: m,
@@ -2169,6 +2374,27 @@ function cmd_status() {
 	print('nft: ' + (s.nft.table_present ?
 		('table present (tcp ' + s.nft.counters.tcp.packets + ' pkts / udp ' + s.nft.counters.udp.packets + ' pkts)') :
 		'table absent') + '\n');
+	// scope line (issue #102): mihomo DIRECT is the always-on scope; source
+	// sections add LAN-forward groups with their auto mark and live counters
+	let scopeparts = [];
+	let scopeactive = 0;
+	for (let i = 0; i < length(scope.sources); i++) {
+		let g = scope.sources[i];
+		if (g.mark == null)
+			continue;
+		scopeactive++;
+		let tpk = (g.counters != null && g.counters.tcp != null) ? g.counters.tcp.packets : '?';
+		let upk = (g.counters != null && g.counters.udp != null) ? g.counters.udp.packets : '?';
+		let part = g.id + '=' + g.mark + ' (tcp ' + tpk + ' / udp ' + upk + ' pkts)';
+		push(scopeparts, part);
+	}
+	let scopeline = 'mihomo DIRECT';
+	if (scopeactive > 0) {
+		scopeline += ' + ' + scopeactive + ' source(s): ';
+		for (let i = 0; i < length(scopeparts); i++)
+			scopeline += ((i > 0) ? ', ' : '') + scopeparts[i];
+	}
+	print('scope: ' + scopeline + '\n');
 	print('tunnel: ' + length(s.tunnel.entries) + ' entries (hosts ' + length(s.tunnel.hosts) +
 		', cron ' + (s.tunnel.cron.ok ? 'ok' : 'missing') + ')\n');
 	print('whitelist: ' + s.whitelist.mode + ' (' + length(s.whitelist.domains) + ' domains, file ' +
@@ -2322,13 +2548,26 @@ function apply_check_run(want_json) {
 		checks.config = { ok: true, detail: null };
 	}
 
-	// nft: table in force AND the template still renders
+	// nft: table in force AND the template still renders (a broken
+	// forward-source config fails nft-render too - its reason is captured
+	// for the check detail, same pattern as the config check above)
 	let table_live = (system('nft list table inet ' + TABLE + ' >/dev/null 2>&1') == 0);
 	let nft_rc = system(CLI_SELF + ' nft-render >/dev/null 2>&1');
+	let nft_detail = null;
+	if (!table_live)
+		nft_detail = 'table absent';
+	else if (nft_rc != 0) {
+		let nfp = popen(CLI_SELF + ' nft-render 2>&1 >/dev/null', 'r');
+		nft_detail = trim((nfp != null) ? nfp.read('all') : '');
+		if (nfp != null)
+			nfp.close();
+		if (length(nft_detail) == 0)
+			nft_detail = 'nft-render failed';
+	}
 	checks.nft = {
 		ok: (table_live && nft_rc == 0),
 		present: table_live,
-		detail: (!table_live) ? 'table absent' : ((nft_rc != 0) ? 'nft-render failed' : null)
+		detail: nft_detail
 	};
 	if (!checks.nft.ok)
 		ok = false;
@@ -2431,9 +2670,13 @@ function cmd_apply() {
 
 	// preflight render: every validation die() in the config path fires
 	// HERE, before any mutation (validation failure -> exit 1, nothing
-	// touched)
+	// touched). engine_argv() covers the engine/whitelist/policy paths,
+	// render_nft() the nft side - including the forward-source scope
+	// validation (issue #102: blanket/duplicate/malformed sources must fail
+	// before mark-ensure touches anything).
 	let c = load_config();
 	engine_argv();
+	render_nft();
 
 	if (dryrun()) {
 		let cur = access(HOSTLIST, 'r') ? readfile(HOSTLIST) : null;
@@ -2443,6 +2686,9 @@ function cmd_apply() {
 		print('DRYRUN: would ensure the routing-mark integration\n');
 		print('DRYRUN: would update the tunnel exclusion set (' + length(load_tunnel().tunnel_hosts) + ' host(s) configured)\n');
 		print('DRYRUN: would apply nft table inet ' + TABLE + '\n');
+		let dsc = source_scope();
+		if (dsc != null)
+			print('DRYRUN: would render ' + length(dsc.list) + ' forward-source group(s) into the nft table\n');
 		print('DRYRUN: would ' + ((wouldbe == null) ? ('remove ' + HOSTLIST + ' (blanket mode)') : ('render ' + HOSTLIST)) + '\n');
 		let dpol = policy_render();
 		if (dpol != null && length(dpol.lists) > 0)

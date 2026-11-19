@@ -506,6 +506,42 @@ name/device-group edits are metadata-only, and domain-list content edits
 apply via reload (SIGHUP). Referenced domain lists cannot be deleted from
 the Domain lists tab until the policies referencing them are unlinked.
 
+## LAN forward sources (issue #102)
+
+By default the desync scope is exactly mihomo's own egress (the
+`routing-mark` contract). Named `config source` sections in
+`/etc/config/wanguard-antidpi` opt explicit LAN CIDR groups INTO the queue:
+their forward traffic gets the same treatment as the mihomo scope (TCP 443
+first 20 packets, UDP 443 first 5 - the rest of a connection is never
+touched), with the same tunnel/local exclusions.
+
+    config source 'lan_main'
+        option name 'Main LAN'
+        option enabled '1'
+        list networks '192.168.1.0/24'
+
+Rules of the road:
+
+- **Explicit groups only.** `0.0.0.0/0` is rejected at render time BY
+  DESIGN: a blanket source desyncs every LAN service including the
+  packet-modification-incompatible ones (banking apps, some games). DHCP
+  reservations give devices stable addresses; duplicate networks across
+  enabled sections are rejected too (ambiguous first-match).
+- **Auto marks.** Each enabled section gets a group mark in the free nibble
+  `0x01000000..0x0F000000` by section order (15 groups; mark map in
+  docs/ARCHITECTURE.md). The mark rides on the same rule that issues the
+  queue verdict - it is the future enforcement point for per-group
+  strategies (device_group phase D), not a user knob.
+- **Apply is a table re-apply.** The engine argv does not depend on sources
+  (until phase D), so a scope edit never restarts the engine and live
+  connections survive. `wanguard-antidpi apply` validates the whole render
+  BEFORE touching anything (a bad source exits 1 without mutations).
+- **Observability.** `wanguard-antidpi status --json` carries a `scope`
+  key: every section with its networks, auto mark and live per-source nft
+  counters. The LuCI page surfaces the same data (Sources tab).
+- **Engine strategies are per-profile, not per-source** until device_group
+  lands: every group is desynchronized with the global strategy.
+
 ## Operations
 
 - **status / diagnostics**: `wanguard-antidpi mark-status` (mihomo

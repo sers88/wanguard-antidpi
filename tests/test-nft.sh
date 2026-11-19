@@ -52,9 +52,22 @@ tcp_packets() {
 }
 
 udp_packets() {
+	# the SECOND queue rule (mihomo udp) - NOT the last one: forward-source
+	# sections (issue #102) append their own rule pairs behind the mihomo
+	# rules, so tail -1 would read a source counter
 	nft list chain inet $TABLE egress 2>/dev/null \
 		| sed -n 's/.*counter packets \([0-9]*\) bytes [0-9]* queue.*/\1/p' \
-		| tail -n 1
+		| sed -n '2p'
+}
+
+source_packets() {
+	# the FIRST source rule counter (rule 3 with one source section). The
+	# pattern is RELAXED vs tcp_packets: a source rule carries the group
+	# mark (`meta mark set 0x...`) BETWEEN the counter and the queue
+	# statement, so the strict `bytes N queue` adjacency never matches
+	nft list chain inet $TABLE egress 2>/dev/null \
+		| sed -n 's/.*counter packets \([0-9]*\) bytes [0-9]*.*/\1/p' \
+		| sed -n '3p'
 }
 
 proxied_code() {
@@ -241,5 +254,60 @@ nft list table inet $TABLE >/dev/null 2>&1 && fail "table survived flush"
 "$CLI" nft-flush >/dev/null  # idempotent: second flush must not error
 "$CLI" nft-apply >/dev/null  # and apply must come back cleanly
 nft list table inet $TABLE >/dev/null || fail "re-apply after flush failed"
+
+# ---- [7] forward-source scope (issue #102, spike #95 phase B) ----
+# The egress chain (postrouting) sees locally generated packets too (spike
+# #95 P2a evidence), so listing THIS container's own address as a source
+# network turns the unmarked direct fetch into a scoped packet: its counter
+# must tick while the mihomo counters stay flat (a queue verdict is
+# terminal - the mihomo rules run first, and mihomo is stopped anyway).
+echo "== [7] forward-source scope"
+kill "$M_PID" 2>/dev/null
+M_PID=
+i=0
+while [ $i -lt 15 ]; do
+	kill -0 "$M_PID" 2>/dev/null || break
+	i=$((i + 1))
+	sleep 1
+done
+SRC_IP=$(ip -4 addr show dev eth0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/[0-9]* .*/\1/p' | head -n 1)
+[ -n "$SRC_IP" ] || fail "cannot resolve the container address for the source probe"
+# negative first: a source CIDR that does NOT cover the container address
+uci set wanguard-antidpi.lan_p=source
+uci set wanguard-antidpi.lan_p.enabled='1'
+uci add_list wanguard-antidpi.lan_p.networks='198.51.100.0/24'
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+nft list set inet $TABLE src_lan_p >/dev/null || fail "source set not rendered"
+s0=$(source_packets)
+code=$(direct_code)
+[ "$code" = "200" ] || fail "direct fetch failed in the out-of-scope probe: $code"
+sleep 1
+[ "$(source_packets)" = "$s0" ] || fail "an out-of-scope direct fetch ticked the source counter"
+# positive: the container address itself is the source
+uci del_list wanguard-antidpi.lan_p.networks='198.51.100.0/24'
+uci add_list wanguard-antidpi.lan_p.networks="${SRC_IP}/32"
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+b1=$(tcp_packets)
+s1=$(source_packets)
+code=$(direct_code)
+[ "$code" = "200" ] || fail "direct fetch failed with the engine down (source scope bypass broken): $code"
+sleep 1
+s2=$(source_packets)
+[ "$s2" -gt "$s1" ] || fail "scoped direct fetch did not tick the source counter ($s1 -> $s2)"
+[ "$(tcp_packets)" = "$b1" ] || fail "scoped direct fetch leaked into the mihomo tcp counter"
+# re-apply idempotency WITH sources rendered
+nft -s list table inet $TABLE > /tmp/nft-src-before.txt
+"$CLI" nft-apply >/dev/null
+nft -s list table inet $TABLE > /tmp/nft-src-after.txt
+cmp -s /tmp/nft-src-before.txt /tmp/nft-src-after.txt || fail "re-apply with sources changed the ruleset (duplicate rules?)"
+# cleanup: golden table restored
+uci delete wanguard-antidpi.lan_p
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+[ "$(nft list chain inet $TABLE egress | grep -c 'queue flags bypass to 300')" = "2" ] \
+	|| fail "source cleanup did not restore the golden table"
+echo "SOURCE-SCOPE-OK (in-scope direct traffic ticks the source counter, out-of-scope stays flat, mihomo counters flat, golden restored)"
 
 echo "NFT-TEST-OK ($MIHOMO_VERSION)"

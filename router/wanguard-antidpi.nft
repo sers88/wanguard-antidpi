@@ -3,17 +3,30 @@
 #
 # Applied by `wanguard-antidpi nft-apply` (declare+delete+define = idempotent
 # re-apply; verified against nftables 1.1.6 / OpenWrt 25.12). nft-render
-# substitutes three tokens from /etc/config/wanguard-antidpi: the queue
+# substitutes five tokens from /etc/config/wanguard-antidpi: the queue
 # number (engine.qnum), the desync fwmark (engine.fwmark - must match the
-# engine's --fwmark), and the proxy_servers set elements (tunnel.proxy_servers
-# UCI list; an empty list renders an empty set). NB: the @lowercase words
-# below are nft SET references, not placeholders - do not substitute them.
+# engine's --fwmark), the proxy_servers set elements (tunnel.proxy_servers
+# UCI list; an empty list renders an empty set), the forward-source sets
+# and rules (config source sections, issue #102 - both tokens render EMPTY
+# without source sections, keeping the default table byte-identical to the
+# issue #61/#68 golden). NB: the @lowercase words below are nft SET
+# references, not placeholders - do not substitute them.
 #
 # Scope: ONLY mihomo's own egress enters the queue (the routing-mark contract,
 # issue #60). LAN-direct and router-local traffic carry no mark and never
 # match; the 0x10000000 mask filters out the wanguard policy marks
 # (0x64..0x258) exactly. The table is namespaced: it never touches `inet fw4`
 # or `inet wanguard`.
+#
+# Forward-source opt-in (issue #102, spike #95 phase B): every enabled
+# `config source` section adds its own set + a tcp/udp rule pair AFTER the
+# mihomo rules (a queue verdict is terminal - first match wins, so the
+# mihomo scope can never be pre-empted). The rules stamp a per-group mark
+# (nibble 0x01000000..0x0F000000, auto-assigned by enabled order) on the
+# SAME rule that issues the queue verdict, so the engine can later
+# discriminate groups via --filter-mark (device_group, phase D). The mark is
+# set in postrouting - after the routing decision - and nothing downstream
+# of this chain consumes it except the queued packet copy itself.
 #
 # - output priority -401 (predefrag): nfqws-generated packets (the fwmark)
 #   are untracked BEFORE conntrack. Without this, a fake that hits a conntrack
@@ -56,7 +69,7 @@ table inet wanguard_antidpi {
 		type ipv4_addr
 		flags interval
 @PROXY_ELEMENTS@	}
-	chain predefrag {
+@SOURCE_SETS@	chain predefrag {
 		type filter hook output priority -401; policy accept;
 		meta mark & @FWMARK@ != 0 notrack
 	}
@@ -80,5 +93,5 @@ table inet wanguard_antidpi {
 		udp dport 443 ct original packets 1-5 \
 		counter \
 		queue num @QNUM@ bypass
-	}
+@SOURCE_RULES@	}
 }

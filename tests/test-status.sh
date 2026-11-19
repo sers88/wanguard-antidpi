@@ -81,6 +81,8 @@ jp_str 's.engine.version' | grep -q . || fail "engine.version empty (binary ship
 [ "$(jp 's.engine.running_argv')" = "null" ] || fail "expected running_argv null"
 [ "$(jp 's.nft.table_present')" = "false" ] || fail "expected table absent"
 [ "$(jp 's.nft.counters')" = "null" ] || fail "expected counters null"
+[ "$(jp 's.scope.enabled')" = "false" ] || fail "expected scope disabled without source sections"
+[ "$(jp 'length(s.scope.sources)')" = "0" ] || fail "expected an empty scope.sources list"
 [ "$(jp 'length(s.tunnel.entries)')" = "0" ] || fail "expected no tunnel entries"
 [ "$(jp 'length(s.tunnel.hosts)')" = "0" ] || fail "expected no tunnel hosts"
 [ "$(jp 's.tunnel.cron.ok')" = "false" ] || fail "expected cron absent"
@@ -219,6 +221,42 @@ grab
 	|| fail "deleting the section must restore the legacy strategy"
 echo "STATUS-PROFILES-OK (sections listed; profiles replace the legacy opt; delete reverts)"
 
+# ---- [5c] forward-source scope surface (issue #102) ----
+echo "== [5c] source sections in the status document"
+uci set wanguard-antidpi.lan_s=source
+uci set wanguard-antidpi.lan_s.name='Scope test'
+uci set wanguard-antidpi.lan_s.enabled='1'
+uci add_list wanguard-antidpi.lan_s.networks='198.51.100.0/24'
+uci set wanguard-antidpi.lan_d=source
+uci set wanguard-antidpi.lan_d.enabled='0'
+uci add_list wanguard-antidpi.lan_d.networks='203.0.113.0/24'
+uci commit wanguard-antidpi
+grab
+[ "$(jp 's.scope.enabled')" = "true" ] || fail "expected scope.enabled with source sections"
+[ "$(jp 'length(s.scope.sources)')" = "2" ] || fail "expected both source sections listed (incl. the disabled one)"
+[ "$(jp_str 's.scope.sources[0].id')" = "lan_s" ] || fail "scope sources keep section file order"
+[ "$(jp_str 's.scope.sources[0].name')" = "Scope test" ] || fail "scope label"
+[ "$(jp_str 's.scope.sources[0].mark')" = "0x01000000" ] || fail "expected the auto group mark for the enabled section"
+[ "$(jp 's.scope.sources[0].counters.tcp')" = "null" ] || fail "expected null counters while the table is absent"
+[ "$(jp 's.scope.sources[1].enabled')" = "false" ] || fail "the disabled section must be listed"
+[ "$(jp 's.scope.sources[1].mark')" = "null" ] || fail "a disabled section must not carry a mark"
+# degradation contract: a BROKEN source config must not kill the status
+# (the render paths fail loudly instead)
+uci add_list wanguard-antidpi.lan_s.networks='0.0.0.0/0'
+uci commit wanguard-antidpi
+grab
+[ "$(jp 'length(s.scope.sources)')" = "2" ] || fail "a broken source config must not kill the status call"
+if "$CLI" nft-render >/dev/null 2>/tmp/scope.err; then
+	fail "nft-render must reject a blanket source"
+fi
+grep -q 'rejected by design' /tmp/scope.err || fail "the blanket guard message lost"
+# cleanup
+uci del_list wanguard-antidpi.lan_s.networks='0.0.0.0/0'
+uci delete wanguard-antidpi.lan_s
+uci delete wanguard-antidpi.lan_d
+uci commit wanguard-antidpi
+echo "SCOPE-OK (sources listed with auto marks, no-table degradation, status never dies)"
+
 # ---- [6] live table ----
 echo "== [6] live nft table"
 LIVE=1
@@ -242,6 +280,25 @@ grab
 [ "$(jp 's.nft.counters.udp.bytes')" = "0" ] || fail "expected a udp counter object"
 [ "$(jp 'length(keys(s.degraded))')" != "0" ] || fail "degraded must still mention mihomo (config absent)"
 echo "NFT-OK (live table + counter objects)"
+# issue #102: with a source section rendered, the scope counters become live
+# objects attributed by the rendered set reference (0 = rules found, unread)
+uci set wanguard-antidpi.lan_s=source
+uci set wanguard-antidpi.lan_s.enabled='1'
+uci add_list wanguard-antidpi.lan_s.networks='198.51.100.0/24'
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+grab
+[ "$(jp_str 's.scope.sources[0].mark')" = "0x01000000" ] || fail "expected the auto mark on the live scope"
+[ "$(jp 's.scope.sources[0].counters.tcp.packets')" = "0" ] \
+	|| fail "expected a live tcp counter object attributed via src_lan_s (got $(jp 's.scope.sources[0].counters.tcp'))"
+[ "$(jp 's.scope.sources[0].counters.udp.bytes')" = "0" ] \
+	|| fail "expected a live udp counter object attributed via src_lan_s"
+uci delete wanguard-antidpi.lan_s
+uci commit wanguard-antidpi
+"$CLI" nft-apply >/dev/null
+grab
+[ "$(jp 's.scope.enabled')" = "false" ] || fail "scope must drop out of the status after cleanup"
+echo "SCOPE-LIVE-OK (auto mark + live counter objects via the set reference)"
 
 # ---- [7] engine-cmdline byte-parity over the refactored builder ----
 echo "== [7] engine-cmdline parity"

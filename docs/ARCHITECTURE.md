@@ -341,6 +341,48 @@ on a 2-policy argv, and the send inventory (tcpdump against a local sink)
 proves the bypass path passes the ClientHello unmodified while the
 catch-all splits it.
 
+## 3.6 forward-source scope (#102, spike #95 phase B)
+
+Named `config source` sections opt explicit LAN CIDR groups into the queue:
+their FORWARD traffic (LAN clients going straight out) gets the mihomo
+scope treatment. Evidence base: the spike-95 docker probes (`spike-scope/`
+in the private tracker clone) proved per-source postrouting rules tick the
+queue, forward == local-output inventories byte-for-byte, connbytes caps
+hold, and a table re-apply never drops live connections.
+
+- render: one `src_<sid>` interval set + a tcp/udp rule pair per enabled
+  section, AFTER the mihomo rules (a queue verdict is terminal - first
+  match wins, so the mihomo scope can never be pre-empted). Same daddr
+  exclusions (`proxy_servers`, `local_v4`) and connbytes caps (tcp 1-20 /
+  udp 1-5) as rule #0. Queue `bypass` = fail open.
+- group marks: auto-assigned `0x01000000..0x0F000000` by enabled-section
+  order (15 groups; no user-facing mark knob), stamped by `meta mark set`
+  on the SAME rule that issues the queue verdict - postrouting, i.e. after
+  the routing decision, consumed by nothing except the queued packet copy.
+  That mark is the enforcement point for per-group strategies (device_group
+  via `--filter-mark`, phase D / issue #104).
+- guard rails (owner decisions, spike #95 verdict §8): `0.0.0.0/0` rejected
+  at render time (blanket desync breaks packet-modification-incompatible
+  services); cross-section duplicate networks rejected (ambiguous
+  first-match); malformed entries rejected like every render-bound address;
+  the mark budget caps enabled sections at 15. All dies are named.
+- engine argv is source-free until phase D: a scope edit is a table
+  re-apply only - the engine never restarts, live connections survive.
+  `apply` validates the full render (sources included) in the preflight,
+  before any mutation.
+- status: the `scope` key lists every section (id/name/enabled/networks/
+  mark) with live per-source counters attributed from `nft -j` by the set
+  reference. Read-only: a broken source config never kills the status -
+  the render paths fail loudly instead (degradation contract, #76).
+
+Verification contract: `tests/container-smoke.sh` (render shape, marks,
+caps, order-vs-mihomo, guards, determinism, golden restore),
+`tests/test-nft.sh` [7] (live: an in-scope source ticks its counter on
+direct traffic, out-of-scope stays flat, mihomo counters flat, re-apply
+idempotent with sources rendered), `tests/test-status.sh` [5c]/[6]
+(surface + live counter objects + no-die degradation),
+`tests/test-apply.sh` [5f] (table-only apply, preflight rejection).
+
 ## 4. Scope discipline
 
 The add-on owns the lifecycle of its own table and engine; it never edits
@@ -357,6 +399,7 @@ above):
 |---|---|---|
 | fwmark `0x10000000` | wanguard-antidpi | the scope mark - mihomo `routing-mark`; installed/removed idempotently (3.1) |
 | fwmark `0x40000000` | wanguard-antidpi | nfqws2 strategy mark (`engine.fwmark`) |
+| fwmark nibble `0x01000000..0x0F000000` | wanguard-antidpi | forward-source group marks (#102, 3.6): auto-assigned by enabled `config source` order, stamped in postrouting on the queued packet |
 | fwmark `0x20000000` | unassigned | reserved for blockcheck2 staging runs: its hardwired `DESYNC_MARK=0x10000000` MUST be patched to a free bit before running (README Tuning) |
 | NFQUEUE `300` | wanguard-antidpi | owns (`engine.qnum`) |
 | nft table `inet wanguard_antidpi` | wanguard-antidpi | own namespaced table, postrouting @ 101 |
@@ -540,10 +583,15 @@ profile and win first-match over every policy).
 ### 7.5 device_group is staged-future
 
 `policy.device_group` round-trips through the UI (badged "staged
-future") but is ignored by the render: the NFQUEUE path carries no
-client identity, so per-device desync targeting has no enforcement
-point. Nothing in the pipeline depends on it, and per-device desync
-should not be expected until the queue path learns client identity.
+future") but is ignored by the render. The enforcement point now EXISTS
+(#102, 3.6): source-scoped packets carry a per-group mark stamped by the
+queue rule, and the engine can discriminate profiles via
+`--filter-mark=mark[/mask]` (spike-95 probe P4). Wiring `device_group` to
+that mark is the phase D contract (issue #104): the policy render gains
+the filter word (engine restart, honestly badged), validation like the
+other refs. Until then nothing in the pipeline depends on the field, and
+per-source desync strategies should not be expected from the current
+render.
 
 Verification contract: `tests/luci/run-tests.js` - the real view + core
 evaluated in node with stubbed LuCI globals (`view` / `poll` / `rpc` /
