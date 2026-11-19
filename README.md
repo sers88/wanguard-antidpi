@@ -146,7 +146,7 @@ back.
 ## LuCI web interface (issues #75-#88)
 
 The feed ships `luci-app-wanguard-antidpi`, a single page under
-**Network -> WAN Guard -> Anti-DPI** with six sub-tabs:
+**Network -> WAN Guard -> Anti-DPI** with seven sub-tabs:
 
 | Tab | What it manages |
 |---|---|
@@ -154,6 +154,7 @@ The feed ships `luci-app-wanguard-antidpi`, a single page under
 | Profiles | named strategy profiles (desync words, one engine `--new` block each), order/color metadata, generic presets |
 | Policies | ordered match -> action rules: a domain list + protocols route to a strategy profile, pass unmodified, or nothing (first match wins) |
 | Domain lists | the SNI lists policies match on, and the desync mode (blanket / whitelist) |
+| Sources | the forward-source scope (issue #102): LAN CIDR groups opt their forward traffic into the queue, read-only auto group marks, live per-source counters |
 | Tunnel protection | the exclusion set - static pins, updater hosts, refresh/expiry intervals: what the nft table and the engine never desynchronize |
 | Tests & Logs | queue counters with a per-tick delta, `apply --check` validation, the engine verbose-logging toggle, a filtered syslog tail |
 
@@ -163,11 +164,13 @@ fetch) run strictly on demand behind their buttons. Editors stage changes
 client-side - nothing reaches the router until you apply. The pending
 bar's **Review & Apply** commits the staged UCI and then runs the
 idempotent `apply` orchestration, whose engine step restarts the service
-only when the engine argv actually drifts: domain-list content edits
-apply via SIGHUP without dropping live connections, strategy/profile/
-policy structure edits restart the engine. The badges say so up front:
+only when the engine argv actually drifts: domain-list content edits and
+source-scope edits (#103 - a scope edit never touches the engine argv)
+apply without dropping live connections, strategy/profile/policy
+structure edits restart the engine. The badges say so up front:
 "apply restarts the engine", "metadata only", "applies via reload -
-live connections stay up".
+live connections stay up", and on the Sources tab "applies as a table
+re-render - the engine is NOT restarted, live connections stay up".
 
 A missing or pre-`status` CLI (old package, denied ACL) renders an
 "unavailable - update the package" section with muted chips instead of

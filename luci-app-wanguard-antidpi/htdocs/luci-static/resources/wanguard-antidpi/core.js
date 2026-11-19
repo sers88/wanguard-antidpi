@@ -77,6 +77,18 @@ var state = {
 		inputs: {},       /* per-list add-domain input text (survives re-renders) */
 		newName: ''       /* new-list label input text */
 	},
+	sources: {          /* Sources tab (#103): client-side staged editor over
+	                       the #102 forward-source sections; the application
+	                       badge is STATIC (a scope edit is a table re-apply
+	                       only - the engine argv stays source-free), so no
+	                       orig* badge-detect state is needed */
+		loaded: false,    /* the uci config has been read at least once */
+		dirty: false,     /* staged edits awaiting the apply pipeline */
+		deleteArm: null,  /* sid armed for the two-step source delete */
+		errors: {},       /* inline validation errors, per-source (and '__new') */
+		inputs: {},       /* per-source add-network input text */
+		newName: ''       /* new-source label input text */
+	},
 	tunnel: {           /* Tunnel protection tab (#83): client-side staged editor */
 		loaded: false,    /* the uci config has been read at least once */
 		dirty: false,     /* staged edits awaiting the apply pipeline */
@@ -126,7 +138,7 @@ var state = {
  * real since #88 (#81 overview, #82 domain lists, #83 tunnel protection,
  * #84/#85 profiles, #86/#87 policies, #88 tests & logs) - the placeholder
  * branch below stays as the honest fallback for future tabs */
-var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'tunnel', 'tests' ];
+var TABS = [ 'overview', 'profiles', 'policies', 'domains', 'sources', 'tunnel', 'tests' ];
 
 function tabLabel(id) {
 	switch (id) {
@@ -134,6 +146,7 @@ function tabLabel(id) {
 		case 'profiles': return _('Profiles');
 		case 'policies': return _('Policies');
 		case 'domains':  return _('Domain lists');
+		case 'sources':  return _('Sources');
 		case 'tunnel':   return _('Tunnel protection');
 		case 'tests':    return _('Tests & Logs');
 	}
@@ -345,12 +358,30 @@ function processingChip() {
 }
 
 /* Scope mihomo DIRECT: the routing-mark integration state (#60) — the queue
- * only sees mihomo DIRECT egress when the mark is installed */
+ * only sees mihomo DIRECT egress when the mark is installed. Forward-source
+ * groups (#102/#103) extend the label honestly: only sources the status
+ * document carries a group mark for (committed, enabled, non-empty render)
+ * are counted - staged tab edits never pretend to be live scope. */
 function scopeChip() {
 	var m = state.status.mihomo;
-	if (m.state == 'installed')
-		return { cls: 'wg-ad-chip-ok', label: _('Scope mihomo DIRECT'),
-			title: (m.mark != null) ? 'routing-mark ' + m.mark : '' };
+	var sc = state.status.scope;
+	var active = 0, names = [];
+	if (sc != null && Array.isArray(sc.sources))
+		sc.sources.forEach(function(g) {
+			if (g != null && g.mark != null && g.enabled) {
+				active++;
+				names.push(g.id + '=' + g.mark);
+			}
+		});
+	var title = (m.mark != null) ? 'routing-mark ' + m.mark : '';
+	if (active > 0)
+		title += ((title.length) ? '; ' : '') + names.join(', ');
+	if (m.state == 'installed') {
+		var label = _('Scope mihomo DIRECT');
+		if (active > 0)
+			label += ' + %d source(s)'.format(active);
+		return { cls: 'wg-ad-chip-ok', label: label, title: title };
+	}
 	if (m.state == 'conflict')
 		return { cls: 'wg-ad-chip-warn', label: _('Mark conflict'),
 			title: (m.mark != null) ? 'routing-mark ' + m.mark : '' };
@@ -743,6 +774,7 @@ function discardPending() {
 		uci.unload('wanguard-antidpi');
 		state.configChanged = true;
 		domainsAfterConfigChange();
+		sourcesAfterConfigChange();
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
 		policiesAfterConfigChange();
@@ -777,6 +809,7 @@ function reviewApply() {
 		ui.changes.init();
 		state.configChanged = true;
 		domainsAfterConfigChange();
+		sourcesAfterConfigChange();
 		tunnelAfterConfigChange();
 		profilesAfterConfigChange();
 		policiesAfterConfigChange();
@@ -828,6 +861,29 @@ function applySeverity(res) {
 	return 'info';
 }
 
+/* the concept's standing notice (#103): the scope line stays honest when
+ * forward-source groups are rendered (the #102 status scope) - staged tab
+ * edits never pretend to be live scope (only status marks count) */
+function scopeActiveCount() {
+	var sc = state.status.scope;
+	var n = 0;
+	if (sc != null && Array.isArray(sc.sources))
+		sc.sources.forEach(function(g) {
+			if (g != null && g.mark != null && g.enabled)
+				n++;
+		});
+	return n;
+}
+
+function scopeNotice() {
+	var n = (state.status != null) ? scopeActiveCount() : 0;
+	return E('div', { 'class': 'alert-message' }, [
+		E('p', {}, [ (n > 0)
+			? _('Desync scope: mihomo DIRECT + %d LAN source group(s). Proxy tunnel and local destinations remain excluded.').format(n)
+			: _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
+	]);
+}
+
 /* ---------- overview assembly (#81) ---------- */
 
 function renderOverview() {
@@ -840,10 +896,8 @@ function renderOverview() {
 		return frag;
 	}
 
-	/* the concept's standing notice */
-	frag.appendChild(E('div', { 'class': 'alert-message' }, [
-		E('p', {}, [ _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
-	]));
+	/* the standing scope notice (shared with the Policies tab) */
+	frag.appendChild(scopeNotice());
 
 	var p = state.status.pending;
 	if (p != null && p.count != null && p.count > 0)
@@ -1235,6 +1289,375 @@ function renderDomains() {
 		state.bodyNode.appendChild(buildDomainsView());
 	}).catch(function(e) {
 		if (state.activeTab != 'domains' || !state.bodyNode)
+			return;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
+			E('p', {}, [ _('The configuration could not be read (%s).').format((e && e.message) || 'error') ])
+		]));
+	});
+}
+
+/* ---------- sources tab (#103, forward-source scope #102) ---------- */
+
+/* the tab's view model: every `config source` section (the LuCI uci client
+ * merges committed values, router-staged deltas and the client's own staged
+ * edits) plus the COMMITTED truth from the status document (#102 scope key):
+ * the group marks are auto-assigned by the CLI render, so a staged section
+ * shows "after apply" instead of pretending to have a mark. `enabled`
+ * mirrors the CLI's soft default (missing option = enabled). */
+function sourcesModel() {
+	var statusScope = (state.status != null) ? state.status.scope : null;
+	var marks = {}, counters = {};
+	if (statusScope != null && Array.isArray(statusScope.sources))
+		statusScope.sources.forEach(function(g) {
+			if (g != null && g.mark != null) {
+				marks[g.id] = g.mark;
+				counters[g.id] = g.counters;
+			}
+		});
+	var lists = (uci.sections('wanguard-antidpi', 'source') || []).map(function(s) {
+		return {
+			sid: s['.name'],
+			label: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name'],
+			networks: (Array.isArray(s.networks) ? s.networks : []).slice(),
+			enabled: !(s.enabled === '0'),
+			mark: marks[s['.name']] || null,
+			counters: counters[s['.name']] || null
+		};
+	});
+	return { lists: lists };
+}
+
+/* how many sections RENDER today (enabled + non-empty networks): the CLI's
+ * group-mark nibble holds 15 - the 16th rendered section dies at apply */
+function sourcesRenderedCount(model) {
+	return model.lists.filter(function(l) {
+		return l.enabled && l.networks.length > 0;
+	}).length;
+}
+
+/* the blanket guard text - kept in one place so the add/create paths and the
+ * tests quote the same named message (the #102 CLI mirror) */
+function sourcesBlanketError() {
+	return _('0.0.0.0/0 is rejected by design - a blanket source would desync every LAN service including the packet-modification-incompatible ones. List explicit CIDR groups only.');
+}
+
+/* 'lan_main'-style stable section id derived from the label (the #82/#85
+ * design contract: the id names the nft set `src_<sid>` in the #102 render,
+ * the label is editable). The CLI accepts [A-Za-z0-9_] only - everything
+ * else is stripped here, never escaped. */
+function sourcesSlug(label) {
+	var base = label.toLowerCase().replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '').slice(0, 48);
+	if (base.length == 0)
+		base = 'source';
+	var sid = base, n = 2;
+	while (uci.get('wanguard-antidpi', sid) != null) {
+		sid = base + '_' + n;
+		n++;
+	}
+	return sid;
+}
+
+function sourcesMarkDirty() {
+	state.sources.dirty = true;
+}
+
+function sourcesAddNetwork(sid) {
+	var m = sourcesModel();
+	var l = m.lists.filter(function(x) { return x.sid == sid; })[0] || null;
+	if (l == null)
+		return;
+	var e = (state.sources.inputs[sid] || '').trim();
+	var err = null;
+	if (e.length == 0)
+		err = _('Enter a network (a.b.c.d or a.b.c.d/nn).');
+	else if (!validAddrEntry(e))
+		err = _('Not a canonical IPv4 address or CIDR (no leading zeros, mask 0-32).');
+	else if (e == '0.0.0.0/0')
+		err = sourcesBlanketError();
+	else if (l.networks.indexOf(e) >= 0)
+		err = _('"%s" is already in this group.'.format(e));
+	else {
+		/* the CLI mirror: a network claimed by another RENDERED section
+		 * (enabled + non-empty) is an ambiguous first-match - rejected here
+		 * with the claiming group named, never staged */
+		var claim = null;
+		m.lists.forEach(function(x) {
+			if (x.sid != sid && x.enabled && x.networks.indexOf(e) >= 0)
+				claim = x.sid;
+		});
+		if (claim != null)
+			err = _('Network %s is already claimed by source "%s" (overlapping scope is ambiguous).').format(e, claim);
+	}
+	if (err != null) {
+		state.sources.errors[sid] = err;
+		renderSources();
+		return;
+	}
+	delete state.sources.errors[sid];
+	var next = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(uci.get('wanguard-antidpi', sid, 'networks'));
+	next.push(e);
+	uci.set('wanguard-antidpi', sid, 'networks', next);
+	state.sources.inputs[sid] = '';
+	sourcesMarkDirty();
+	renderSources();
+}
+
+function sourcesRemoveNetwork(sid, idx) {
+	var next = (function(v) { return (Array.isArray(v) ? v : []).slice(); })(uci.get('wanguard-antidpi', sid, 'networks'));
+	if (idx < 0 || idx >= next.length)
+		return;
+	next.splice(idx, 1);
+	uci.set('wanguard-antidpi', sid, 'networks', next);
+	delete state.sources.errors[sid];
+	sourcesMarkDirty();
+	renderSources();
+}
+
+function sourcesSetEnabled(sid, on) {
+	var m = sourcesModel();
+	/* the budget guard (the #102 CLI mirror): the 16th rendered source
+	 * section fails the apply - block it here with the named reason */
+	if (on && sourcesRenderedCount(m) >= 15) {
+		var l0 = m.lists.filter(function(x) { return x.sid == sid; })[0];
+		var empty = (l0 != null && l0.networks.length == 0);
+		if (!empty) {
+			state.sources.errors[sid] = _('The group-mark budget holds 15 rendered source groups - disable or merge one first.');
+			renderSources();
+			return;
+		}
+	}
+	uci.set('wanguard-antidpi', sid, 'enabled', on ? '1' : '0');
+	delete state.sources.errors[sid];
+	sourcesMarkDirty();
+	renderSources();
+}
+
+function sourcesCreate() {
+	var label = (state.sources.newName || '').trim();
+	if (label.length == 0) {
+		state.sources.errors['__new'] = _('Enter a source group name.');
+		renderSources();
+		return;
+	}
+	delete state.sources.errors['__new'];
+	var sid = sourcesSlug(label);
+	uci.add('wanguard-antidpi', 'source', sid);
+	uci.set('wanguard-antidpi', sid, 'name', label);
+	uci.set('wanguard-antidpi', sid, 'enabled', '1');
+	uci.set('wanguard-antidpi', sid, 'networks', []);
+	state.sources.newName = '';
+	sourcesMarkDirty();
+	renderSources();
+}
+
+function sourcesDelete(sid) {
+	/* two-step armed delete (the #82 pattern). No ref guard is needed yet:
+	 * device_group refs (phase D) do not exist in the render - a future
+	 * policy referencing this section must unlink first, same as the
+	 * domain-list guard. */
+	if (state.sources.deleteArm != sid) {
+		state.sources.deleteArm = sid;
+		renderSources();
+		return;
+	}
+	uci.remove('wanguard-antidpi', sid);
+	state.sources.deleteArm = null;
+	sourcesMarkDirty();
+	renderSources();
+}
+
+/* drop the client-side staged edits without touching the router (the
+ * pending bar's Discard covers the router-side deltas); unload+load is the
+ * uci client's reset for one config */
+function sourcesDiscardEdits() {
+	state.sources.dirty = false;
+	state.sources.deleteArm = null;
+	state.sources.errors = {};
+	state.sources.inputs = {};
+	state.sources.newName = '';
+	uci.unload('wanguard-antidpi');
+	renderSources();
+}
+
+/* after the shared apply pipeline committed (or the router deltas were
+ * reverted), the editor starts clean from the committed truth */
+function sourcesAfterConfigChange() {
+	state.sources.dirty = false;
+	state.sources.deleteArm = null;
+	state.sources.errors = {};
+	state.sources.inputs = {};
+	state.sources.newName = '';
+	if (state.activeTab == 'sources')
+		renderSources();
+}
+
+function sourcesPanel(model, l) {
+	var panel = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ l.label, ' ',
+			chipEl((l.enabled)
+				? { cls: 'wg-ad-chip-ok', label: _('Enabled'),
+					title: _('The group renders into the nft table and its forward traffic enters the queue') }
+				: { cls: 'wg-ad-chip-muted', label: _('Disabled'),
+					title: _('The section is listed but renders nothing') }),
+			' ',
+			/* the group mark is auto-assigned by the #102 render - shown
+			 * read-only from the committed status; a staged section honestly
+			 * says "after apply" instead of inventing a mark */
+			chipEl((l.mark != null)
+				? { cls: 'wg-ad-chip-muted', label: _('Group mark %s').format(l.mark),
+					title: _('Auto-assigned by enabled order (no user knob); stamped on the queue rule for future per-group strategies') }
+				: { cls: 'wg-ad-chip-muted', label: _('Mark after apply'),
+					title: _('Auto-assigned by enabled order when this section renders') }),
+			' ',
+			chipEl({ cls: 'wg-ad-chip-muted', label: '%d network(s)'.format(l.networks.length) })
+		])
+	]);
+	var c = l.counters;
+	var ctext = (c != null && c.tcp != null && c.udp != null)
+		? '%d tcp / %d udp packet(s)'.format(c.tcp.packets, c.udp.packets)
+		: _('—');
+	panel.appendChild(kvRow(_('Queue counters'), [
+		ctext, ' ',
+		(c != null && c.tcp != null) ? E('span', { 'class': 'wg-ad-hint' },
+			[ _('(live from the nft table)') ]) : E([]) ]));
+
+	if (l.networks.length == 0)
+		panel.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('No networks - this group is skipped by the render until you add at least one.') ]));
+	l.networks.forEach(function(nw, idx) {
+		panel.appendChild(E('div', { 'class': 'wg-ad-domrow' }, [
+			E('span', {}, [ nw ]),
+			E('button', {
+				'class': 'wg-ad-domremove',
+				'title': _('Remove from group'),
+				'click': ui.createHandlerFn(null, function() { sourcesRemoveNetwork(l.sid, idx); })
+			}, [ '✕' ])
+		]));
+	});
+
+	var err = state.sources.errors[l.sid];
+	if (err != null)
+		panel.appendChild(E('div', { 'class': 'wg-ad-error' }, [ err ]));
+	var input = E('input', {
+		'type': 'text',
+		'placeholder': _('192.168.1.0/24'),
+		'input': function(ev) { state.sources.inputs[l.sid] = ev.target.value; }
+	});
+	input.value = state.sources.inputs[l.sid] || '';
+	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		input,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { sourcesAddNetwork(l.sid); })
+		}, [ _('Add network') ])
+	]));
+
+	panel.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, function() { sourcesSetEnabled(l.sid, !l.enabled); })
+		}, [ l.enabled ? _('Disable') : _('Enable') ]),
+		E('button', {
+			'class': 'btn cbi-button' + (state.sources.deleteArm == l.sid ? ' cbi-button-negative' : ''),
+			'click': ui.createHandlerFn(null, function() { sourcesDelete(l.sid); })
+		}, [ (state.sources.deleteArm == l.sid) ? _('Confirm delete') : _('Delete group') ])
+	]));
+	return panel;
+}
+
+function buildSourcesView() {
+	var m = sourcesModel();
+	var frag = E([]);
+
+	/* the honest application badge (#103): a scope edit never touches the
+	 * engine argv (the #102 contract until device_group/phase D) */
+	var badgeCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('How sources apply') ])
+	]);
+	badgeCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+		label: _('Applies as a table re-render - the engine is NOT restarted, live connections stay up'),
+		title: _('A scope edit never changes the engine command line; apply re-applies the nft table only (verified to survive mid-transfer traffic)') }));
+	badgeCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('Each enabled group is desynchronized with the GLOBAL strategy until per-group strategies arrive (device group phase). The group mark is auto-assigned by enabled order - up to 15 groups.') ]));
+	badgeCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+		_('0.0.0.0/0 is rejected by design: a blanket source would desync every LAN service including the packet-modification-incompatible ones (banking apps, some games). Use DHCP reservations for stable addresses.') ]));
+	frag.appendChild(badgeCard);
+
+	/* the sections */
+	m.lists.forEach(function(l) {
+		frag.appendChild(sourcesPanel(m, l));
+	});
+	if (m.lists.length == 0)
+		frag.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
+			_('No source groups - the desync scope is exactly mihomo DIRECT traffic.') ]));
+
+	/* new group */
+	var newCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('New source group') ])
+	]);
+	if (state.sources.errors['__new'] != null)
+		newCard.appendChild(E('div', { 'class': 'wg-ad-error' }, [ state.sources.errors['__new'] ]));
+	var nameInput = E('input', {
+		'type': 'text',
+		'placeholder': _('Group name (e.g. Main LAN)'),
+		'input': function(ev) { state.sources.newName = ev.target.value; }
+	});
+	nameInput.value = state.sources.newName || '';
+	newCard.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
+		nameInput,
+		E('button', {
+			'class': 'btn cbi-button',
+			'click': ui.createHandlerFn(null, sourcesCreate)
+		}, [ _('Create group') ])
+	]));
+	frag.appendChild(newCard);
+
+	/* apply block: the shared pipeline + the static honest badge */
+	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
+		E('h3', {}, [ _('Apply') ])
+	]);
+	if (state.sources.dirty)
+		applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
+			label: _('Applies as a table re-render - the engine is NOT restarted, live connections stay up') }));
+	else
+		applyCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('No unsaved edits.') ]));
+	applyCard.appendChild(E('div', { 'class': 'wg-ad-actions' }, [
+		E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(null, reviewApply),
+			'disabled': (!state.sources.dirty || state.applyBusy) ? '' : null
+		}, [ _('Apply changes') ]),
+		E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'click': ui.createHandlerFn(null, sourcesDiscardEdits),
+			'disabled': (!state.sources.dirty) ? '' : null
+		}, [ _('Discard edits') ])
+	]));
+	frag.appendChild(applyCard);
+
+	return frag;
+}
+
+/* the tab body renders once per switch (and after applies) - NOT per poll
+ * tick: a rebuild would blow away in-progress edits. The LuCI uci client is
+ * read through a lazy load; a failure renders the honest warn card. */
+function renderSources() {
+	var node = state.bodyNode;
+	if (!node)
+		return;
+	node.setAttribute('data-unavail', 'false');
+	node.innerHTML = '';
+	node.appendChild(E('p', { 'class': 'wg-ad-hint' }, [ _('Loading configuration…') ]));
+	uci.load('wanguard-antidpi').then(function() {
+		if (state.activeTab != 'sources' || !state.bodyNode)
+			return;
+		state.sources.loaded = true;
+		state.bodyNode.innerHTML = '';
+		state.bodyNode.appendChild(buildSourcesView());
+	}).catch(function(e) {
+		if (state.activeTab != 'sources' || !state.bodyNode)
 			return;
 		state.bodyNode.innerHTML = '';
 		state.bodyNode.appendChild(E('div', { 'class': 'alert-message warning' }, [
@@ -3141,10 +3564,8 @@ function buildPoliciesView() {
 	var m = policiesModel();
 	var frag = E([]);
 
-	/* the concept's standing notice */
-	frag.appendChild(E('div', { 'class': 'alert-message' }, [
-		E('p', {}, [ _('Only mihomo DIRECT traffic is eligible. Proxy tunnel and local destinations remain excluded.') ])
-	]));
+	/* the standing scope notice (shared with the Overview tab) */
+	frag.appendChild(scopeNotice());
 
 	/* the processing table (concept: Priority / Match / Strategy / State /
 	 * «…»): drag-priority with the up/down fallback in the row menu */
@@ -3691,6 +4112,10 @@ function renderBody() {
 		renderDomains();
 		return;
 	}
+	if (state.activeTab == 'sources') {
+		renderSources();
+		return;
+	}
 	if (state.activeTab == 'tunnel') {
 		renderTunnel();
 		return;
@@ -3764,6 +4189,17 @@ return L.Class.extend({
 	domainsAddDomain: domainsAddDomain,
 	domainsSetMode: domainsSetMode,
 	domainsAfterConfigChange: domainsAfterConfigChange,
+	scopeActiveCount: scopeActiveCount,
+	scopeNotice: scopeNotice,
+	sourcesModel: sourcesModel,
+	sourcesRenderedCount: sourcesRenderedCount,
+	sourcesSlug: sourcesSlug,
+	renderSources: renderSources,
+	buildSourcesView: buildSourcesView,
+	sourcesAddNetwork: sourcesAddNetwork,
+	sourcesSetEnabled: sourcesSetEnabled,
+	sourcesCreate: sourcesCreate,
+	sourcesAfterConfigChange: sourcesAfterConfigChange,
 	validAddrEntry: validAddrEntry,
 	tunnelModel: tunnelModel,
 	renderTunnel: renderTunnel,

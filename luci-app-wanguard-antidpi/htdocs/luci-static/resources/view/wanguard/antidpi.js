@@ -7,8 +7,9 @@
  * Scaffold shape (issue #80): header with the two placeholder actions
  * (Service settings / + New profile — disabled until their own stages),
  * the chips row fed by ONE `wanguard-antidpi status --json` exec (#76) and
- * the six sub-tab frames (Overview / Profiles / Policies / Domain lists /
- * Tunnel protection / Tests & Logs — content per tab lands with #81–#88).
+ * the seven sub-tab frames (Overview / Profiles / Policies / Domain lists /
+ * Sources / Tunnel protection / Tests & Logs — content per tab lands with
+ * #81–#88 and #103).
  * A missing or pre-status CLI renders the "unavailable — update the
  * package" section and muted chips instead of throwing. All logic lives
  * in the shared wanguard-antidpi.core module (the luci-app-wanguard
