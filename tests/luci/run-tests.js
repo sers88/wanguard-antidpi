@@ -453,6 +453,7 @@ const STATUS = (o) => JSON.stringify(Object.assign({
 		file: { exists: true, mtime: 1 } },
 	mihomo: { state: 'installed', mark: '0x10000000', install_on_start: true, backup: true,
 		running: true, api: '0.0.0.0:9090', config: '/etc/mihomo/config.yaml', config_missing: false },
+	scope: { enabled: false, sources: [] },
 	pending: { count: 0, sections: [] },
 	events: [ 'line1' ],
 	degraded: {}
@@ -1021,6 +1022,252 @@ suite('#82 domains: validation, staging lifecycle, mode flip, guards', async () 
 	await ad.refresh(); ad.update();
 	ok('poll tick leaves the domains DOM untouched', ad.state.bodyNode.firstChild === beforeTick);
 	ok('staged edits survive the tick', texts().includes('wip.example') && ad.state.domains.dirty === true);
+});
+
+/* ==================== #103: Sources tab (forward-source scope) ==================== */
+
+suite('#103 sources: scope chip, honest notice, validation, staging lifecycle, table-only badge', async () => {
+	SERVER = freshServer();
+	UCI = makeUci(SERVER);
+	/* one committed rendered group (the #102 seed contract) */
+	SERVER.committed['wanguard-antidpi'].lan_main = { '.type': 'source', name: 'Main LAN',
+		enabled: '1', networks: [ '192.168.1.0/24' ] };
+
+	/* the status doc mirrors the COMMITTED truth (the CLI scope surface):
+	 * lan_main is enabled with networks -> mark 0x01000000 + live counters */
+	const statusWith = (scopeSources) => JSON.stringify(Object.assign(JSON.parse(STATUS({})), {
+		scope: { enabled: scopeSources.length > 0, sources: scopeSources }
+	}));
+	const lanMark = (id, mark) => ({ id: id, name: id, enabled: true,
+		networks: [ '192.168.1.0/24' ], mark: mark,
+		counters: { tcp: { packets: 0, bytes: 0 }, udp: { packets: 0, bytes: 0 } } });
+
+	RPC.routes['file.exec'] = (cmd, args) => {
+		if (args[0] === 'status')
+			return Promise.resolve({ code: 0, stdout: statusWith([ lanMark('lan_main', '0x01000000') ]), stderr: '' });
+		if (args[0] === 'engine-cmdline')
+			return Promise.resolve({ code: 0, stdout: '/usr/bin/nfqws2\n--filter-tcp=443\n', stderr: '' });
+		if (args[0] === 'apply') return Promise.resolve({ code: 0, stdout: APPLY_OK_STEPS, stderr: '' });
+		return Promise.resolve({ code: 2, stdout: '', stderr: 'unexpected: ' + args.join(' ') });
+	};
+
+	ad = loadCore();
+	v = loadView(ad);
+	await v.load();
+	v.render();
+	await ad.refresh(); ad.update();
+
+	/* -- A. scope chip + the honest overview notice -- */
+	ok('chip: scope counts the rendered source group', hchips().some((c) =>
+		c.includes('Scope mihomo DIRECT + 1 source(s)')), hchips());
+	ok('overview notice names the source group count', texts().includes(
+		'Desync scope: mihomo DIRECT + 1 LAN source group(s)'), texts());
+
+	/* -- B. the tab renders from UCI + the committed status marks -- */
+	ad.switchTab('sources');
+	await tick(); await tick();
+	ok('tab bar carries the Sources entry', findAll(ad.state.tabsNode,
+		(n) => n.tag === 'button' && flat(n) === 'Sources').length === 1);
+	ok('seven tabs total', ad.state.tabsNode.children.length === 7, ad.state.tabsNode.children.length);
+	ok('panel: label from option name', texts().includes('Main LAN'));
+	ok('panel: network row', texts().includes('192.168.1.0/24'));
+	ok('panel: read-only auto mark from the status', texts().includes('Group mark 0x01000000'));
+	ok('panel: live counters row', texts().includes('0 tcp / 0 udp packet(s)'), texts());
+	ok('honest badge: table re-render, engine NOT restarted',
+		texts().includes('Applies as a table re-render - the engine is NOT restarted, live connections stay up'));
+	ok('honest badge: global-strategy hint (device group phase)',
+		texts().includes('desynchronized with the GLOBAL strategy'));
+	ok('honest badge: blanket guard hint', texts().includes('0.0.0.0/0 is rejected by design'));
+	ok('apply block: no unsaved edits hint', texts().includes('No unsaved edits.'));
+	ok('apply button disabled when clean', btn('Apply changes') != null &&
+		btn('Apply changes').attrs.disabled === '');
+
+	/* -- C. inline validation: invalid input never stages -- */
+	const netInputs = () => findAll(ad.state.bodyNode,
+		(n) => n.tag === 'input' && n.attrs.placeholder === '192.168.1.0/24');
+	const stagedEmpty = () => Object.keys(SERVER.staged).length === 0 &&
+		SERVER.committed['wanguard-antidpi'].lan_main.networks.length === 1;
+	const addNet = (text) => { type(netInputs()[0], text); click(btn('Add network')); return tick(); };
+
+	await addNet('300.1.2.3/24');
+	ok('bad octet rejected inline', texts().includes('Not a canonical IPv4 address or CIDR'), texts());
+	ok('bad octet not staged', stagedEmpty());
+	await addNet('192.168.1.001/24');
+	ok('leading zeros rejected (the render canonicality mirror)', texts().includes('Not a canonical IPv4 address or CIDR'));
+	await addNet('192.168.1.0/33');
+	ok('bad mask rejected', texts().includes('Not a canonical IPv4 address or CIDR'));
+	await addNet('0.0.0.0/0');
+	ok('blanket source rejected with the named message', texts().includes(
+		'0.0.0.0/0 is rejected by design - a blanket source would desync every LAN service'), texts());
+	ok('blanket not staged', stagedEmpty());
+	await addNet('192.168.1.0/24');
+	ok('in-group duplicate rejected', texts().includes('is already in this group'));
+
+	/* -- D. create a second group, cross-claim guard -- */
+	type(inputByPh('Group name (e.g. Main LAN)'), 'Second LAN');
+	click(btn('Create group'));
+	await tick();
+	ok('new group panel appears (client-staged)', texts().includes('Second LAN'));
+	ok('new group: mark honestly deferred', texts().includes('Mark after apply'));
+	ok('client staged only (server store untouched)', Object.keys(SERVER.staged).length === 0);
+	type(netInputs()[1], '192.168.1.0/24');
+	click(btnN('Add network', 1));
+	await tick();
+	ok('cross-section duplicate rejected with the claiming group named',
+		texts().includes('already claimed by source "lan_main"'), texts());
+
+	/* -- E. valid add stages client-side -- */
+	type(netInputs()[1], '10.0.0.5/32');
+	click(btnN('Add network', 1));
+	await tick();
+	ok('valid /32 staged: row appears in the second panel', texts().includes('10.0.0.5/32'));
+	ok('dirty: apply enabled + badge', btn('Apply changes') != null &&
+		btn('Apply changes').attrs.disabled == null &&
+		texts().includes('Applies as a table re-render - the engine is NOT restarted, live connections stay up'));
+	ok('single IP input cleared after add', (netInputs()[1] || {}).value === '');
+
+	/* -- F. shared apply pipeline commits (two staged sections at once) -- */
+	UI._notes.length = 0;
+	click(btn('Apply changes'));
+	await tick(); await tick(); await tick();
+	ok('uci.apply committed', SERVER.applies === 1, SERVER.applies);
+	ok('notification: configuration applied', UI._notes.some((n) => n[0] === 'info' &&
+		n[1].includes('Configuration applied')));
+	const committed = SERVER.committed['wanguard-antidpi'];
+	ok('second group committed with its network', committed.second_lan != null &&
+		(committed.second_lan.networks || []).includes('10.0.0.5/32'), committed.second_lan);
+	ok('second group type + enabled committed', committed.second_lan['.type'] === 'source' &&
+		committed.second_lan.enabled === '1');
+	ok('editor reset after apply', texts().includes('No unsaved edits.'));
+
+	/* -- G. enable/disable staging (client-side) -- */
+	click(btnN('Disable', 0));
+	await tick();
+	ok('disable stages client-side (chip flips)', texts().includes('Disabled') &&
+		Object.keys(SERVER.staged).length === 0);
+	ok('enable button present for the disabled group', btnN('Enable', 0) != null);
+	click(btnN('Enable', 0));
+	await tick();
+	ok('re-enable stages back', texts().includes('Enabled'));
+
+	/* -- H. fresh staged edit + discard restores the committed truth -- */
+	type(netInputs()[0], '172.16.0.0/24');
+	click(btn('Add network'));
+	await tick();
+	ok('fresh edit staged (dirty)', texts().includes('172.16.0.0/24') && ad.state.sources.dirty === true);
+	click(btn('Discard edits'));
+	await tick(); await tick();
+	ok('discard: staged add gone', !texts().includes('172.16.0.0/24'));
+	ok('discard: no unsaved edits', texts().includes('No unsaved edits.') && ad.state.sources.dirty === false);
+
+	/* -- I. delete: two-step armed, committed through the shared pipeline -- */
+	click(btnN('Delete group', 1));
+	await tick();
+	ok('delete arms to Confirm delete', btnN('Confirm delete', 0) != null);
+	click(btnN('Confirm delete', 0));
+	await tick();
+	ok('confirm: panel gone client-side, delete staged', !texts().includes('Second LAN') &&
+		ad.state.sources.dirty === true);
+	UI._notes.length = 0;
+	click(btn('Apply changes'));
+	await tick(); await tick(); await tick();
+	ok('delete committed through the shared pipeline', SERVER.committed['wanguard-antidpi'].second_lan == null);
+
+	/* -- J. poll tick never rebuilds the sources tab -- */
+	type(netInputs()[0], '192.168.5.0/24');
+	const beforeTick = ad.state.bodyNode.firstChild;
+	await ad.refresh(); ad.update();
+	ok('poll tick leaves the sources DOM untouched', ad.state.bodyNode.firstChild === beforeTick);
+	ok('typed text survives the tick (not yet staged)', (netInputs()[0] || {}).value === '192.168.5.0/24');
+
+	/* -- K. scope-less status keeps the classic chip + notice -- */
+	RPC.routes['file.exec'] = (cmd, args) => {
+		if (args[0] === 'status')
+			return Promise.resolve({ code: 0, stdout: statusWith([]), stderr: '' });
+		return Promise.resolve({ code: 2, stdout: '', stderr: 'unexpected' });
+	};
+	ad.switchTab('overview');
+	await ad.refresh(); ad.update();
+	ok('chip: plain scope without rendered groups', hchips().some((c) =>
+		c.trim() === 'Scope mihomo DIRECT'), hchips());
+	ok('overview notice back to the mihomo-only line', texts().includes(
+		'Only mihomo DIRECT traffic is eligible'), texts());
+
+	/* -- L. uci load failure = honest warn card -- */
+	SERVER = freshServer();
+	UCI = makeUci(SERVER);
+	SERVER.failLoad = 'permission denied';
+	ad = loadCore();
+	v = loadView(ad);
+	await v.load();
+	v.render();
+	ad.switchTab('sources');
+	await tick(); await tick();
+	ok('uci load failure renders the warn card', texts().includes('The configuration could not be read'));
+});
+
+suite('#103 sources: budget guard on the 16th rendered group', async () => {
+	SERVER = freshServer();
+	UCI = makeUci(SERVER);
+	/* 15 rendered groups (the #102 mark nibble is full) + one disabled */
+	for (let i = 0; i < 15; i++)
+		SERVER.committed['wanguard-antidpi']['pad' + i] = { '.type': 'source', name: 'Pad ' + i,
+			enabled: '1', networks: [ '10.' + i + '.0.0/24' ] };
+	SERVER.committed['wanguard-antidpi'].lan_off = { '.type': 'source', name: 'Off group',
+		enabled: '0', networks: [ '10.99.0.0/24' ] };
+
+	RPC.routes['file.exec'] = (cmd, args) => {
+		if (args[0] === 'status') {
+			const sources = [];
+			for (let i = 0; i < 15; i++)
+				sources.push({ id: 'pad' + i, name: 'Pad ' + i, enabled: true,
+					networks: [ '10.' + i + '.0.0/24' ], mark: '0x' + ((i + 1) * 0x01000000).toString(16).padStart(8, '0'),
+					counters: { tcp: null, udp: null } });
+			return Promise.resolve({ code: 0,
+				stdout: JSON.stringify(Object.assign(JSON.parse(STATUS({})), {
+					scope: { enabled: true, sources: sources } })), stderr: '' });
+		}
+		if (args[0] === 'engine-cmdline')
+			return Promise.resolve({ code: 0, stdout: '/usr/bin/nfqws2\n--filter-tcp=443\n', stderr: '' });
+		return Promise.resolve({ code: 2, stdout: '', stderr: 'unexpected' });
+	};
+
+	ad = loadCore();
+	v = loadView(ad);
+	await v.load();
+	v.render();
+	await ad.refresh(); ad.update();
+	ad.switchTab('sources');
+	await tick(); await tick();
+
+	ok('all 15 rendered groups listed with their marks', texts().includes('Group mark 0x0f000000'), texts());
+	/* enabling the 16th rendered group must be blocked inline, not staged */
+	const offBtn = findAll(ad.state.bodyNode, (n) => n.tag === 'button' && flat(n) === 'Enable')[0];
+	click(offBtn);
+	await tick();
+	ok('budget guard: the 16th group refused with the named reason',
+		texts().includes('The group-mark budget holds 15 rendered source groups'), texts());
+	ok('budget guard: nothing staged', Object.keys(SERVER.staged).length === 0 &&
+		SERVER.committed['wanguard-antidpi'].lan_off.enabled === '0');
+	/* an EMPTY enabled group does not render - it may pass the guard */
+	const empty = { '.type': 'source', name: 'Empty group', enabled: '0', networks: [] };
+	SERVER.committed['wanguard-antidpi'].lan_empty = empty;
+	UCI.unload('wanguard-antidpi');
+	ad.switchTab('overview');
+	ad.switchTab('sources');
+	await tick(); await tick();
+	const emptyBtn = findAll(ad.state.bodyNode, (n) => n.tag === 'button' && flat(n) === 'Enable').pop();
+	click(emptyBtn);
+	await tick();
+	ok('empty group may be enabled (no budget error on ITS panel, mark not spent)',
+		ad.state.sources.errors.lan_empty == null &&
+		texts().includes('The group-mark budget holds 15 rendered source groups'));
+	ok('empty-group enable staged client-side only (router store untouched)',
+		Object.keys(SERVER.staged).length === 0 &&
+		UCI.state.changes['wanguard-antidpi'] != null &&
+		UCI.state.changes['wanguard-antidpi'].lan_empty != null &&
+		UCI.state.changes['wanguard-antidpi'].lan_empty.enabled === '1');
+	ok('dirty flag set by the empty-group enable', ad.state.sources.dirty === true);
 });
 
 /* ==================== #83: Tunnel protection ==================== */

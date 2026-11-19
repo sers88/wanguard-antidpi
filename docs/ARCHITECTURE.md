@@ -438,12 +438,18 @@ release gate".
 One LuCI view (`view/wanguard/antidpi.js`) over one shared core module
 (`wanguard-antidpi/core.js`; the luci-app-wanguard pattern: the module
 factory yields a CLASS, the loader instantiates it, and the instance is a
-stateless facade over a module-closure `state`). The page has six
-sub-tabs - Overview / Profiles / Policies / Domain lists / Tunnel
-protection / Tests & Logs. The browser never touches nft, logread or the
-engine process: every router fact comes from the CLI surfaces, and the
-core's only innerHTML payloads are static strings from its own tables
-(CLI-derived fields ride `E()` text nodes).
+stateless facade over a module-closure `state`). The page has seven
+sub-tabs - Overview / Profiles / Policies / Domain lists / Sources /
+Tunnel protection / Tests & Logs. The browser never touches nft, logread
+or the engine process: every router fact comes from the CLI surfaces, and
+the core's only innerHTML payloads are static strings from its own tables
+(CLI-derived fields ride `E()` text nodes). The Sources tab (#103) is the
+staged editor over the forward-source scope (3.6): per-group panels with
+read-only auto marks from the status document, the same strict
+IPv4/CIDR validation as the tunnel pins (the valid_addr_entry mirror),
+the blanket-LAN guard quoted verbatim from the #102 CLI die, and the
+static honest badge - a scope edit applies as a table re-render only,
+the engine is never restarted.
 
 ### 7.1 Package surface and the menu merge contract (#78/#79)
 

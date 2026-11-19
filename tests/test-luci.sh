@@ -22,8 +22,9 @@
 #       the placeholder; luci-app-wanguard = byte-snapshot fixture)
 #   [8] the #80 page scaffold in the package: view/wanguard/antidpi.js +
 #       wanguard-antidpi/core.js land at the /www LuCI paths with the
-#       structural anchors (core require, status --json exec, the six
-#       sub-tabs); the placeholder view stays luci-app-wanguard's file
+#       structural anchors (core require, status --json exec, the seven
+#       sub-tabs, #103 sources pins); the placeholder view stays
+#       luci-app-wanguard's file
 #   [9] apk del removes the real tab AND the page files, keeps the simulated
 #       luci-app-wanguard file and the core package - the Anti-DPI tab falls
 #       back to the luci-app-wanguard placeholder (#79 fixture sync); this
@@ -188,7 +189,7 @@ expect 'live: antidpi' \
 	"$out"
 echo "LIVE-MENU-OK"
 
-echo "== [8] page scaffold + all six tabs (issues #80-#88)"
+echo "== [8] page scaffold + all seven tabs (issues #80-#88, #103)"
 VIEW=/www/luci-static/resources/view/wanguard/antidpi.js
 CORE=/www/luci-static/resources/wanguard-antidpi/core.js
 [ -f "$VIEW" ] || fail "view missing: $VIEW"
@@ -207,7 +208,7 @@ grep -qF "'status', '--json'" "$CORE" \
 	|| fail "core module must exec status --json (the #76 surface)"
 grep -qF "L.Class.extend" "$CORE" \
 	|| fail "core module must yield a LuCI class (module loader contract)"
-for tab in overview profiles policies domains tunnel tests; do
+for tab in overview profiles policies domains sources tunnel tests; do
 	grep -qF "'$tab'" "$CORE" || fail "tab '$tab' missing from the core tab table"
 done
 # the #81 overview: the on-demand surfaces and the bar's verbs are pinned
@@ -240,6 +241,25 @@ grep -qF "'domainlist'" "$CORE" \
 	|| fail "the domains tab lost the domainlist section type"
 grep -qF "domainsModel" "$CORE" \
 	|| fail "the domains tab lost its view model (legacy + named lists)"
+# the #103 Sources tab (forward-source scope, the #102 CLI mirror): the
+# section type, the view model, the strict validator reuse, the blanket-LAN
+# guard and the render entry point are pinned structurally - the editor
+# stages client-side; the application badge is table-re-render-only (the
+# engine argv stays source-free until phase D)
+grep -qF "'source'" "$CORE" \
+	|| fail "the sources tab lost the source section type"
+grep -qF "sourcesModel" "$CORE" \
+	|| fail "the sources tab lost its view model (sections + status marks)"
+grep -qF "sourcesAddNetwork" "$CORE" \
+	|| fail "the sources tab lost the network staging path"
+grep -qF "sourcesSetEnabled" "$CORE" \
+	|| fail "the sources tab lost the enable toggle path"
+grep -qF "renderSources" "$CORE" \
+	|| fail "the sources tab lost its render entry point"
+grep -qF "0.0.0.0/0 is rejected by design" "$CORE" \
+	|| fail "the sources tab lost the blanket-LAN guard (the #102 owner decision)"
+grep -qF "Group mark %s" "$CORE" \
+	|| fail "the sources tab lost the read-only auto-mark surface"
 # the #83 Tunnel protection tab: the strict address validator (the exact
 # valid_addr_entry mirror), the view model and the render entry point are
 # pinned structurally - the editor stages client-side and applies through
