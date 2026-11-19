@@ -357,19 +357,19 @@ hold, and a table re-apply never drops live connections.
   udp 1-5) as rule #0. Queue `bypass` = fail open.
 - group marks: auto-assigned `0x01000000..0x0F000000` by enabled-section
   order (15 groups; no user-facing mark knob), stamped by `meta mark set`
-  on the SAME rule that issues the queue verdict - postrouting, i.e. after
-  the routing decision, consumed by nothing except the queued packet copy.
-  That mark is the enforcement point for per-group strategies (device_group
-  via `--filter-mark`, phase D / issue #104).
+  on the SAME rule that issues the queue verdict. That mark is the
+  enforcement point for per-group strategies: `policy.device_group`
+  (#104, 7.5) renders `--filter-mark=<mark>/0x1F000000`, scoping one
+  policy to one group's forward traffic (engine restart on a group edit).
 - guard rails (owner decisions, spike #95 verdict §8): `0.0.0.0/0` rejected
   at render time (blanket desync breaks packet-modification-incompatible
   services); cross-section duplicate networks rejected (ambiguous
   first-match); malformed entries rejected like every render-bound address;
   the mark budget caps enabled sections at 15. All dies are named.
-- engine argv is source-free until phase D: a scope edit is a table
-  re-apply only - the engine never restarts, live connections survive.
-  `apply` validates the full render (sources included) in the preflight,
-  before any mutation.
+- engine argv is source-free except a `policy.device_group` binding
+  (#104, 7.5): a scope edit is a table re-apply only - the engine never
+  restarts, live connections survive. `apply` validates the full render
+  (sources included) in the preflight, before any mutation.
 - status: the `scope` key lists every section (id/name/enabled/networks/
   mark) with live per-source counters attributed from `nft -j` by the set
   reference. Read-only: a broken source config never kills the status -
@@ -586,18 +586,23 @@ validation contracts in 3.4/3.5 apply unchanged; profiles add the
 a leading empty segment would render a filterless match-everything
 profile and win first-match over every policy).
 
-### 7.5 device_group is staged-future
+### 7.5 device_group targets a source group (#104, spike-95 phase D)
 
-`policy.device_group` round-trips through the UI (badged "staged
-future") but is ignored by the render. The enforcement point now EXISTS
-(#102, 3.6): source-scoped packets carry a per-group mark stamped by the
-queue rule, and the engine can discriminate profiles via
-`--filter-mark=mark[/mask]` (spike-95 probe P4). Wiring `device_group` to
-that mark is the phase D contract (issue #104): the policy render gains
-the filter word (engine restart, honestly badged), validation like the
-other refs. Until then nothing in the pipeline depends on the field, and
-per-source desync strategies should not be expected from the current
-render.
+`policy.device_group` references a `config source` section (ref by the
+section name, validated loudly like every ref: a missing, disabled or
+empty-networks target dies the render - an unreachable group would make
+the policy silently inert). A bound policy renders
+`--filter-mark=<group mark>/0x1F000000` into its block: the nft source
+rule (#102) stamps the group mark on the SAME rule that issues the queue
+verdict, and the engine applies the policy ONLY to that group's traffic.
+The mihomo scope mark 0x10000000 falls outside the nibble mask - group
+policies never touch mihomo DIRECT traffic; the catch-all keeps serving
+it. A group edit drifts the engine argv, so the apply restarts the
+engine (the UI badge says so; a group-unbound policy stays
+metadata-only except for its name). Live proof: tests/test-policies.sh
+[12] - the engine's post-CH profile search carries `mark=0x...`
+verbatim; the in-group probe matches the group-bound policy while the
+out-group and list-miss probes fall through to the catch-all.
 
 Verification contract: `tests/luci/run-tests.js` - the real view + core
 evaluated in node with stubbed LuCI globals (`view` / `poll` / `rpc` /

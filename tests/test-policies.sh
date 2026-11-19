@@ -308,6 +308,52 @@ uci set "$CONF.whitelist.enabled=0"
 uci commit "$CONF"
 echo "WHITELIST-IGNORED-OK (policy blocks own their hostlists, the binding warns and skips)"
 
+# ---- [8b] device_group refs (issue #104, spike-95 phase D) ----
+echo "== [8b] device_group: --filter-mark targeting"
+# one rendered source group; bind the surviving bypass policy to it
+uci set "$CONF.lan_a=source"
+uci set "$CONF.lan_a.enabled=1"
+uci add_list "$CONF.lan_a.networks=198.51.100.0/24"
+uci set "$CONF.pol_bypass.device_group=lan_a"
+uci commit "$CONF"
+# the block gains --filter-mark AFTER the proto filter pair, BEFORE the hostlist
+[ "$(nth 6)" = "--filter-tcp=443" ] || fail "group block proto filter misplaced: $(nth 6)"
+[ "$(nth 7)" = "--payload=tls_client_hello" ] || fail "group block payload misplaced: $(nth 7)"
+[ "$(nth 8)" = "--filter-mark=0x01000000/0x1F000000" ] || fail "the group mark word must ride the block: $(nth 8)"
+[ "$(nth 9)" = "--hostlist=$LF" ] || fail "group block hostlist misplaced: $(nth 9)"
+[ "$(wc_lines)" = "17" ] || fail "expected 17 argv lines (5 base + 4 bypass w/ mark + --new + 7 two-profile catch-all), got $(wc_lines)"
+# a profile's own --filter-mark stays excluded from the block (one filter source)
+add_prof prof_dg 1 --filter-mark=0x0F000000/0x1F000000 --filter-tcp=443 --payload=tls_client_hello --lua-desync=fake:repeats=2
+uci set "$CONF.pol_bypass.action=strategy"
+uci set "$CONF.pol_bypass.profile=prof_dg"
+uci commit "$CONF"
+[ "$(nth 10)" = "--lua-desync=fake:repeats=2" ] || fail "the strategy word must ride verbatim: $(nth 10)"
+uci delete "$CONF.prof_dg"
+uci set "$CONF.pol_bypass.action=bypass"
+uci set "$CONF.pol_bypass.profile="
+uci commit "$CONF"
+# guards: missing / disabled / empty refs die named
+uci set "$CONF.pol_bypass.device_group=nosuch"
+uci commit "$CONF"
+chk_die "missing group ref" "does not exist"
+uci set "$CONF.lan_off=source"
+uci set "$CONF.lan_off.enabled=0"
+uci add_list "$CONF.lan_off.networks=203.0.113.0/24"
+uci set "$CONF.pol_bypass.device_group=lan_off"
+uci commit "$CONF"
+chk_die "disabled group ref" "is disabled"
+uci set "$CONF.lan_e=source"
+uci set "$CONF.lan_e.enabled=1"
+uci set "$CONF.pol_bypass.device_group=lan_e"
+uci commit "$CONF"
+chk_die "empty group ref" "no networks"
+# back to the live binding for the [9] status assertions
+uci delete "$CONF.lan_off"
+uci delete "$CONF.lan_e"
+uci set "$CONF.pol_bypass.device_group=lan_a"
+uci commit "$CONF"
+echo "DEVICE-GROUP-OK (--filter-mark word, profile exclusion, named guards)"
+
 # ---- [9] status surfaces ----
 echo "== [9] status --json policy surfaces"
 grab
@@ -317,6 +363,8 @@ grab
 [ "$(jp_str 's.engine.policy_sections[0].action')" = "bypass" ] || fail "policy_sections action wrong"
 [ "$(jp_str 's.engine.policy_sections[0].domainlist')" = "list_media" ] || fail "policy_sections domainlist wrong"
 [ "$(jp_str 's.engine.policy_sections[0].priority')" = "10" ] || fail "policy_sections priority wrong"
+[ "$(jp_str 's.engine.policy_sections[0].device_group')" = "lan_a" ] || fail "policy_sections device_group wrong"
+[ "$(jp_str 's.engine.policy_sections[0].group_mark')" = "0x01000000" ] || fail "policy_sections group_mark must mirror the render assignment (#104)"
 [ "$(jp 's.engine.policy_sections[0].enabled')" = "true" ] || fail "policy_sections enabled wrong"
 [ "$(jp_str 's.engine.hostlists[0]')" = "$BASE/lists/list_media.hosts" ] || fail "status hostlists must name the policy list"
 # DRYRUN apply mentions the policy list render
@@ -324,6 +372,8 @@ WANGUARD_ANTIDPI_DRYRUN=1 "$CLI" apply 2>&1 | grep -q "1 policy list file(s)" ||
 echo "STATUS-POLICIES-OK (policies count, policy_sections fields, hostlists, DRYRUN line)"
 
 # cleanup the policy config for the live parts
+uci delete "$CONF.pol_bypass.device_group"
+uci delete "$CONF.lan_a"
 uci delete "$CONF.whitelist.domains"
 uci set "$CONF.whitelist.enabled=0"
 uci commit "$CONF"
@@ -464,5 +514,121 @@ wait "$ENG_PID" 2>/dev/null
 ENG_PID=
 kill "$SINK_PID" 2>/dev/null
 echo "INVENTORY-OK (bypass SNI passed the CH in one segment, catch-all split it; both handshakes green)"
+
+# ---- [12] live device-group inventory: --filter-mark targets ONE group ----
+# The REAL rendered table (nft-apply) carries the #102 source rules: a
+# packet whose SOURCE sits in a rendered group gets the group mark stamped
+# by the queue rule. The policy discriminator is read from the ENGINE'S OWN
+# decision log (--debug=1): every post-CH profile search line carries
+# `mark=0x... hostname='...'` verbatim and names the profile that matched -
+# that is exactly the spike-95 P4 evidence surface, stable across the
+# engine's ipcache behavior (segment lengths are NOT: the cached-profile
+# shortcut makes a same-target second probe skip the search entirely):
+#   (bypass.example, lan_a bind, dst A)  -> search mark=0x01000000 +
+#       hostname='bypass.example' MATCHES the policy profile (bypass:
+#       the CH passes in ONE segment)
+#   (bypass.example, lan_b bind, dst B)  -> search mark=0x02000000 + the
+#       SAME hostname - the policy profile (0x01/0x1F000000) MUST NOT match
+#   (desync.example, lan_a bind, dst C)  -> search mark=0x01000000 +
+#       hostname='desync.example' - the policy profile MUST NOT match
+#       (the SNI is not in the policy hostlist)
+echo "== [12] device-group inventory (spike-95 P4 against the CLI-rendered argv)"
+# the [11] harness table would re-mark every 8.8.100.0/24 probe as the
+# mihomo scope (output hook) - it must go before the real table is applied
+nft delete table inet policies86 2>/dev/null || true
+# the group-agnostic bypass policy from [8] would match every probe by its
+# hostlist alone and shadow the group-bound policy (it is profile 1 by
+# file order) - the inventory needs the group-bound policy to be profile 1
+uci delete "$CONF.pol_bypass"
+uci commit "$CONF"
+for a in 8.8.100.10 8.8.100.11 8.8.100.12 8.8.100.99; do
+	ip addr add "$a/32" dev lo 2>/dev/null || true
+done
+SRC_IP=$(ip -4 addr show dev eth0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\)\/[0-9]* .*/\1/p' | head -n 1)
+[ -n "$SRC_IP" ] || fail "cannot resolve the container address for the group probe"
+uci set "$CONF.lan_a=source"
+uci set "$CONF.lan_a.enabled=1"
+uci add_list "$CONF.lan_a.networks=$SRC_IP/32"
+uci set "$CONF.lan_b=source"
+uci set "$CONF.lan_b.enabled=1"
+uci add_list "$CONF.lan_b.networks=8.8.100.99/32"
+uci delete "$CONF.list_media.domains" 2>/dev/null || :
+uci add_list "$CONF.list_media.domains=bypass.example"
+uci set "$CONF.pol_grp=policy"
+uci set "$CONF.pol_grp.name=Group bypass"
+uci set "$CONF.pol_grp.priority=10"
+uci set "$CONF.pol_grp.domainlist=list_media"
+uci set "$CONF.pol_grp.proto=tcp"
+uci set "$CONF.pol_grp.device_group=lan_a"
+uci set "$CONF.pol_grp.action=bypass"
+uci set "$CONF.pol_grp.enabled=1"
+uci commit "$CONF"
+"$CLI" whitelist-refresh >/dev/null
+"$CLI" nft-apply >/dev/null
+nft list set inet wanguard_antidpi src_lan_a >/dev/null 2>&1 || fail "the rendered table lost src_lan_a"
+nft list set inet wanguard_antidpi src_lan_b >/dev/null 2>&1 || fail "the rendered table lost src_lan_b"
+openssl s_server -accept 443 -cert /tmp/sink.crt -key /tmp/sink.key \
+	-www -quiet >/tmp/policies-sink2.log 2>&1 &
+SINK_PID=$!
+sleep 1
+kill -0 "$SINK_PID" 2>/dev/null || fail "s_server died on the group probe"
+set -- $("$CLI" engine-cmdline)
+prog=$1
+shift
+"$prog" --debug=1 "$@" >/tmp/policies-engine3.log 2>&1 &
+ENG_PID=$!
+sleep 3
+kill -0 "$ENG_PID" 2>/dev/null || fail "engine died on the group-policy argv (log: $(tail -3 /tmp/policies-engine3.log))"
+grep -q "Loaded 1 hosts" /tmp/policies-engine3.log || fail "engine must load the group-policy hostlist"
+inv_probe2() { # inv_probe2 <sni> <bind-ip> <dst-ip> <tag> - run one probe
+	tcpdump -i lo -nn -l "dst host $3 and tcp port 443" > "/tmp/cap2-$4.txt" 2>&1 &
+	TPID=$!
+	sleep 1
+	echo Q | openssl s_client -bind "$2" -connect "$3:443" -servername "$1" \
+		>/tmp/sc2-"$4".out 2>&1
+	sleep 1
+	kill "$TPID" 2>/dev/null
+	wait "$TPID" 2>/dev/null
+	grep -E '^[0-9]{2}:[0-9]{2}:' "/tmp/cap2-$4.txt" | grep -oE 'length [0-9]+' | grep -oE '[0-9]+$'
+}
+# the profile decision for one (mark, hostname) pair: the first post-search
+# `matches` line after the reveal-time search carrying BOTH values
+dg_decide() { # dg_decide <mark> <sni>
+	grep -F "mark=$1 hostname='$2'" /tmp/policies-engine3.log >/dev/null || \
+		fail "the engine log lost the profile search for mark=$1 hostname='$2'"
+	grep -F -A8 "mark=$1 hostname='$2'" /tmp/policies-engine3.log \
+		| grep -E 'desync profile [0-9]+ \(.*\) matches' | head -1
+}
+inv_probe2 bypass.example "$SRC_IP" 8.8.100.10 in-group
+inv_probe2 bypass.example 8.8.100.99 8.8.100.11 out-group
+inv_probe2 desync.example "$SRC_IP" 8.8.100.12 list-miss
+GRP_BYPASS_LEN=$(grep -E '^[0-9]{2}:[0-9]{2}:' /tmp/cap2-in-group.txt | grep -oE 'length [0-9]+' | grep -oE '[0-9]+$' | grep -v '^0$' | head -1)
+IN_DECIDE=$(dg_decide 0x01000000 bypass.example)
+OUT_DECIDE=$(dg_decide 0x02000000 bypass.example)
+MISS_DECIDE=$(dg_decide 0x01000000 desync.example)
+echo "in-group decision: $IN_DECIDE; out-group decision: $OUT_DECIDE; list-miss decision: $MISS_DECIDE; in-group first segment: $GRP_BYPASS_LEN"
+grep -q "Cipher is" /tmp/sc2-in-group.out || fail "the in-group bypass session did not complete the TLS handshake"
+grep -q "Cipher is" /tmp/sc2-out-group.out || fail "the out-group session did not complete the TLS handshake"
+grep -q "Cipher is" /tmp/sc2-list-miss.out || fail "the list-miss session did not complete the TLS handshake"
+[ -n "$GRP_BYPASS_LEN" ] && [ "$GRP_BYPASS_LEN" -gt 500 ] || fail "the in-group CH must pass unmodified (one large segment), got: $GRP_BYPASS_LEN"
+printf '%s' "$IN_DECIDE" | grep -q 'desync profile 1 ' \
+	|| fail "the in-group CH must be decided by the policy profile (profile 1), got: $IN_DECIDE"
+printf '%s' "$OUT_DECIDE" | grep -qv 'desync profile 1 ' \
+	|| fail "the out-group CH (mark 0x02) must NOT match the 0x01 policy filter, got: $OUT_DECIDE"
+printf '%s' "$MISS_DECIDE" | grep -qv 'desync profile 1 ' \
+	|| fail "a list-miss inside the group must fall through (the policy hostlist must not match), got: $MISS_DECIDE"
+kill "$ENG_PID" 2>/dev/null
+wait "$ENG_PID" 2>/dev/null
+ENG_PID=
+kill "$SINK_PID" 2>/dev/null
+"$CLI" nft-flush >/dev/null
+uci delete "$CONF.pol_grp"
+uci delete "$CONF.lan_a"
+uci delete "$CONF.lan_b"
+uci commit "$CONF"
+for a in 8.8.100.10 8.8.100.11 8.8.100.12 8.8.100.99; do
+	ip addr del "$a/32" dev lo 2>/dev/null || true
+done
+echo "DEVICE-GROUP-LIVE-OK (the profile search carries the group mark: in-group matches the policy, out-group and list-miss fall through)"
 
 echo "POLICIES-TEST-OK"

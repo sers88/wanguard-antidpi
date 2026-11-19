@@ -33,6 +33,8 @@
 #   [5e] profile strategy edit -> restart, profile words in /proc cmdline (#84)
 #   [5f] source section add -> nft re-apply, engine no-op; blanket source
 #        dies in the preflight, --check names it (#102)
+#   [5g] device_group staging -> argv drift = engine restart, the block
+#        carries --filter-mark live (#104)
 #   [6]  --check all green (+ --json ok:true, engine pid present)
 #   [7]  --check catches a missing hostlist file
 #   [8]  --check catches a foreign routing-mark
@@ -364,6 +366,60 @@ assert_out 'engine: no-op' "$OUT"
 nft list set inet wanguard_antidpi src_lan_a >/dev/null 2>&1 \
 	&& fail "a removed source set survived the apply" || :
 echo "SOURCE-APPLY-OK (scope edit = table re-apply only, engine pid $P untouched, blanket preflight rejected)"
+
+# ---- [5g] device_group edit -> argv drift = engine restart (issue #104) ----
+# A group ref rides in the engine argv (--filter-mark), so staging one is
+# the OPPOSITE of a scope edit: the apply MUST restart the engine (the UI
+# badge says so). The block word is verified in the live /proc cmdline.
+echo "== [5g] device_group staging -> restart"
+uci set wanguard-antidpi.list_dg=domainlist
+uci add_list wanguard-antidpi.list_dg.domains='grp.example'
+uci set wanguard-antidpi.prof_dg=profile
+uci set wanguard-antidpi.prof_dg.enabled='1'
+uci add_list wanguard-antidpi.prof_dg.strategy_words='--filter-tcp=443'
+uci add_list wanguard-antidpi.prof_dg.strategy_words='--payload=tls_client_hello'
+uci add_list wanguard-antidpi.prof_dg.strategy_words='--lua-desync=fake:repeats=2'
+uci set wanguard-antidpi.lan_g=source
+uci set wanguard-antidpi.lan_g.enabled='1'
+uci add_list wanguard-antidpi.lan_g.networks='198.51.100.0/24'
+uci set wanguard-antidpi.pol_g=policy
+uci set wanguard-antidpi.pol_g.priority='10'
+uci set wanguard-antidpi.pol_g.domainlist='list_dg'
+uci set wanguard-antidpi.pol_g.proto='tcp'
+uci set wanguard-antidpi.pol_g.action='bypass'
+uci set wanguard-antidpi.pol_g.enabled='1'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "policy-seed apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+P2=$(epid)
+[ -n "$P2" ] && [ "$P2" != "$P" ] || fail "expected a fresh engine pid after the policy seed ($P -> $P2)"
+# stage the group ref: argv drift -> restart
+uci set wanguard-antidpi.pol_g.device_group='lan_g'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "device_group apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+P3=$(epid)
+[ -n "$P3" ] && [ "$P3" != "$P2" ] || fail "a device_group edit must restart the engine ($P2 -> $P3)"
+grep -qa -- '--filter-mark=0x01000000/0x1F000000' "/proc/$P3/cmdline" \
+	|| fail "the running engine must carry --filter-mark=0x01000000/0x1F000000"
+# unbinding the group is argv drift too (back to the plain block)
+uci set wanguard-antidpi.pol_g.device_group=''
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "device_group clear apply exited $RC: $OUT"
+assert_out 'engine: restarted' "$OUT"
+grep -qa -- '--filter-mark' "/proc/$(epid)/cmdline" \
+	&& fail "the unbound policy must not carry --filter-mark" || :
+uci delete wanguard-antidpi.pol_g
+uci delete wanguard-antidpi.prof_dg
+uci delete wanguard-antidpi.list_dg
+uci delete wanguard-antidpi.lan_g
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "cleanup apply exited $RC: $OUT"
+echo "DEVICE-GROUP-APPLY-OK (group staging = argv drift = restart, --filter-mark verified live)"
 
 # ---- [6] --check all green ----
 echo "== [6] --check all green"

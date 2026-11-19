@@ -127,6 +127,12 @@ const CLI_SELF = '/usr/bin/wanguard-antidpi';
 // core policy marks stay clear. There is no user-facing mark knob.
 const SOURCE_MARK_STEP = 0x01000000;
 const SOURCE_MARK_MAX = 15;
+// the nibble mask for per-group engine targeting (issue #104, spike-95
+// phase D): a policy bound to a source group renders
+// --filter-mark=<mark>/0x1F000000 (probe P4). The mihomo scope mark
+// 0x10000000 falls OUTSIDE the mask, so a group-filtered profile never
+// touches mihomo DIRECT traffic - the catch-all keeps serving it.
+const SOURCE_MARK_MASK = '0x1F000000';
 
 function die(msg) {
 	warn('wanguard-antidpi: ' + msg + '\n');
@@ -358,6 +364,155 @@ function validate_whitelist_sources(src) {
 
 const POLICY_LISTS_DIR = BASE + '/lists';
 
+function valid_addr_entry(e) {
+	// strict 'a.b.c.d' or 'a.b.c.d/nn' - entries land inside a generated nft
+	// file, so anything unusual must be rejected, not escaped
+	if (e == null || length(e) == 0)
+		return false;
+	let host = e;
+	let sl = index(e, '/');
+	if (sl != null && sl >= 0) {
+		let mask = substr(e, sl + 1);
+		if (!match(mask, /^[0-9]+$/) || int(mask) > 32)
+			return false;
+		host = substr(e, 0, sl);
+	}
+	let parts = split(host, '.');
+	if (length(parts) != 4)
+		return false;
+	for (let i = 0; i < 4; i++) {
+		let p = parts[i];
+		if (!match(p, /^[0-9]+$/) || length(p) > 3 || int(p) > 255)
+			return false;
+		if (length(p) > 1 && substr(p, 0, 1) == '0')
+			return false; // no leading zeros: keeps the render canonical
+	}
+	return true;
+}
+
+function load_sources() {
+	// forward-source opt-in sections (issue #102): the section NAME is the
+	// stable id (device_group refs, issue #104), `name` is the editable
+	// label. Soft loader - missing sections/options render nothing (the
+	// golden contract); strict validation happens in source_scope() at
+	// render time, so a broken section fails nft-render/apply loudly and
+	// stays invisible to the read-only status (which degrades instead).
+	let out = [];
+	uci.cursor().foreach(CONF, 'source', function(s) {
+		push(out, {
+			id: s['.name'],
+			name: (type(s.name) == 'string' && length(s.name) > 0) ? s.name : s['.name'],
+			networks: (type(s.networks) == 'array') ? s.networks : [],
+			enabled: (s.enabled == null || s.enabled != '0') ? true : false
+		});
+	});
+	return out;
+}
+
+function source_mark_map() {
+	// the SOFT mark assignment for the read-only surfaces (status never
+	// dies on a broken config, the #76 contract): enabled file order over
+	// RENDERED sections (enabled + non-empty), capped at the nibble budget.
+	// The render (source_scope) is the authority - this map must mirror it
+	// exactly; test-status pins the parity.
+	let out = {};
+	let srcs = load_sources();
+	let n = 0;
+	for (let i = 0; i < length(srcs); i++) {
+		if (!srcs[i].enabled || length(srcs[i].networks) == 0)
+			continue;
+		n++;
+		if (n > SOURCE_MARK_MAX)
+			break;
+		out[srcs[i].id] = sprintf('0x%08x', n * SOURCE_MARK_STEP);
+	}
+	return out;
+}
+
+function source_scope() {
+	// the render model for the forward-source scope (issue #102): validate
+	// every enabled section loudly, assign the group marks by enabled file
+	// order, render the per-source nft sets + egress rule pairs. Returns
+	// null when nothing renders (no sections / all disabled / all empty) -
+	// the template tokens render empty and the table stays byte-identical
+	// to the issue #61/#68 golden.
+	//
+	// Guard rails (owner decisions, spike #95 verdict §8): 0.0.0.0/0 is
+	// rejected by design - a blanket source would desync every LAN service
+	// including the packet-modification-incompatible ones; duplicate
+	// networks across enabled sections are rejected (ambiguous first-match);
+	// the group-mark budget caps the enabled count.
+	let srcs = load_sources();
+	let claimed = {};
+	let n = 0;
+	let sets = '';
+	let rules = '';
+	let list = [];
+	for (let i = 0; i < length(srcs); i++) {
+		let sc = srcs[i];
+		if (!sc.enabled)
+			continue;
+		// the section id lands inside the generated nft file (set names) -
+		// strict charset, no escaping (render-injection safety, same rule
+		// as every address that reaches the render)
+		if (match(sc.id, /^[A-Za-z0-9_]+$/) == null)
+			die('source "' + sc.id + '": section name must be [A-Za-z0-9_] (it names the nft set)');
+		if (length(sc.networks) == 0) {
+			warn('wanguard-antidpi: source "' + sc.id + '" is enabled but has no networks - skipped\n');
+			continue;
+		}
+		let els = [];
+		for (let j = 0; j < length(sc.networks); j++) {
+			let e = sc.networks[j];
+			if (!valid_addr_entry(e))
+				die('source "' + sc.id + '": network is not a canonical IPv4/CIDR: "' + e + '"');
+			if (e == '0.0.0.0/0')
+				die('source "' + sc.id + '": 0.0.0.0/0 is rejected by design - a blanket source would desync every LAN service including the packet-modification-incompatible ones (spike #95 owner decision); list explicit CIDR groups');
+			if (claimed[e] != null)
+				die('source "' + sc.id + '": network ' + e + ' is already claimed by source "' + claimed[e] + '" (overlapping scope is ambiguous - the first match would silently win)');
+			claimed[e] = sc.id;
+			push(els, e);
+		}
+		n++;
+		if (n > SOURCE_MARK_MAX)
+			die('more than ' + SOURCE_MARK_MAX + ' enabled source sections (the group-mark nibble 0x01000000..0x0F000000 holds ' + SOURCE_MARK_MAX + ' groups - docs/ARCHITECTURE.md §5)');
+		let elsline = '';
+		for (let j = 0; j < length(els); j++)
+			elsline += ((j > 0) ? ', ' : '') + els[j];
+		let mark = sprintf('0x%08x', n * SOURCE_MARK_STEP);
+		push(list, { id: sc.id, name: sc.name, mark: mark });
+		sets += '\tset src_' + sc.id + ' {\n' +
+			'\t\ttype ipv4_addr\n' +
+			'\t\tflags interval\n' +
+			'\t\telements = { ' + elsline + ' }\n' +
+			'\t}\n';
+		// per-source rule pair AFTER the mihomo rules (a queue verdict is
+		// terminal, so the mihomo scope can never be pre-empted). The group
+		// mark rides on the SAME rule as the queue verdict - the engine's
+		// --filter-mark (device_group, issue #104) reads it off the queued
+		// packet copy. Same daddr exclusions and connbytes caps as the
+		// mihomo scope; queue bypass = fail open. The label is NOT rendered
+		// (free text, injection safety) - only the charset-checked id is.
+		for (let k = 0; k < 2; k++) {
+			let proto = (k == 0) ? 'tcp' : 'udp';
+			let cap = (k == 0) ? '1-20' : '1-5';
+			rules += '\t\t# source ' + sc.id + ' (group mark ' + mark +
+				'): LAN-forward ' + proto + ' 443, packets ' + cap + ' (issue #102)\n' +
+				'\t\tip saddr @src_' + sc.id + ' \\\n' +
+				'\t\tmeta mark & @FWMARK@ == 0 \\\n' +
+				'\t\tip daddr != @proxy_servers \\\n' +
+				'\t\tip daddr != @local_v4 \\\n' +
+				'\t\t' + proto + ' dport 443 ct original packets ' + cap + ' \\\n' +
+				'\t\tcounter \\\n' +
+				'\t\tmeta mark set ' + mark + ' \\\n' +
+				'\t\tqueue num @QNUM@ bypass\n';
+		}
+	}
+	if (n == 0)
+		return null;
+	return { list: list, sets: sets, rules: rules };
+}
+
 function policy_hostlist_path(list_sid) {
 	// one hostlist file per referenced domainlist section (design §3):
 	// rendered by whitelist-refresh, consumed by the engine argv. The path
@@ -463,6 +618,22 @@ function policy_render() {
 	}
 	let lists = load_domainlists();
 	let profiles = load_profiles();
+	// device_group refs (issue #104, spike-95 phase D): an OPTIONAL ref to
+	// a forward-source section (#102). When set, the block gains
+	// --filter-mark=<mark>/0x1F000000 so the engine applies the policy ONLY
+	// to that group's queued packets - the nft source rule stamps the group
+	// mark on the SAME rule that issues the queue verdict (probe P4). The
+	// mihomo scope mark 0x10000000 is outside the nibble mask: group-bound
+	// policies never touch mihomo DIRECT traffic, the catch-all keeps
+	// serving it. The mark map is computed once per render when any visible
+	// policy carries a ref (source_scope validates the map's inputs loudly).
+	let need_scope = false;
+	for (let i = 0; i < length(visible); i++)
+		if (length(visible[i].device_group) > 0) {
+			need_scope = true;
+			break;
+		}
+	let scope = need_scope ? source_scope() : null;
 	let blocks = [];
 	let refd = {};
 	let refd_order = [];
@@ -482,6 +653,33 @@ function policy_render() {
 			refd[dl.sid] = true;
 			push(refd_order, dl);
 		}
+		// device_group ref validation (issue #104): loud and named like
+		// every ref - the section must RENDER (enabled + non-empty), or the
+		// policy could never match and would silently disappear from the
+		// engine behavior. Runs BEFORE the action dispatch: none-policies
+		// validate their refs too (the #86 contract).
+		let grp = null;
+		if (length(p.device_group) > 0) {
+			if (scope != null)
+				for (let si = 0; si < length(scope.list); si++)
+					if (scope.list[si].id == p.device_group)
+						grp = scope.list[si];
+			if (grp == null) {
+				let all = load_sources();
+				let found = null;
+				for (let si = 0; si < length(all); si++)
+					if (all[si].id == p.device_group)
+						found = all[si];
+				if (found == null)
+					die('policy "' + p.id + '": device_group ref "' + p.device_group +
+						'" does not exist (refs go by the source section name)');
+				if (!found.enabled)
+					die('policy "' + p.id + '": device_group ref "' + p.device_group +
+						'" is disabled - enable the source section or unlink the policy');
+				die('policy "' + p.id + '": device_group ref "' + p.device_group +
+					'" has no networks - it renders no group mark');
+			}
+		}
 		// action: strategy | bypass | none; anything else is a broken
 		// config that must fail the render loudly (issue contract)
 		if (p.action != 'strategy' && p.action != 'bypass' && p.action != 'none')
@@ -500,10 +698,13 @@ function policy_render() {
 			continue; // validated above; renders no block (falls through)
 		if (length(p.proto) == 0)
 			die('policy "' + p.id + '": proto is empty - at least one of tcp/udp/quic is required');
-		// the block: proto filters + payload, then the hostlist (block
-		// start, the same position the whitelist binding uses), then the
-		// desync part for strategy actions
+		// the block: proto filters + payload, then the group filter (issue
+		// #104 - filters cluster together), then the hostlist (block start,
+		// the same position the whitelist binding uses), then the desync
+		// part for strategy actions
 		let words = policy_proto_filters(p.proto);
+		if (grp != null)
+			push(words, '--filter-mark=' + grp.mark + '/' + SOURCE_MARK_MASK);
 		push(words, '--hostlist=' + policy_hostlist_path(dl.sid));
 		if (p.action == 'strategy') {
 			for (let wi = 0; wi < length(prof.words); wi++) {
@@ -514,7 +715,7 @@ function policy_render() {
 				// functions, wssize, ...) rides verbatim and stays a single
 				// argv word (the #84 contract)
 				if (index(w, '--filter-tcp=') == 0 || index(w, '--filter-udp=') == 0 ||
-				    index(w, '--payload=') == 0)
+				    index(w, '--payload=') == 0 || index(w, '--filter-mark=') == 0)
 					continue;
 				if (type(w) != 'string' || length(w) == 0 ||
 				    index(w, ' ') >= 0 || index(w, '\t') >= 0)
@@ -542,32 +743,6 @@ function policy_list_canonical(raw) {
 	return doms;
 }
 
-function valid_addr_entry(e) {
-	// strict 'a.b.c.d' or 'a.b.c.d/nn' - entries land inside a generated nft
-	// file, so anything unusual must be rejected, not escaped
-	if (e == null || length(e) == 0)
-		return false;
-	let host = e;
-	let sl = index(e, '/');
-	if (sl != null && sl >= 0) {
-		let mask = substr(e, sl + 1);
-		if (!match(mask, /^[0-9]+$/) || int(mask) > 32)
-			return false;
-		host = substr(e, 0, sl);
-	}
-	let parts = split(host, '.');
-	if (length(parts) != 4)
-		return false;
-	for (let i = 0; i < 4; i++) {
-		let p = parts[i];
-		if (!match(p, /^[0-9]+$/) || length(p) > 3 || int(p) > 255)
-			return false;
-		if (length(p) > 1 && substr(p, 0, 1) == '0')
-			return false; // no leading zeros: keeps the render canonical
-	}
-	return true;
-}
-
 function merge_proxy_entries(t) {
 	// the rendered set = manual pins (tunnel.proxy_servers) UNION resolver-
 	// managed answers (tunnel.proxy_resolved, issue #62); strict validation
@@ -588,109 +763,6 @@ function merge_proxy_entries(t) {
 	}
 	sort(els);
 	return els;
-}
-
-function load_sources() {
-	// forward-source opt-in sections (issue #102): the section NAME is the
-	// stable id (device_group refs in phase D), `name` is the editable
-	// label. Soft loader - missing sections/options render nothing (the
-	// golden contract); strict validation happens in source_scope() at
-	// render time, so a broken section fails nft-render/apply loudly and
-	// stays invisible to the read-only status (which degrades instead).
-	let out = [];
-	uci.cursor().foreach(CONF, 'source', function(s) {
-		push(out, {
-			id: s['.name'],
-			name: (type(s.name) == 'string' && length(s.name) > 0) ? s.name : s['.name'],
-			networks: (type(s.networks) == 'array') ? s.networks : [],
-			enabled: (s.enabled == null || s.enabled != '0') ? true : false
-		});
-	});
-	return out;
-}
-
-function source_scope() {
-	// the render model for the forward-source scope (issue #102): validate
-	// every enabled section loudly, assign the group marks by enabled file
-	// order, render the per-source nft sets + egress rule pairs. Returns
-	// null when nothing renders (no sections / all disabled / all empty) -
-	// the template tokens render empty and the table stays byte-identical
-	// to the issue #61/#68 golden.
-	//
-	// Guard rails (owner decisions, spike #95 verdict §8): 0.0.0.0/0 is
-	// rejected by design - a blanket source would desync every LAN service
-	// including the packet-modification-incompatible ones; duplicate
-	// networks across enabled sections are rejected (ambiguous first-match);
-	// the group-mark budget caps the enabled count.
-	let srcs = load_sources();
-	let claimed = {};
-	let n = 0;
-	let sets = '';
-	let rules = '';
-	let list = [];
-	for (let i = 0; i < length(srcs); i++) {
-		let sc = srcs[i];
-		if (!sc.enabled)
-			continue;
-		// the section id lands inside the generated nft file (set names) -
-		// strict charset, no escaping (render-injection safety, same rule
-		// as every address that reaches the render)
-		if (match(sc.id, /^[A-Za-z0-9_]+$/) == null)
-			die('source "' + sc.id + '": section name must be [A-Za-z0-9_] (it names the nft set)');
-		if (length(sc.networks) == 0) {
-			warn('wanguard-antidpi: source "' + sc.id + '" is enabled but has no networks - skipped\n');
-			continue;
-		}
-		let els = [];
-		for (let j = 0; j < length(sc.networks); j++) {
-			let e = sc.networks[j];
-			if (!valid_addr_entry(e))
-				die('source "' + sc.id + '": network is not a canonical IPv4/CIDR: "' + e + '"');
-			if (e == '0.0.0.0/0')
-				die('source "' + sc.id + '": 0.0.0.0/0 is rejected by design - a blanket source would desync every LAN service including the packet-modification-incompatible ones (spike #95 owner decision); list explicit CIDR groups');
-			if (claimed[e] != null)
-				die('source "' + sc.id + '": network ' + e + ' is already claimed by source "' + claimed[e] + '" (overlapping scope is ambiguous - the first match would silently win)');
-			claimed[e] = sc.id;
-			push(els, e);
-		}
-		n++;
-		if (n > SOURCE_MARK_MAX)
-			die('more than ' + SOURCE_MARK_MAX + ' enabled source sections (the group-mark nibble 0x01000000..0x0F000000 holds ' + SOURCE_MARK_MAX + ' groups - docs/ARCHITECTURE.md §5)');
-		let elsline = '';
-		for (let j = 0; j < length(els); j++)
-			elsline += ((j > 0) ? ', ' : '') + els[j];
-		let mark = sprintf('0x%08x', n * SOURCE_MARK_STEP);
-		push(list, { id: sc.id, name: sc.name, mark: mark });
-		sets += '\tset src_' + sc.id + ' {\n' +
-			'\t\ttype ipv4_addr\n' +
-			'\t\tflags interval\n' +
-			'\t\telements = { ' + elsline + ' }\n' +
-			'\t}\n';
-		// per-source rule pair AFTER the mihomo rules (a queue verdict is
-		// terminal, so the mihomo scope can never be pre-empted). The group
-		// mark rides on the SAME rule as the queue verdict - the engine's
-		// --filter-mark (device_group, phase D) reads it off the queued
-		// packet copy. Same daddr exclusions and connbytes caps as the
-		// mihomo scope; queue bypass = fail open. The label is NOT rendered
-		// (free text, injection safety) - only the charset-checked id is.
-		for (let k = 0; k < 2; k++) {
-			let proto = (k == 0) ? 'tcp' : 'udp';
-			let cap = (k == 0) ? '1-20' : '1-5';
-			rules += '\t\t# source ' + sc.id + ' (group mark ' + mark +
-				'): LAN-forward ' + proto + ' 443, packets ' + cap + ' (issue #102)\n' +
-				'\t\tip saddr @src_' + sc.id + ' \\\n' +
-				'\t\tmeta mark & @FWMARK@ == 0 \\\n' +
-				'\t\tip daddr != @proxy_servers \\\n' +
-				'\t\tip daddr != @local_v4 \\\n' +
-				'\t\t' + proto + ' dport 443 ct original packets ' + cap + ' \\\n' +
-				'\t\tcounter \\\n' +
-				'\t\tmeta mark set ' + mark + ' \\\n' +
-				'\t\tqueue num @QNUM@ bypass\n';
-		}
-	}
-	if (n == 0)
-		return null;
-	return { list: list, sets: sets, rules: rules };
 }
 
 function cmd_version() {
@@ -1974,6 +2046,9 @@ function status_engine_info() {
 	// profile word does) - status stays consistent with the argv it reports.
 	let polsecs = load_policies();
 	let pol = policy_render();
+	// the device_group display marks (issue #104): the soft assignment
+	// mirrors the render (source_mark_map) - status never validates
+	let smarks = source_mark_map();
 	let psections = [];
 	for (let i = 0; i < length(polsecs); i++)
 		push(psections, {
@@ -1985,6 +2060,8 @@ function status_engine_info() {
 			action: polsecs[i].action,
 			profile: polsecs[i].profile,
 			device_group: polsecs[i].device_group,
+			group_mark: (length(polsecs[i].device_group) > 0) ?
+				(smarks[polsecs[i].device_group] || null) : null,
 			enabled: polsecs[i].enabled
 		});
 	return {
@@ -2050,25 +2127,16 @@ function status_scope_info() {
 	let srcs = load_sources();
 	if (length(srcs) == 0)
 		return { enabled: false, sources: [] };
-	let n = 0;
+	let marks = source_mark_map();
 	let out = [];
 	for (let i = 0; i < length(srcs); i++) {
 		let sc = srcs[i];
-		let mark = null;
-		if (sc.enabled && length(sc.networks) > 0) {
-			if (n < SOURCE_MARK_MAX) {
-				n++;
-				mark = sprintf('0x%08x', n * SOURCE_MARK_STEP);
-			}
-			// over budget: mark stays null - the render fails loudly on
-			// every apply, status keeps listing the section
-		}
 		push(out, {
 			id: sc.id,
 			name: sc.name,
 			enabled: sc.enabled,
 			networks: sc.networks,
-			mark: mark,
+			mark: marks[sc.id] || null,
 			counters: { tcp: null, udp: null }
 		});
 	}

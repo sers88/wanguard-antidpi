@@ -337,10 +337,12 @@ grep -qF "wg-ad-rowmenu" "$CORE" \
 	|| fail "the policies row menu lost its style hook"
 grep -qF "Only mihomo DIRECT traffic is eligible" "$CORE" \
 	|| fail "the policies tab lost the standing notice"
-grep -qF "Device groups are identifiers for future group targeting" "$CORE" \
-	|| fail "the policies tab lost the device-group foot-note (concept text)"
-grep -qF "stored, ignored by the current render" "$CORE" \
-	|| fail "the drawer lost the device-group staged-future badge"
+grep -qF "A device group targets the policy at one source group forward traffic" "$CORE" \
+	|| fail "the policies tab lost the device-group foot-note (#104)"
+grep -qF "Group targeted - apply restarts the engine" "$CORE" \
+	|| fail "the drawer lost the device-group restart badge (#104)"
+grep -qF -- "--filter-mark" "$CORE" \
+	|| fail "the policies tab lost the --filter-mark surface (#104)"
 grep -qF "Domain list edits apply via reload - live connections stay up" "$CORE" \
 	|| fail "the apply card lost the honest reload chip"
 grep -qF "Referenced by %d policy(s) - unlink them first." "$CORE" \

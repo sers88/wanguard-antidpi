@@ -1452,11 +1452,23 @@ function sourcesCreate() {
 	renderSources();
 }
 
+/* how many policies reference this group by section name (#104 refs) */
+function sourcesPolicyUse(sid) {
+	return (uci.sections('wanguard-antidpi', 'policy') || [])
+		.filter(function(p) { return p.device_group == sid; }).length;
+}
+
 function sourcesDelete(sid) {
-	/* two-step armed delete (the #82 pattern). No ref guard is needed yet:
-	 * device_group refs (phase D) do not exist in the render - a future
-	 * policy referencing this section must unlink first, same as the
-	 * domain-list guard. */
+	/* two-step armed delete (the #82 pattern) + the policy-ref guard (#104):
+	 * a delete must never orphan a policy - the render would die loudly at
+	 * apply time (the #86 contract) */
+	var used = sourcesPolicyUse(sid);
+	if (used > 0) {
+		state.sources.errors[sid] = _('Referenced by %d policy(s) - unlink them first.').format(used);
+		state.sources.deleteArm = null;
+		renderSources();
+		return;
+	}
 	if (state.sources.deleteArm != sid) {
 		state.sources.deleteArm = sid;
 		renderSources();
@@ -1572,7 +1584,8 @@ function buildSourcesView() {
 	var frag = E([]);
 
 	/* the honest application badge (#103): a scope edit never touches the
-	 * engine argv (the #102 contract until device_group/phase D) */
+	 * engine argv (a device_group BINDING does - it rides in the argv as
+	 * --filter-mark, #104 - and the Policies drawer badges it) */
 	var badgeCard = E('div', { 'class': 'wg-ad-panel' }, [
 		E('h3', {}, [ _('How sources apply') ])
 	]);
@@ -1580,7 +1593,7 @@ function buildSourcesView() {
 		label: _('Applies as a table re-render - the engine is NOT restarted, live connections stay up'),
 		title: _('A scope edit never changes the engine command line; apply re-applies the nft table only (verified to survive mid-transfer traffic)') }));
 	badgeCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
-		_('Each enabled group is desynchronized with the GLOBAL strategy until per-group strategies arrive (device group phase). The group mark is auto-assigned by enabled order - up to 15 groups.') ]));
+		_('Groups WITHOUT a bound policy are desynchronized with the GLOBAL strategy. Bind one via the Policies tab device group select - that binding rides in the engine argv and restarts the engine. The group mark is auto-assigned by enabled order - up to 15 groups.') ]));
 	badgeCard.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
 		_('0.0.0.0/0 is rejected by design: a blanket source would desync every LAN service including the packet-modification-incompatible ones (banking apps, some games). Use DHCP reservations for stable addresses.') ]));
 	frag.appendChild(badgeCard);
@@ -2833,11 +2846,12 @@ function renderProfiles() {
  * order), the global strategy catch-all last; first match wins. The
  * editor stages client-side through the uci client (the #82/#83/#85
  * lifecycle) and applies through the shared save -> apply(5) -> CLI apply
- * pipeline. Priority/order/action/protocol/ref/enabled edits drift the
- * engine argv -> the honest badge is a restart; name and device_group are
- * metadata (never in the argv). `device_group` is staged-future (#86):
- * stored and shown, ignored by the render - no client identity survives
- * in the queue (the foot-note says so). */
+ * pipeline. Priority/order/action/protocol/ref/enabled AND device-group
+ * edits drift the engine argv -> the honest badge is a restart; the name
+ * is metadata (never in the argv). `device_group` (issue #104, spike-95
+ * phase D) references a Sources-tab group: the block gains
+ * --filter-mark=<group mark>/0x1F000000, so the policy applies ONLY to
+ * that group's forward traffic - mihomo DIRECT stays with the catch-all. */
 
 var POLICY_ACTIONS = [ 'strategy', 'bypass', 'none' ];
 var POLICY_PROTOS = [ 'tcp', 'udp', 'quic' ];
@@ -2861,6 +2875,20 @@ function policiesModel() {
 		return {
 			sid: s['.name'],
 			name: (typeof s.name == 'string' && s.name.length) ? s.name : s['.name']
+		};
+	});
+	/* the device-group ref targets (#104): every source section with its
+	 * renderability - a disabled or empty group can never render a mark,
+	 * so it is not a legal ref target (the CLI dies named; the select
+	 * shows the state and the staging path blocks it) */
+	var sources = (uci.sections('wanguard-antidpi', 'source') || []).map(function(s) {
+		var nets = (Array.isArray(s.networks) ? s.networks : []).length;
+		var enabled = !(s.enabled === '0');
+		return {
+			sid: s['.name'],
+			label: ((typeof s.name == 'string' && s.name.length) ? s.name : s['.name']) +
+				(!enabled ? ' (disabled)' : (nets == 0 ? ' (no networks)' : '')),
+			renderable: enabled && nets > 0
 		};
 	});
 	var sections = (uci.sections('wanguard-antidpi', 'policy') || []).map(function(s) {
@@ -2903,6 +2931,7 @@ function policiesModel() {
 	return {
 		lists: lists,
 		profiles: profiles,
+		sources: sources,
 		sections: sections,
 		ordered: ordered,
 		rendered: rendered
@@ -2910,18 +2939,19 @@ function policiesModel() {
 }
 
 /* the derived argv key: the ENABLED policies in priority order, each block
- * identified by [action, list-ref, protocol, profile-ref] - the exact
- * mirror of what engine_argv renders (disabled policies render nothing,
- * the priority NUMBER itself is not in the argv, only the block ORDER is;
- * a same-content reorder therefore flips the key exactly like the engine
- * decision does) */
+ * identified by [action, list-ref, protocol, profile-ref, device-group-ref]
+ * - the exact mirror of what engine_argv renders (disabled policies render
+ * nothing, the priority NUMBER itself is not in the argv, only the block
+ * ORDER is; a same-content reorder therefore flips the key exactly like
+ * the engine decision does. The device-group ref rides in the argv as
+ * --filter-mark since #104 - a group change is argv drift = restart). */
 function policiesArgvKey(m) {
 	var parts = [];
 	m.ordered.forEach(function(p) {
 		if (!p.enabled)
 			return;
 		parts.push([ p.action, p.domainlist,
-			p.proto.slice().sort().join(','), p.profile ].join('|'));
+			p.proto.slice().sort().join(','), p.profile, p.device_group ].join('|'));
 	});
 	return parts.join('\u0001');
 }
@@ -2955,6 +2985,10 @@ function policiesValidateDraft(d, m) {
 		if (!m.profiles.some(function(p) { return p.sid == d.profile; }))
 			return _('The strategy profile does not exist - pick one from the Profiles tab.');
 	}
+	if (d.device_group && !m.sources.some(function(s) { return s.sid == d.device_group; }))
+		return _('The source group does not exist - pick one from the Sources tab.');
+	if (d.device_group && !m.sources.some(function(s) { return s.sid == d.device_group && s.renderable; }))
+		return _('The source group cannot render (disabled or has no networks) - enable it on the Sources tab first.');
 	return null;
 }
 
@@ -2977,6 +3011,12 @@ function policiesSetField(sid, field, value) {
 	else if (field == 'profile') {
 		if (!m.profiles.some(function(x) { return x.sid == value; }))
 			err = _('The strategy profile does not exist - pick one from the Profiles tab.');
+	}
+	else if (field == 'device_group') {
+		if (value != '' && !m.sources.some(function(s) { return s.sid == value; }))
+			err = _('The source group does not exist - pick one from the Sources tab.');
+		else if (value != '' && !m.sources.some(function(s) { return s.sid == value && s.renderable; }))
+			err = _('The source group cannot render (disabled or has no networks) - enable it on the Sources tab first.');
 	}
 	if (err != null) {
 		state.policies.errors[sid] = err;
@@ -3022,10 +3062,25 @@ function policiesSetName(sid, text) {
 	/* no re-render: the input keeps the focus while typing (the #85 rule) */
 }
 
-function policiesSetDeviceGroup(sid, text) {
-	uci.set('wanguard-antidpi', sid, 'device_group', text);
+/* the device-group ref (issue #104): validated BEFORE staging (the target
+ * must exist and be renderable - the CLI dies named otherwise), a group
+ * change drifts the engine argv (--filter-mark) = a restart */
+function policiesSetDeviceGroup(sid, value) {
+	var m = policiesModel();
+	var err = null;
+	if (value != '' && !m.sources.some(function(s) { return s.sid == value; }))
+		err = _('The source group does not exist - pick one from the Sources tab.');
+	else if (value != '' && !m.sources.some(function(s) { return s.sid == value && s.renderable; }))
+		err = _('The source group cannot render (disabled or has no networks) - enable it on the Sources tab first.');
+	if (err != null) {
+		state.policies.errors[sid] = err;
+		renderPolicies();
+		return;
+	}
+	delete state.policies.errors[sid];
+	uci.set('wanguard-antidpi', sid, 'device_group', value);
 	policiesMarkDirty();
-	/* no re-render (typing) */
+	renderPolicies();
 }
 
 function policiesSetPriority(sid, text) {
@@ -3317,6 +3372,12 @@ function policiesRow(m, p) {
 		matchCell.appendChild(E('span', { 'class': 'wg-ad-chip wg-ad-chip-muted' },
 			[ t.toUpperCase() ]));
 	});
+	/* the device-group chip (#104): the block is filter-mark scoped to the
+	 * group - visible straight from the table, not buried in the drawer */
+	if (p.device_group)
+		matchCell.appendChild(E('span', { 'class': 'wg-ad-chip wg-ad-chip-muted',
+			title: _('Applies only to this source group forward traffic (--filter-mark)') },
+			[ '@' + p.device_group ]));
 	tr.appendChild(matchCell);
 	tr.appendChild(E('td', {}, [ policiesStrategyCellText(p, m) ]));
 	/* state: the honest enabled badge (staged flips show immediately) */
@@ -3408,28 +3469,24 @@ function policiesEditorPanel(m) {
 	nameInput.value = nameVal();
 	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [ nameInput ]));
 
-	/* device group (staged-future: stored and shown, ignored by the render) */
+	/* device group (issue #104, spike-95 phase D): a ref to a Sources-tab
+	 * group - the block gains --filter-mark=<mark>/0x1F000000, so the edit
+	 * drifts the engine argv = a restart (honestly badged). The select
+	 * lists every section with its renderability; an unrenderable target
+	 * never stages (the CLI mirror). */
 	var dgVal = isNew
 		? function() { return state.policies.draft.device_group; }
-		: function() { return state.policies.inputs[p.sid + '.dg'] || p.device_group; };
-	var dgInput = E('input', {
-		'type': 'text',
-		'placeholder': _('Device group (optional)'),
-		'input': function(ev) {
-			if (isNew)
-				state.policies.draft.device_group = ev.target.value;
-			else {
-				state.policies.inputs[p.sid + '.dg'] = ev.target.value;
-				policiesSetDeviceGroup(p.sid, ev.target.value);
-			}
-		}
-	});
-	dgInput.value = dgVal();
-	panel.appendChild(E('div', { 'class': 'wg-ad-addrow' }, [
-		dgInput,
-		chipEl({ cls: 'wg-ad-chip-muted', label: _('stored, ignored by the current render'),
-			title: _('Staged-future: the field is kept in UCI for group targeting when the queue learns client identity') })
-	]));
+		: function() { return p.device_group; };
+	var dgPick = isNew
+		? function(v) { state.policies.draft.device_group = v; renderPolicies(); }
+		: function(v) { policiesSetDeviceGroup(p.sid, v); };
+	panel.appendChild(policiesSelectField(_('Device group (forward-source)'),
+		dgVal(), m.sources, dgPick, true, _('No group (mihomo scope only)')));
+	panel.appendChild(chipEl(dgVal()
+		? { cls: 'wg-ad-chip-warn', label: _('Group targeted - apply restarts the engine'),
+			title: _('The block gains --filter-mark: the policy applies only to that group forward traffic; mihomo DIRECT stays with the catch-all') }
+		: { cls: 'wg-ad-chip-muted', label: _('No group - mihomo scope only'),
+			title: _('The policy matches the mihomo DIRECT scope; pick a source group to target LAN-forward traffic') }));
 
 	/* domain list select (the match scope) */
 	var listPick = isNew
@@ -3617,7 +3674,7 @@ function buildPoliciesView() {
 	});
 	list.appendChild(table);
 	list.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
-		_('Device groups are identifiers for future group targeting; mihomo DIRECT filtering does not preserve client identity.')
+		_('A device group targets the policy at one source group forward traffic (--filter-mark, the Sources tab); mihomo DIRECT traffic always stays with the catch-all.')
 	]));
 	list.appendChild(E('p', { 'class': 'wg-ad-hint' }, [
 		_('Order = priority (lower first); the first matching policy wins. Drag rows to reorder or use the row menu arrows. Order/action changes need an engine restart; domain list CONTENT edits apply via reload.')
@@ -3629,8 +3686,8 @@ function buildPoliciesView() {
 	if (panel != null)
 		frag.appendChild(panel);
 
-	/* apply block: the honest badges (order/action/proto/ref/enabled edits
-	 * drift the engine argv -> restart; name/device_group are metadata;
+	/* apply block: the honest badges (order/action/proto/ref/group/enabled
+	 * edits drift the engine argv -> restart; the name is metadata;
 	 * staged domain-list content edits from the Domain lists tab ride the
 	 * same apply via reload) */
 	var applyCard = E('div', { 'class': 'wg-ad-panel' }, [
@@ -3642,11 +3699,11 @@ function buildPoliciesView() {
 		if (argvChanged)
 			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-warn',
 				label: _('Policy order or actions changed - apply restarts the engine'),
-				title: _('Policy blocks ride in the engine argv: order/action/protocol/ref/enabled changes need a restart to take effect') }));
+				title: _('Policy blocks ride in the engine argv: order/action/protocol/ref/group/enabled changes need a restart to take effect') }));
 		else {
 			applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
 				label: _('Metadata only - the engine stays untouched'),
-				title: _('Name and device-group edits do not appear in the engine argv') }));
+				title: _('Name-only edits do not appear in the engine argv') }));
 			if (state.domains.dirty)
 				applyCard.appendChild(chipEl({ cls: 'wg-ad-chip-ok',
 					label: _('Domain list edits apply via reload - live connections stay up'),
