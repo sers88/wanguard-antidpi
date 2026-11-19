@@ -31,6 +31,8 @@
 #   [5c] whitelist mode flip on -> restart again, hostlist back
 #   [5d] tunnel pin add/remove -> set + --ipset-exclude-ip rebuilt (#83)
 #   [5e] profile strategy edit -> restart, profile words in /proc cmdline (#84)
+#   [5f] source section add -> nft re-apply, engine no-op; blanket source
+#        dies in the preflight, --check names it (#102)
 #   [6]  --check all green (+ --json ok:true, engine pid present)
 #   [7]  --check catches a missing hostlist file
 #   [8]  --check catches a foreign routing-mark
@@ -319,6 +321,49 @@ run OUT RC "$CLI" apply
 [ "$RC" = 0 ] || fail "legacy-restore apply exited $RC: $OUT"
 assert_out 'engine: restarted' "$OUT"
 echo "PROFILE-RESTART-OK (profile strategy change = restart, no-op after, legacy flip = restart)"
+
+# ---- [5f] source sections: a nft-only change (issue #102) ----
+# A scope edit re-applies the table; the engine argv carries no source words
+# until device_group (phase D), so the engine MUST NOT restart (spike #95
+# P6: the re-apply even survives mid-transfer). A broken source must die in
+# the preflight, before any mutation.
+echo "== [5f] source add -> table re-apply, engine no-op"
+P=$(epid)
+[ -n "$P" ] || fail "expected a live engine before the source scenarios"
+uci set wanguard-antidpi.lan_a=source
+uci set wanguard-antidpi.lan_a.enabled='1'
+uci add_list wanguard-antidpi.lan_a.networks='198.51.100.0/24'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "source-add apply exited $RC: $OUT"
+assert_out 'engine: no-op' "$OUT"
+assert_out 'apply: nft: applied' "$OUT"
+[ "$(epid)" = "$P" ] || fail "a source add restarted the engine (pid changed) - scope edits must be table-only"
+nft list set inet wanguard_antidpi src_lan_a >/dev/null 2>&1 \
+	|| fail "source-add apply did not render the source set"
+# preflight: blanket source -> exit 1 BEFORE any mutation
+uci add_list wanguard-antidpi.lan_a.networks='0.0.0.0/0'
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 1 ] || fail "expected exit 1 on a blanket source (got $RC): $OUT"
+assert_out 'rejected by design' "$OUT"
+nft list table inet wanguard_antidpi >/dev/null 2>&1 || fail "the failed apply dropped the live table"
+nft list set inet wanguard_antidpi src_lan_a >/dev/null 2>&1 || fail "the failed apply disturbed the rendered table"
+[ "$(epid)" = "$P" ] || fail "the failed apply disturbed the engine"
+# --check names the reason (the nft item captures the render stderr)
+run OUT RC "$CLI" apply --check
+[ "$RC" = 1 ] || fail "expected --check exit 1 on a blanket source (got $RC)"
+assert_out 'check: nft: FAILED' "$OUT"
+assert_out 'rejected by design' "$OUT"
+uci del_list wanguard-antidpi.lan_a.networks='0.0.0.0/0'
+uci delete wanguard-antidpi.lan_a
+uci commit wanguard-antidpi
+run OUT RC "$CLI" apply
+[ "$RC" = 0 ] || fail "source-cleanup apply exited $RC: $OUT"
+assert_out 'engine: no-op' "$OUT"
+nft list set inet wanguard_antidpi src_lan_a >/dev/null 2>&1 \
+	&& fail "a removed source set survived the apply" || :
+echo "SOURCE-APPLY-OK (scope edit = table re-apply only, engine pid $P untouched, blanket preflight rejected)"
 
 # ---- [6] --check all green ----
 echo "== [6] --check all green"

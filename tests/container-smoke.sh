@@ -264,6 +264,110 @@ out=$("$CLI" nft-render)
 [ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "1" ] \
 	|| fail "nft-render: config not pristine after the tunnel-section test"
 
+# ---- forward-source scope (issue #102, spike #95 phase B) ----
+# The golden above (2 queue rules, 1 elements line) must hold without source
+# sections. Named `config source` sections render their own set + a tcp/udp
+# rule pair each; marks are auto-assigned by enabled order; disabled
+# sections render nothing.
+uci set wanguard-antidpi.lan_a=source
+uci set wanguard-antidpi.lan_a.name='Group A'
+uci set wanguard-antidpi.lan_a.enabled='1'
+uci add_list wanguard-antidpi.lan_a.networks='198.51.100.0/24'
+uci add_list wanguard-antidpi.lan_a.networks='203.0.113.0/24'
+uci set wanguard-antidpi.lan_b=source
+uci set wanguard-antidpi.lan_b.enabled='1'
+uci add_list wanguard-antidpi.lan_b.networks='192.0.2.0/26'
+uci set wanguard-antidpi.lan_off=source
+uci set wanguard-antidpi.lan_off.enabled='0'
+uci add_list wanguard-antidpi.lan_off.networks='203.0.113.0/24'
+uci commit wanguard-antidpi
+out=$("$CLI" nft-render)
+[ "$(printf '%s\n' "$out" | grep -c 'queue num 300 bypass')" = "6" ] \
+	|| fail "source render: expected 6 queue rules (2 mihomo + a tcp/udp pair per enabled source)"
+[ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "3" ] \
+	|| fail "source render: expected 3 elements lines (local_v4 + two source sets; a disabled section must not render)"
+case "$out" in
+	*"set src_lan_a"*"elements = { 198.51.100.0/24, 203.0.113.0/24 }"*) ;;
+	*) fail "source render: lan_a set missing or its network list got reordered" ;;
+esac
+[ "$(printf '%s\n' "$out" | grep -c 'meta mark set 0x01000000')" = "2" ] \
+	|| fail "source render: group mark 1 must ride on both lan_a rules"
+[ "$(printf '%s\n' "$out" | grep -c 'meta mark set 0x02000000')" = "2" ] \
+	|| fail "source render: group mark 2 must ride on both lan_b rules"
+printf '%s\n' "$out" | grep -q 'src_lan_off' \
+	&& fail "source render: a disabled section leaked into the render" || :
+case "$out" in
+	*"ip saddr @src_lan_a"*"tcp dport 443 ct original packets 1-20"*) ;;
+	*) fail "source render: tcp connbytes cap missing on the source rules" ;;
+esac
+case "$out" in
+	*"ip saddr @src_lan_b"*"udp dport 443 ct original packets 1-5"*) ;;
+	*) fail "source render: udp connbytes cap missing on the source rules" ;;
+esac
+case "$out" in
+	*"ip saddr @src_lan_a"*"ip daddr != @local_v4"*"ip daddr != @proxy_servers"*) ;;
+	*) fail "source render: source rules lost the tunnel/local exclusions" ;;
+esac
+[ "$out" = "$("$CLI" nft-render)" ] || fail "source render not deterministic"
+# a queue verdict is terminal: source rules must come AFTER the mihomo rules
+if [ "$(printf '%s\n' "$out" | grep -n 'ip saddr @src_lan_a' | head -n 1 | cut -d: -f1)" -le \
+	"$(printf '%s\n' "$out" | grep -n 'meta mark & 0x10000000 == 0x10000000' | head -n 1 | cut -d: -f1)" ]; then
+	fail "source rules must render AFTER the mihomo rules"
+fi
+# status surface carries the scope key (full matrix: tests/test-status.sh)
+"$CLI" status --json | grep -q '"scope"' || fail "status --json lost the scope key"
+
+# guard: 0.0.0.0/0 rejected loudly (owner decision - blanket desync breaks
+# packet-modification-incompatible services; spike #95 verdict)
+uci add_list wanguard-antidpi.lan_a.networks='0.0.0.0/0'
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>/tmp/src.err \
+	&& fail "source render accepted 0.0.0.0/0"
+grep -q 'rejected by design' /tmp/src.err || fail "the 0.0.0.0/0 guard message lost"
+uci del_list wanguard-antidpi.lan_a.networks='0.0.0.0/0'
+# guard: duplicate networks across enabled sections (ambiguous first-match)
+uci add_list wanguard-antidpi.lan_b.networks='198.51.100.0/24'
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>/tmp/src.err \
+	&& fail "source render accepted a cross-section duplicate network"
+grep -q 'already claimed' /tmp/src.err || fail "the duplicate guard message lost"
+uci del_list wanguard-antidpi.lan_b.networks='198.51.100.0/24'
+# guard: malformed entry
+uci add_list wanguard-antidpi.lan_b.networks='192.0.2.0/33'
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>&1 \
+	&& fail "source render accepted a malformed network (/33)"
+uci del_list wanguard-antidpi.lan_b.networks='192.0.2.0/33'
+# guard: the 15-group mark budget
+i=0
+while [ $i -lt 15 ]; do
+	uci set wanguard-antidpi.pad$i=source
+	uci set wanguard-antidpi.pad$i.enabled='1'
+	uci add_list wanguard-antidpi.pad$i.networks="10.$i.0.0/24"
+	i=$((i + 1))
+done
+uci commit wanguard-antidpi
+"$CLI" nft-render >/dev/null 2>/tmp/src.err \
+	&& fail "source render accepted 17 enabled sources (15-mark budget)"
+grep -q 'enabled source sections' /tmp/src.err || fail "the mark-budget guard message lost"
+i=0
+while [ $i -lt 15 ]; do uci delete wanguard-antidpi.pad$i; i=$((i + 1)); done
+uci commit wanguard-antidpi
+out=$("$CLI" nft-render)
+[ "$(printf '%s\n' "$out" | grep -c 'queue num 300 bypass')" = "6" ] \
+	|| fail "the guard cleanup broke the source render"
+# cleanup: back to the pristine golden for the following sections
+uci delete wanguard-antidpi.lan_a
+uci delete wanguard-antidpi.lan_b
+uci delete wanguard-antidpi.lan_off
+uci commit wanguard-antidpi
+out=$("$CLI" nft-render)
+[ "$(printf '%s\n' "$out" | grep -c 'queue num 300 bypass')" = "2" ] \
+	|| fail "source cleanup did not restore the golden render"
+[ "$(printf '%s\n' "$out" | grep -c 'elements = ')" = "1" ] \
+	|| fail "source cleanup left rendered set elements behind"
+echo "SOURCE-SCOPE-OK (sets, marks, caps, order, guards, golden restore)"
+
 # ---- tunnel resolver updater (issue #62): structural here; the live matrix
 # ---- (stub DNS answers + real table state) is tests/test-tunnel.sh
 out=$("$CLI" tunnel-update)
