@@ -486,27 +486,31 @@ Semantics and guardrails:
 - Tunnel/proxy exclusions stay ABOVE every policy: the nft set and the
   engine `--ipset-exclude-ip` still fire first - only mihomo DIRECT traffic
   is ever eligible for desync or bypass.
-- `option device_group` is stored for future group targeting and ignored by
-  the current render (no client identity survives in the queue).
-- A policy argv change (add/remove/order/action/filters) needs an engine
-  restart; editing a list's DOMAINS only needs `whitelist-reload` (SIGHUP
-  re-reads the file content).
+- `option device_group` targets the policy at ONE source group's forward
+  traffic (issue #104): the block gains `--filter-mark=<group mark>` and
+  the engine applies it only to that group - mihomo DIRECT traffic always
+  stays with the catch-all. The ref must point at a rendered group
+  (missing/disabled/empty targets die the render loudly).
+- A policy argv change (add/remove/order/action/filters/group) needs an
+  engine restart; editing a list's DOMAINS only needs `whitelist-reload`
+  (SIGHUP re-reads the file content).
 
 Status: `wanguard-antidpi status` carries `engine.policies` (rendered block
 count) and `engine.policy_sections` (id/name/priority/domainlist/proto/
-action/profile/enabled) for the LuCI page.
+action/profile/device_group/group_mark/enabled) for the LuCI page.
 
 The LuCI page (Network -> WAN Guard -> Anti-DPI -> Policies, issue #87)
 manages the same sections: the Processing policies table (Priority / Match /
 Strategy / State columns, drag-to-reorder with row-menu arrow fallback -
 reorders renumber priorities in the step-10 convention), an Edit-policy
-drawer (name, device group - stored but ignored by the render until the
-queue learns client identity, domain list, protocols, action, strategy
-profile, advanced priority override), inline validation before staging
-(unknown list/profile refs are named errors, never staged), and honest
-apply badges: order/action/protocol/ref/enabled edits restart the engine,
-name/device-group edits are metadata-only, and domain-list content edits
-apply via reload (SIGHUP). Referenced domain lists cannot be deleted from
+drawer (name, device group select over the Sources-tab groups with the
+honest restart badge, domain list, protocols, action, strategy profile,
+advanced priority override), inline validation before staging
+(unknown list/profile/group refs are named errors, never staged), and
+honest apply badges: order/action/protocol/ref/group/enabled edits restart
+the engine, name-only edits are metadata-only, and domain-list content
+edits apply via reload (SIGHUP). Referenced domain lists cannot be deleted
+from
 the Domain lists tab until the policies referencing them are unlinked.
 
 ## LAN forward sources (issue #102)
@@ -533,17 +537,18 @@ Rules of the road:
 - **Auto marks.** Each enabled section gets a group mark in the free nibble
   `0x01000000..0x0F000000` by section order (15 groups; mark map in
   docs/ARCHITECTURE.md). The mark rides on the same rule that issues the
-  queue verdict - it is the future enforcement point for per-group
-  strategies (device_group phase D), not a user knob.
-- **Apply is a table re-apply.** The engine argv does not depend on sources
-  (until phase D), so a scope edit never restarts the engine and live
-  connections survive. `wanguard-antidpi apply` validates the whole render
-  BEFORE touching anything (a bad source exits 1 without mutations).
+  queue verdict - it is the per-group enforcement point
+  (`policy.device_group`, issue #104), not a user knob.
+- **Apply is a table re-apply.** A scope edit never restarts the engine and
+  live connections survive. `wanguard-antidpi apply` validates the whole
+  render BEFORE touching anything (a bad source exits 1 without mutations).
 - **Observability.** `wanguard-antidpi status --json` carries a `scope`
   key: every section with its networks, auto mark and live per-source nft
   counters. The LuCI page surfaces the same data (Sources tab).
-- **Engine strategies are per-profile, not per-source** until device_group
-  lands: every group is desynchronized with the global strategy.
+- **Per-group strategies** bind a policy to a group: `policy.device_group`
+  renders `--filter-mark=<mark>/0x1F000000`, so the policy applies ONLY to
+  that group's forward traffic (a group edit restarts the engine). Groups
+  WITHOUT a bound policy get the global strategy (the catch-all).
 
 ## Operations
 

@@ -37,11 +37,12 @@
  *   - #86/#87 Policies: table (priority/match/strategy/state, drag +
  *     fallback arrows with step-10 renumbering), edit drawer (ref
  *     validation BEFORE staging - bogus list/profile never stage, last
- *     -protocol guard, advanced manual priority, device-group staged
- *     -future badge), New policy draft validation, search filter,
- *     metadata-only vs restart badges, cross-tab reload chip, two-step
- *     delete + discard, the domains-tab guard protecting referenced
- *     lists, honest "N rendered" from the status document.
+ *     -protocol guard, advanced manual priority, device-group #104
+ *     targeting: renderable-group refs only, group select, argv-drift
+ *     restart badge, @group match chip), New policy draft validation,
+ *     search filter, metadata-only vs restart badges, cross-tab reload
+ *     chip, two-step delete + discard, the domains-tab guard protecting
+ *     referenced lists, honest "N rendered" from the status document.
  *   - #88 Tests & Logs: queue counters with the per-tick delta (patched
  *     without rebuilding the tab DOM), debug toggle (staged flip ->
  *     restart badge -> shared apply pipeline, reversible + idempotent),
@@ -1075,8 +1076,9 @@ suite('#103 sources: scope chip, honest notice, validation, staging lifecycle, t
 	ok('panel: live counters row', texts().includes('0 tcp / 0 udp packet(s)'), texts());
 	ok('honest badge: table re-render, engine NOT restarted',
 		texts().includes('Applies as a table re-render - the engine is NOT restarted, live connections stay up'));
-	ok('honest badge: global-strategy hint (device group phase)',
-		texts().includes('desynchronized with the GLOBAL strategy'));
+	ok('honest badge: global-strategy hint + the #104 binding path',
+		texts().includes('desynchronized with the GLOBAL strategy') &&
+		texts().includes('Bind one via the Policies tab device group select'));
 	ok('honest badge: blanket guard hint', texts().includes('0.0.0.0/0 is rejected by design'));
 	ok('apply block: no unsaved edits hint', texts().includes('No unsaved edits.'));
 	ok('apply button disabled when clean', btn('Apply changes') != null &&
@@ -1268,6 +1270,41 @@ suite('#103 sources: budget guard on the 16th rendered group', async () => {
 		UCI.state.changes['wanguard-antidpi'].lan_empty != null &&
 		UCI.state.changes['wanguard-antidpi'].lan_empty.enabled === '1');
 	ok('dirty flag set by the empty-group enable', ad.state.sources.dirty === true);
+});
+
+suite('#104 sources: the policy-ref delete guard', async () => {
+	SERVER = freshServer();
+	UCI = makeUci(SERVER);
+	SERVER.committed['wanguard-antidpi'].lan_main = { '.type': 'source', name: 'Main LAN',
+		enabled: '1', networks: [ '192.168.1.0/24' ] };
+	SERVER.committed['wanguard-antidpi'].pol_media = { '.type': 'policy', name: 'Video traffic',
+		priority: '10', domainlist: 'list_media', proto: 'tcp', action: 'bypass',
+		profile: '', device_group: 'lan_main', enabled: '1' };
+
+	RPC.routes['file.exec'] = (cmd, args) => {
+		if (args[0] === 'status')
+			return Promise.resolve({ code: 0,
+				stdout: JSON.stringify(Object.assign(JSON.parse(STATUS({})), {
+					scope: { enabled: true, sources: [ { id: 'lan_main', name: 'Main LAN',
+						enabled: true, networks: [ '192.168.1.0/24' ], mark: '0x01000000',
+						counters: { tcp: { packets: 0, bytes: 0 }, udp: { packets: 0, bytes: 0 } } } ] }
+				})), stderr: '' });
+		return Promise.resolve({ code: 2, stdout: '', stderr: 'unexpected' });
+	};
+
+	ad = loadCore();
+	v = loadView(ad);
+	await v.load();
+	v.render();
+	await ad.refresh(); ad.update();
+	ad.switchTab('sources');
+	await tick(); await tick();
+	click(findAll(ad.state.bodyNode, (n) => n.tag === 'button' && flat(n) === 'Delete group')[0]);
+	await tick();
+	ok('delete of a referenced group is refused with the named guard',
+		texts().includes('Referenced by 1 policy(s) - unlink them first.'), texts());
+	ok('delete NOT armed', btn('Confirm delete') == null);
+	ok('nothing staged by the refused delete', Object.keys(SERVER.staged).length === 0);
 });
 
 /* ==================== #83: Tunnel protection ==================== */
@@ -1905,7 +1942,11 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 			strategy_words: [ '--filter-tcp=443', '--payload=tls_client_hello', '--lua-desync=multisplit:pos=midsld' ] },
 		pol_media: { '.type': 'policy', name: 'Video traffic', priority: '10',
 			domainlist: 'list_media', proto: 'tcp', action: 'bypass', profile: '',
-			device_group: '', enabled: '1' }
+			device_group: '', enabled: '1' },
+		lan_main: { '.type': 'source', name: 'Main LAN', enabled: '1',
+			networks: [ '192.168.1.0/24' ] },
+		lan_off: { '.type': 'source', name: 'Off group', enabled: '0',
+			networks: [ '198.51.100.0/24' ] }
 	});
 	UCI = makeUci(SERVER);
 
@@ -1947,8 +1988,8 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 		texts().includes('Strategy') && texts().includes('State'), texts());
 	ok('search input', inputByPh('Search policies') != null);
 	ok('Add policy button', btn('Add policy') != null);
-	ok('device-group foot-note (concept text)', texts().includes(
-		'Device groups are identifiers for future group targeting; mihomo DIRECT filtering does not preserve client identity.'), texts());
+	ok('device-group foot-note (the #104 targeting line)', texts().includes(
+		'A device group targets the policy at one source group forward traffic'), texts());
 	ok('order hint mentions the restart/reload split', texts().includes('Order = priority (lower first)'), texts());
 
 	const row0 = polRows()[0];
@@ -1996,16 +2037,36 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 		drawerRow('Protocols (block filters):').attrs.class.indexOf('wg-ad-formrow') >= 0 &&
 		drawerRow('Protocols (block filters):').attrs.class.indexOf('wg-ad-chips') < 0,
 		drawerRow('Protocols (block filters):') && drawerRow('Protocols (block filters):').attrs.class);
-	ok('device-group staged-future badge', texts().includes('stored, ignored by the current render'), texts());
-	ok('two selects without strategy (list + action)', selects().length === 2, selects().length);
+	ok('device-group chip: no group selected (honest mihomo-scope-only)', texts().includes('No group - mihomo scope only'), texts());
+	ok('three selects always (group + list + action)', selects().length === 3, selects().length);
+	ok('group select lists source sections with state', findAll(selects()[0], (o) => o.tag === 'option')
+		.map(flat).join('|').includes('Off group (disabled)'), texts());
 	/* bogus refs: validated BEFORE staging (the issue criterion) */
-	fire(selects()[0], 'change', { target: { value: 'list_nope' } });
+	fire(selects()[0], 'change', { target: { value: 'lan_nope' } });
+	await tick();
+	ok('missing group = inline error', texts().includes('The source group does not exist'), texts());
+	ok('bogus group ref NOT staged', uciGet('pol_media', 'device_group') === '', uciGet('pol_media', 'device_group'));
+	fire(selects()[0], 'change', { target: { value: 'lan_off' } });
+	await tick();
+	ok('unrenderable group (disabled) refused with the named reason',
+		texts().includes('The source group cannot render'), texts());
+	ok('unrenderable group ref NOT staged', uciGet('pol_media', 'device_group') === '');
+	fire(selects()[1], 'change', { target: { value: 'list_nope' } });
 	await tick();
 	ok('missing list = inline error', texts().includes('The domain list does not exist'), texts());
 	ok('bogus list ref NOT staged', uciGet('pol_media', 'domainlist') === 'list_media', uciGet('pol_media', 'domainlist'));
-	/* device group staging */
-	type(inputByPh('Device group (optional)'), 'lobby');
-	ok('device group staged (metadata)', uciGet('pol_media', 'device_group') === 'lobby', uciGet('pol_media', 'device_group'));
+	/* device group staging through the select (#104): argv drift = restart */
+	fire(selects()[0], 'change', { target: { value: 'lan_main' } });
+	await tick();
+	ok('renderable group staged', uciGet('pol_media', 'device_group') === 'lan_main', uciGet('pol_media', 'device_group'));
+	ok('group targeted chip + restart badge', texts().includes('Group targeted - apply restarts the engine') &&
+		texts().includes('Policy order or actions changed - apply restarts the engine'), texts());
+	ok('row match cell carries the group chip', texts().includes('@lan_main'), texts());
+	fire(selects()[0], 'change', { target: { value: '' } });
+	await tick();
+	ok('group cleared -> metadata-only badge back (name is the only metadata)',
+		uciGet('pol_media', 'device_group') === '' &&
+		texts().includes('Metadata only - the engine stays untouched'), texts());
 	/* advanced collapse: manual priority */
 	ok('Advanced collapse button', btn('Advanced') != null);
 	click(btn('Advanced'));
@@ -2040,15 +2101,15 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 	click(protoBtn('UDP'));
 	await tick();
 	/* action -> strategy: the profile select appears, refs validated */
-	fire(selects()[1], 'change', { target: { value: 'strategy' } });
+	fire(selects()[2], 'change', { target: { value: 'strategy' } });
 	await tick();
-	ok('strategy action reveals the profile select (3 selects)', selects().length === 3, selects().length);
+	ok('strategy action reveals the profile select (4 selects)', selects().length === 4, selects().length);
 	ok('strategy without profile = inline hint', texts().includes('Strategy policies need a strategy profile.'), texts());
-	fire(selects()[2], 'change', { target: { value: 'prof_nope' } });
+	fire(selects()[3], 'change', { target: { value: 'prof_nope' } });
 	await tick();
 	ok('missing profile = inline error', texts().includes('The strategy profile does not exist'), texts());
 	ok('bogus profile ref NOT staged', uciGet('pol_media', 'profile') === '', uciGet('pol_media', 'profile'));
-	fire(selects()[2], 'change', { target: { value: 'prof_split' } });
+	fire(selects()[3], 'change', { target: { value: 'prof_split' } });
 	await tick();
 	ok('valid profile staged', uciGet('pol_media', 'profile') === 'prof_split', uciGet('pol_media', 'profile'));
 	ok('profile hint gone', texts().includes('Strategy policies need a strategy profile.') === false);
@@ -2070,15 +2131,15 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 	click(btn('Create policy'));
 	await tick();
 	ok('missing list rejected on create', texts().includes('The domain list does not exist'), texts());
-	fire(selects()[0], 'change', { target: { value: 'list_media' } });
+	fire(selects()[1], 'change', { target: { value: 'list_media' } });
 	await tick();
-	fire(selects()[1], 'change', { target: { value: 'strategy' } });
+	fire(selects()[2], 'change', { target: { value: 'strategy' } });
 	await tick();
 	click(btn('Create policy'));
 	await tick();
 	ok('strategy draft without profile rejected', texts().includes('Strategy policies need a strategy profile.'), texts());
 	ok('still nothing staged', stagedPolSids().length === 1, stagedPolSids());
-	fire(selects()[2], 'change', { target: { value: 'prof_split' } });
+	fire(selects()[3], 'change', { target: { value: 'prof_split' } });
 	await tick();
 	click(btn('Create policy'));
 	await tick();
@@ -2113,7 +2174,7 @@ suite('#86/#87 policies: table, drawer refs, drag, badges, guards', async () => 
 		conf1.pol_media.priority === '20', { chat: conf1.pol_chat_domains.priority, media: conf1.pol_media.priority });
 	ok('committed strategy fields', conf1.pol_chat_domains.action === 'strategy' &&
 		conf1.pol_chat_domains.profile === 'prof_split' && conf1.pol_media.proto === 'udp' &&
-		conf1.pol_media.device_group === 'lobby');
+		conf1.pol_media.device_group === '');
 	/* apply ran the whole chain: dirty reset + editor reset; the CLI's
 	 * status reads committed truth (the dynamic stub), the config-change
 	 * flag rebuilds the editor tab - the chip is fresh right away */

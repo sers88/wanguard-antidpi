@@ -151,6 +151,11 @@ config whitelist 'whitelist'
 #	option priority '10'
 #	option domainlist 'list_media'
 #	option proto 'tcp quic'
+#	# optional: bind the policy to ONE forward-source group (the section
+#	# name from a `config source` block); the block then carries
+#	# --filter-mark=<group mark> and applies only to that group's traffic
+#	# (mihomo DIRECT stays with the catch-all). The target must render:
+#	# missing/disabled/empty groups fail the render loudly (issue #104).
 #	option device_group ''
 #	option action 'bypass'
 #	option profile ''
@@ -177,9 +182,14 @@ config whitelist 'whitelist'
 #   - duplicate networks across enabled sections are rejected (the first
 #     match would silently win).
 #
-# Until per-group strategies land (device_group, phase D) every source group
-# is desynchronized with the GLOBAL strategy. Apply is a table re-apply: the
-# engine does NOT restart and live connections survive.
+# Per-group strategies: bind a `config policy` to this group via
+# `option device_group '<sid>'` - the policy block then carries
+# --filter-mark=<group mark> and applies only to this group's forward
+# traffic. Groups WITHOUT a bound policy get the global strategy.
+#
+# Apply is a table re-apply: the engine does NOT restart and live
+# connections survive (a device_group binding is the exception - it rides
+# in the engine argv, so binding/unbinding a group restarts the engine).
 #
 #config source 'lan_main'
 #	option name 'Main LAN'
