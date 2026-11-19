@@ -146,13 +146,20 @@ hooks only prerouting). Sets:
   queue - which is safe only while the engine strategy is empty (graceful
   no-op). Do not enable desync strategies before the exclusion set is
   populated.
+- `src_<sid>` - one interval set per enabled `config source` section
+  (#102, 3.6): the forward-source scope. Each set backs a tcp/udp rule
+  pair rendered AFTER the mihomo rules (first match wins, so the mihomo
+  scope can never be pre-empted) that issues the queue verdict and stamps
+  the section's auto group mark - the `policy.device_group` enforcement
+  point (see 3.6).
 
 Verification contract: `tests/test-nft.sh` (live, NET_ADMIN container,
 real pinned mihomo as the marked traffic source): apply shape, re-apply
 byte-identical (idempotent), BYPASS (engine down -> traffic flows, rule
 counter ticks), engine bind (traffic flows through the bound queue), scope
 negatives (direct and unmarked-mihomo fetches never tick the counters),
-flush + re-apply. When the host kernel lacks NFQUEUE the script stays
+forward-source scope ([7], 3.6), flush + re-apply. When the host kernel
+lacks NFQUEUE the script stays
 structural (`NFT-LIVE-SKIP`) and the live matrix is router-acceptance-only.
 `tests/container-smoke.sh` asserts the rendered shape (priority, connbytes,
 both exclusions, counters, empty `proxy_servers`, filled-UCI render, merged
