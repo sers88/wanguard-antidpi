@@ -159,6 +159,65 @@ jobs:
             openwrt/rootfs:x86_64-25.12.6 \
             sh /tests/test-nft.sh
 
+  forward-test:
+    name: Matrix - forward-source scope behind SNAT (two containers, NET_ADMIN)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: out
+
+      # test-nft.sh [7] probes the source match on LOCAL output (never
+      # SNAT'ed), which is exactly the blind spot that let #102's render
+      # ship inert on the live router (#107: fw4 masquerade at priority
+      # srcnat precedes the egress hook at srcnat+1, so ip saddr only ever
+      # saw the WAN address). This stand rebuilds the real order: a router
+      # container forwards + masquerades client traffic from a second
+      # container through the fw4 slot, and tests/test-forward.sh asserts
+      # the scope discriminates on the post-SNAT path.
+      - name: SNAT-forward probe (client -> router -> WAN, issue #107 stand)
+        run: |
+          set -eu
+          docker network create --subnet 192.168.77.0/24 --gateway 192.168.77.1 lantest
+          # router: default bridge first (eth0 = WAN, default route), then the LAN attach (eth1);
+          # ip_forward must come from the start - /proc/sys is read-only inside the container
+          docker run -d --name antidpi-fw-router --cap-add NET_ADMIN \
+            --network bridge \
+            --sysctl net.ipv4.ip_forward=1 \
+            -v "$PWD/out:/out:ro" \
+            -v "$PWD/tests:/tests:ro" \
+            openwrt/rootfs:x86_64-25.12.6 sleep 900
+          docker network connect --ip 192.168.77.2 lantest antidpi-fw-router
+          # client: LAN-only, default route replaced to point at the router
+          docker run -d --name antidpi-fw-client --cap-add NET_ADMIN \
+            --network lantest --ip 192.168.77.3 \
+            openwrt/rootfs:x86_64-25.12.6 sleep 900
+          docker exec antidpi-fw-client ip route del default
+          docker exec antidpi-fw-client ip route add default via 192.168.77.2
+          # backgrounded probe loop: every curl is a fresh TLS connection
+          # forwarded through the router (the router polls the masquerade
+          # counter, so the cold client `apk add curl` is covered)
+          docker exec -d antidpi-fw-client sh -c \
+            'apk add curl >/dev/null 2>&1; while true; do curl -s -m 20 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace; sleep 3; done'
+          docker exec antidpi-fw-router sh /tests/test-forward.sh eth0 eth1 192.168.77.3 192.168.77.0/24
+
+      - name: Dump stand state on failure
+        if: failure()
+        run: |
+          docker exec antidpi-fw-router sh -c 'echo "== ip_forward:"; cat /proc/sys/net/ipv4/ip_forward; echo "== router addresses:"; ip addr show; echo "== antidpi table:"; nft list table inet wanguard_antidpi 2>/dev/null; echo "== fwdprobe table:"; nft list table inet fwdprobe 2>/dev/null; echo "== uci:"; uci show wanguard-antidpi 2>/dev/null' || true
+          docker exec antidpi-fw-client sh -c 'echo "== client routes:"; ip route; echo "== client probe (curl present?):"; command -v curl >/dev/null && curl -s -m 10 -o /dev/null -w "probe:%{http_code}\n" https://www.cloudflare.com/cdn-cgi/trace || echo "(curl not installed yet)"' || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker rm -f antidpi-fw-router antidpi-fw-client >/dev/null 2>&1 || true
+          docker network rm lantest >/dev/null 2>&1 || true
+
+
   tunnel-test:
     name: Matrix - tunnel exclusion updater (OpenWrt container, NET_ADMIN)
     needs: build
@@ -320,7 +379,7 @@ jobs:
   # ---- Tag pushes only - dispatch runs validate without publishing.
   publish:
     name: Sign index, publish feed branch (gated by the matrix)
-    needs: [build, smoke-test, mark-test, nft-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, events-test, luci-test, view-test]
+    needs: [build, smoke-test, mark-test, nft-test, forward-test, tunnel-test, status-test, apply-test, profiles-test, policies-test, events-test, luci-test, view-test]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:

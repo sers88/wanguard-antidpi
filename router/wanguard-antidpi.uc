@@ -493,12 +493,25 @@ function source_scope() {
 		// packet copy. Same daddr exclusions and connbytes caps as the
 		// mihomo scope; queue bypass = fail open. The label is NOT rendered
 		// (free text, injection safety) - only the charset-checked id is.
+		//
+		// The source match reads the conntrack ORIGINAL tuple, not the
+		// packet header: this chain sits at postrouting priority srcnat+1
+		// (#61), where fw4 srcnat (priority srcnat) has already MASQUERADE'd
+		// forward traffic - a plain `ip saddr` would only ever see the
+		// router's WAN address, and the whole source scope stayed inert on
+		// the live router (issue #107, caught by the 20.11 live test after
+		// the docker probes missed it: forward traffic without masquerade
+		// keeps its LAN source, so the flaw is invisible there).
+		// `ct original ip saddr` sees the pre-NAT LAN address on forwarded
+		// packets and the router's own address on local output (local
+		// traffic is never SNAT'ed) - LAN CIDRs select forward traffic by
+		// construction, which is the documented scope.
 		for (let k = 0; k < 2; k++) {
 			let proto = (k == 0) ? 'tcp' : 'udp';
 			let cap = (k == 0) ? '1-20' : '1-5';
 			rules += '\t\t# source ' + sc.id + ' (group mark ' + mark +
-				'): LAN-forward ' + proto + ' 443, packets ' + cap + ' (issue #102)\n' +
-				'\t\tip saddr @src_' + sc.id + ' \\\n' +
+				'): LAN-forward ' + proto + ' 443, packets ' + cap + ' (issues #102 #107)\n' +
+				'\t\tct original ip saddr @src_' + sc.id + ' \\\n' +
 				'\t\tmeta mark & @FWMARK@ == 0 \\\n' +
 				'\t\tip daddr != @proxy_servers \\\n' +
 				'\t\tip daddr != @local_v4 \\\n' +
