@@ -60,7 +60,11 @@ assert_out() { # assert_out <grep-pattern> <output>
 }
 
 epid() {
-	pidof nfqws2 2>/dev/null | awk '{print $1}'
+	# the NEWEST engine pid (highest): a restart must not leave two
+	# processes visible - the stub kills -9 (nfqws2 ignores SIGTERM, the
+	# documented router gotcha), and this helper stays robust if one ever
+	# lingers
+	pidof nfqws2 2>/dev/null | tr ' ' '\n' | sort -n | tail -n 1
 }
 
 # run/apply capture safe under set -e
@@ -138,7 +142,11 @@ action=${1:-}
 case "$action" in
 restart|start)
 	old=$(pidof nfqws2 2>/dev/null)
-	[ -n "$old" ] && kill $old 2>/dev/null
+	# nfqws2 ignores SIGTERM (the documented router gotcha): a plain kill
+	# leaves the old process holding the queue while the new one spawns,
+	# and pidof then reports two engines. The real init shim kills -9 -
+	# the stub must match that contract.
+	[ -n "$old" ] && kill -9 $old 2>/dev/null
 	i=0
 	while pidof nfqws2 >/dev/null 2>&1 && [ $i -lt 5 ]; do sleep 1; i=$((i+1)); done
 	set -- $(/usr/bin/wanguard-antidpi engine-cmdline)
@@ -151,7 +159,7 @@ restart|start)
 	;;
 stop)
 	pid=$(pidof nfqws2 2>/dev/null)
-	if [ -n "$pid" ]; then kill $pid 2>/dev/null || true; fi
+	if [ -n "$pid" ]; then kill -9 $pid 2>/dev/null || true; fi
 	;;
 *)
 	:
