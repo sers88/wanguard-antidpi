@@ -255,12 +255,16 @@ nft list table inet $TABLE >/dev/null 2>&1 && fail "table survived flush"
 "$CLI" nft-apply >/dev/null  # and apply must come back cleanly
 nft list table inet $TABLE >/dev/null || fail "re-apply after flush failed"
 
-# ---- [7] forward-source scope (issue #102, spike #95 phase B) ----
+# ---- [7] forward-source scope (issues #102 #107, spike #95 phase B) ----
 # The egress chain (postrouting) sees locally generated packets too (spike
 # #95 P2a evidence), so listing THIS container's own address as a source
 # network turns the unmarked direct fetch into a scoped packet: its counter
 # must tick while the mihomo counters stay flat (a queue verdict is
 # terminal - the mihomo rules run first, and mihomo is stopped anyway).
+# Local output is never SNAT'ed, so the conntrack original tuple (the
+# #107 match) still carries the container address - the probe below
+# exercises match semantics, NOT the masquerade order; the SNAT-forward
+# regression probe is tests/test-forward.sh (two-container stand).
 echo "== [7] forward-source scope"
 kill "$M_PID" 2>/dev/null
 M_PID=

@@ -297,20 +297,27 @@ esac
 printf '%s\n' "$out" | grep -q 'src_lan_off' \
 	&& fail "source render: a disabled section leaked into the render" || :
 case "$out" in
-	*"ip saddr @src_lan_a"*"tcp dport 443 ct original packets 1-20"*) ;;
+	*"ct original ip saddr @src_lan_a"*"tcp dport 443 ct original packets 1-20"*) ;;
 	*) fail "source render: tcp connbytes cap missing on the source rules" ;;
 esac
 case "$out" in
-	*"ip saddr @src_lan_b"*"udp dport 443 ct original packets 1-5"*) ;;
+	*"ct original ip saddr @src_lan_b"*"udp dport 443 ct original packets 1-5"*) ;;
 	*) fail "source render: udp connbytes cap missing on the source rules" ;;
 esac
 case "$out" in
-	*"ip saddr @src_lan_a"*"ip daddr != @local_v4"*"ip daddr != @proxy_servers"*) ;;
+	*"ct original ip saddr @src_lan_a"*"ip daddr != @local_v4"*"ip daddr != @proxy_servers"*) ;;
 	*) fail "source render: source rules lost the tunnel/local exclusions" ;;
 esac
+# the source match MUST read the conntrack original tuple: the egress chain
+# runs at srcnat+1, after fw4 masquerade - a plain ip saddr match can only
+# see the WAN address and the scope stays inert on a real router (#107).
+# Anchor on the line start: `ct original ip saddr` CONTAINS the plain
+# substring, so an unanchored grep would false-positive on the good render.
+printf '%s\n' "$out" | grep -E '^[[:space:]]*ip saddr @src_' \
+	&& fail "source render regressed to a plain ip saddr match (inert behind masquerade - issue #107)" || :
 [ "$out" = "$("$CLI" nft-render)" ] || fail "source render not deterministic"
 # a queue verdict is terminal: source rules must come AFTER the mihomo rules
-if [ "$(printf '%s\n' "$out" | grep -n 'ip saddr @src_lan_a' | head -n 1 | cut -d: -f1)" -le \
+if [ "$(printf '%s\n' "$out" | grep -n 'ct original ip saddr @src_lan_a' | head -n 1 | cut -d: -f1)" -le \
 	"$(printf '%s\n' "$out" | grep -n 'meta mark & 0x10000000 == 0x10000000' | head -n 1 | cut -d: -f1)" ]; then
 	fail "source rules must render AFTER the mihomo rules"
 fi

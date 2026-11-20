@@ -148,8 +148,9 @@ hooks only prerouting). Sets:
   populated.
 - `src_<sid>` - one interval set per enabled `config source` section
   (#102, 3.6): the forward-source scope. Each set backs a tcp/udp rule
-  pair rendered AFTER the mihomo rules (first match wins, so the mihomo
-  scope can never be pre-empted) that issues the queue verdict and stamps
+  pair matched on `ct original ip saddr` (#107) and rendered AFTER the
+  mihomo rules (first match wins, so the mihomo scope can never be
+  pre-empted) that issues the queue verdict and stamps
   the section's auto group mark - the `policy.device_group` enforcement
   point (see 3.6).
 
@@ -355,13 +356,25 @@ their FORWARD traffic (LAN clients going straight out) gets the mihomo
 scope treatment. Evidence base: the spike-95 docker probes (`spike-scope/`
 in the private tracker clone) proved per-source postrouting rules tick the
 queue, forward == local-output inventories byte-for-byte, connbytes caps
-hold, and a table re-apply never drops live connections.
+hold, and a table re-apply never drops live connections - with one blind
+spot the probes could not see (#107): their forward path carried no
+masquerade, so the SNAT-vs-source-match order never came into play; the
+20.11 live-router test caught it and r3 fixed the match.
 
 - render: one `src_<sid>` interval set + a tcp/udp rule pair per enabled
-  section, AFTER the mihomo rules (a queue verdict is terminal - first
+  section, matched on **`ct original ip saddr`** (#107) and placed AFTER
+  the mihomo rules (a queue verdict is terminal - first
   match wins, so the mihomo scope can never be pre-empted). Same daddr
   exclusions (`proxy_servers`, `local_v4`) and connbytes caps (tcp 1-20 /
   udp 1-5) as rule #0. Queue `bypass` = fail open.
+  The conntrack-original match is load-bearing: the egress chain runs at
+  postrouting priority `srcnat + 1`, where fw4 srcnat (priority `srcnat`)
+  has already MASQUERADE'd forward traffic - a plain `ip saddr` would only
+  ever see the router's WAN address and the whole scope would stay inert.
+  Shipped as plain `ip saddr` in #102, caught by the 20.11 live test, fixed
+  in r3: the docker probes missed it because their forward path carried no
+  masquerade; `tests/test-forward.sh` rebuilds the fw4 order so the matrix
+  can never lose this again.
 - group marks: auto-assigned `0x01000000..0x0F000000` by enabled-section
   order (15 groups; no user-facing mark knob), stamped by `meta mark set`
   on the SAME rule that issues the queue verdict. That mark is the
@@ -385,8 +398,15 @@ hold, and a table re-apply never drops live connections.
 Verification contract: `tests/container-smoke.sh` (render shape, marks,
 caps, order-vs-mihomo, guards, determinism, golden restore),
 `tests/test-nft.sh` [7] (live: an in-scope source ticks its counter on
-direct traffic, out-of-scope stays flat, mihomo counters flat, re-apply
-idempotent with sources rendered), `tests/test-status.sh` [5c]/[6]
+direct LOCAL traffic - never SNAT'ed, so the conntrack-original match
+still sees the container address; out-of-scope stays flat, mihomo
+counters flat, re-apply idempotent with sources rendered),
+`tests/test-forward.sh` (live, two-container stand: a client container's
+traffic is forwarded + masqueraded through the router container's fw4
+slot BEFORE the egress hook - the #107 regression stand; an in-scope
+source must tick on a post-SNAT packet, out-of-scope and the mihomo
+scope stay flat),
+`tests/test-status.sh` [5c]/[6]
 (surface + live counter objects + no-die degradation),
 `tests/test-apply.sh` [5f] (table-only apply, preflight rejection).
 
